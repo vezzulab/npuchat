@@ -14,6 +14,7 @@ toolbox run -c npu-dev meson compile -C build-test
 toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-rag
 # The calculator and the other local skills.
 toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-skills
+toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-calendar
 
 # A separate port and D-Bus session let this run next to a real NPU Chat.
 port=52690
