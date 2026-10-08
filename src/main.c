@@ -14,6 +14,7 @@
 #include "selftest.h"
 #include "store.h"
 #include "templates.h"
+#include "updater.h"
 #include "sysinfo.h"
 
 #define APP_ID "io.github.vezzulab.NpuChat"
@@ -83,6 +84,8 @@ static struct {
   char    *theme;
   gboolean idle_unload;
   gboolean concise;
+  gboolean auto_update;
+  gint64   last_update_check;
   int      width;
   int      height;
 
@@ -95,6 +98,10 @@ static struct {
   gboolean      conv_saved;
   GHashTable   *pulling;   /* names being downloaded */
   gboolean      lang_changed;
+  UpdateInfo   *update;        /* newer release found, if any */
+  AdwDialog    *update_dialog;
+  GtkWidget    *update_bar;
+  gboolean      restart_after_exit;
   gboolean      quitting;
 
   /* streaming */
@@ -162,6 +169,11 @@ settings_load (void)
   A.concise = ok ? g_key_file_get_boolean (kf, "chat", "concise", &error) : TRUE;
   if (error)
     A.concise = TRUE;
+  g_clear_error (&error);
+  A.auto_update = ok ? g_key_file_get_boolean (kf, "updates", "automatic", &error) : TRUE;
+  if (error)
+    A.auto_update = TRUE;
+  A.last_update_check = ok ? g_key_file_get_int64 (kf, "updates", "last-check", NULL) : 0;
   A.width = ok ? g_key_file_get_integer (kf, "window", "width", NULL) : 0;
   A.height = ok ? g_key_file_get_integer (kf, "window", "height", NULL) : 0;
   if (A.width < 360 || A.height < 360)
@@ -186,6 +198,8 @@ settings_save (void)
   g_key_file_set_string (kf, "chat", "theme", A.theme);
   g_key_file_set_boolean (kf, "chat", "idle-unload", A.idle_unload);
   g_key_file_set_boolean (kf, "chat", "concise", A.concise);
+  g_key_file_set_boolean (kf, "updates", "automatic", A.auto_update);
+  g_key_file_set_int64 (kf, "updates", "last-check", A.last_update_check);
   g_key_file_set_integer (kf, "window", "width", A.width);
   g_key_file_set_integer (kf, "window", "height", A.height);
   g_mkdir_with_parents (dir, 0700);
@@ -723,8 +737,8 @@ reply_new (const char *model, const char *emoji, const char *name)
   gtk_widget_set_valign (avatar, GTK_ALIGN_CENTER);
   GtkWidget *title = gtk_label_new (name ? name : (model ? model : ""));
   gtk_widget_add_css_class (title, "model-name");
-  r->typing = adw_spinner_new ();
-  gtk_widget_set_size_request (r->typing, 14, 14);
+  r->typing = gtk_spinner_new ();
+  gtk_spinner_set_spinning (GTK_SPINNER (r->typing), TRUE);
   gtk_box_append (GTK_BOX (header), avatar);
   gtk_box_append (GTK_BOX (header), title);
   if (name && model)
@@ -797,6 +811,7 @@ reply_finish_footer (Reply *r, const char *answer, const char *stats, const char
 {
   g_autoptr (GString) line = g_string_new (stats);
 
+  gtk_spinner_set_spinning (GTK_SPINNER (r->typing), FALSE);
   gtk_widget_set_visible (r->typing, FALSE);
   if (error)
     {
@@ -2120,7 +2135,8 @@ open_models_dialog (gboolean download)
                                                  "Only models that fit your NPU, memory and disk are shown."));
 
   md->available = GTK_LIST_BOX (boxed_list (NULL));
-  GtkWidget *spinner = adw_spinner_new ();
+  GtkWidget *spinner = gtk_spinner_new ();
+  gtk_spinner_set_spinning (GTK_SPINNER (spinner), TRUE);
   gtk_widget_set_size_request (spinner, 32, 32);
   gtk_widget_set_margin_top (spinner, 24);
   gtk_widget_set_margin_bottom (spinner, 24);
@@ -2198,6 +2214,163 @@ on_detected (gboolean external, gpointer user_data)
   if (!external && A.model && A.flm_present && !power_on_battery () && memlock_ok ())
     flm_load (A.model, effective_pmode ());
   update_header (NULL);
+}
+
+/* ---- updates ----------------------------------------------------------- */
+
+static void
+on_update_dialog_response (AdwAlertDialog *dialog, const char *response, gpointer user_data)
+{
+  (void) dialog;
+  (void) user_data;
+  if (g_str_equal (response, "restart"))
+    {
+      A.restart_after_exit = TRUE;
+      gtk_window_close (A.win);
+    }
+}
+
+static void
+on_update_dialog_closed (AdwDialog *dialog, gpointer user_data)
+{
+  (void) dialog;
+  (void) user_data;
+  A.update_dialog = NULL;
+  g_clear_object (&A.update_bar);
+}
+
+static void
+update_progress (double fraction, gpointer user_data)
+{
+  (void) user_data;
+  if (A.update_bar)
+    gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (A.update_bar), fraction);
+}
+
+static void
+update_installed (gboolean ok, const char *message, gpointer user_data)
+{
+  (void) user_data;
+  if (A.quitting || !A.update_dialog)
+    return;
+  AdwAlertDialog *d = ADW_ALERT_DIALOG (A.update_dialog);
+  gtk_widget_set_visible (A.update_bar, FALSE);
+  adw_dialog_set_can_close (A.update_dialog, TRUE);
+  if (ok)
+    {
+      adw_alert_dialog_set_heading (d, TR ("Actualización lista", "Update ready"));
+      adw_alert_dialog_set_body (d, TR ("Reinicia NPU Chat para usar la versión nueva.",
+                                        "Restart NPU Chat to use the new version."));
+      adw_alert_dialog_add_responses (d, "later", TR ("Más tarde", "Later"),
+                                      "restart", TR ("Reiniciar ahora", "Restart now"), NULL);
+      adw_alert_dialog_set_response_appearance (d, "restart", ADW_RESPONSE_SUGGESTED);
+      adw_alert_dialog_set_default_response (d, "restart");
+    }
+  else
+    {
+      adw_alert_dialog_set_heading (d, TR ("No se pudo actualizar", "Update failed"));
+      adw_alert_dialog_set_body (d, message);
+      adw_alert_dialog_add_response (d, "close", TR ("Cerrar", "Close"));
+    }
+}
+
+static void
+act_install_update (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void) a; (void) p; (void) d;
+  if (!A.update || A.update_dialog)
+    return;
+
+  AdwDialog *dialog = TRACK (adw_alert_dialog_new (NULL, NULL));
+  adw_alert_dialog_format_heading (ADW_ALERT_DIALOG (dialog), TR ("Descargando NPU Chat %s…", "Downloading NPU Chat %s…"),
+                                   A.update->version);
+  adw_alert_dialog_set_body (ADW_ALERT_DIALOG (dialog), TR ("Se verifica la descarga antes de instalarla.",
+                                                            "The download is verified before it is installed."));
+  A.update_bar = g_object_ref (gtk_progress_bar_new ());
+  adw_alert_dialog_set_extra_child (ADW_ALERT_DIALOG (dialog), A.update_bar);
+  adw_dialog_set_can_close (dialog, FALSE);
+  g_signal_connect (dialog, "response", G_CALLBACK (on_update_dialog_response), NULL);
+  g_signal_connect (dialog, "closed", G_CALLBACK (on_update_dialog_closed), NULL);
+  A.update_dialog = dialog;
+  adw_dialog_present (dialog, GTK_WIDGET (A.win));
+  updater_install (A.update, update_progress, update_installed, NULL);
+}
+
+static void
+act_open_release (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void) a; (void) p; (void) d;
+  if (!A.update)
+    return;
+  g_autoptr (GtkUriLauncher) launcher = gtk_uri_launcher_new (A.update->page_url);
+  gtk_uri_launcher_launch (launcher, A.win, NULL, NULL, NULL);
+}
+
+static void
+on_update_checked (UpdateInfo *info, const char *error, gpointer user_data)
+{
+  gboolean manual = GPOINTER_TO_INT (user_data);
+  if (A.quitting)
+    {
+      update_info_free (info);
+      return;
+    }
+  if (!error)
+    {
+      A.last_update_check = g_get_real_time () / G_USEC_PER_SEC;
+      settings_save ();
+    }
+  if (!info)
+    {
+      if (manual)
+        toast ("%s", error ? TR ("No se pudo buscar actualizaciones", "Could not check for updates")
+                           : TR ("Tienes la versión más reciente", "You have the latest version"));
+      return;
+    }
+
+  update_info_free (A.update);
+  A.update = info;
+  g_autofree char *title = g_strdup_printf (TR ("NPU Chat %s está disponible", "NPU Chat %s is available"), info->version);
+  AdwToast *t = adw_toast_new (title);
+  adw_toast_set_timeout (t, 0);
+  if (updater_can_self_update () && info->appimage_url && info->sha256_url)
+    {
+      adw_toast_set_button_label (t, TR ("Actualizar", "Update"));
+      adw_toast_set_action_name (t, "win.install-update");
+    }
+  else
+    {
+      adw_toast_set_button_label (t, TR ("Ver", "View"));
+      adw_toast_set_action_name (t, "win.open-release");
+    }
+  adw_toast_overlay_add_toast (A.toasts, t);
+}
+
+static gboolean
+auto_update_check (gpointer user_data)
+{
+  (void) user_data;
+  gint64 now = g_get_real_time () / G_USEC_PER_SEC;
+  if (A.auto_update && !A.quitting && now - A.last_update_check > 24 * 3600)
+    updater_check (on_update_checked, GINT_TO_POINTER (FALSE));
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_check_updates_clicked (GtkButton *button, gpointer user_data)
+{
+  (void) button;
+  (void) user_data;
+  updater_check (on_update_checked, GINT_TO_POINTER (TRUE));
+}
+
+static void
+on_auto_update_toggled (AdwSwitchRow *row, GParamSpec *pspec, gpointer user_data)
+{
+  (void) pspec;
+  (void) user_data;
+  A.auto_update = adw_switch_row_get_active (row);
+  settings_save ();
 }
 
 /* ---- preferences ------------------------------------------------------ */
@@ -2362,9 +2535,29 @@ open_preferences (void)
   g_signal_connect (concise, "notify::active", G_CALLBACK (on_concise_toggled), NULL);
   adw_preferences_group_add (chat, concise);
 
+  AdwPreferencesGroup *upd = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_title (upd, TR ("Actualizaciones", "Updates"));
+  adw_preferences_group_set_description (upd, TR ("Es la única conexión a internet de NPU Chat: consulta GitHub una vez al día.",
+                                                  "NPU Chat's only internet connection: it asks GitHub once a day."));
+  GtkWidget *auto_row = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (auto_row), TR ("Buscar actualizaciones automáticamente",
+                                                                     "Check for updates automatically"));
+  adw_switch_row_set_active (ADW_SWITCH_ROW (auto_row), A.auto_update);
+  g_signal_connect (auto_row, "notify::active", G_CALLBACK (on_auto_update_toggled), NULL);
+  adw_preferences_group_add (upd, auto_row);
+  GtkWidget *now_row = adw_action_row_new ();
+  g_autofree char *version_text = g_strdup_printf (TR ("Versión instalada: %s", "Installed version: %s"), NPU_CHAT_VERSION);
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (now_row), version_text);
+  GtkWidget *now_btn = gtk_button_new_with_label (TR ("Buscar ahora", "Check now"));
+  gtk_widget_set_valign (now_btn, GTK_ALIGN_CENTER);
+  g_signal_connect (now_btn, "clicked", G_CALLBACK (on_check_updates_clicked), NULL);
+  adw_action_row_add_suffix (ADW_ACTION_ROW (now_row), now_btn);
+  adw_preferences_group_add (upd, now_row);
+
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), look);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), chat);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), npu);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), upd);
   adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dialog), ADW_PREFERENCES_PAGE (page));
   g_signal_connect (dialog, "closed", G_CALLBACK (on_prefs_closed), NULL);
   A.prefs = dialog;
@@ -2395,7 +2588,7 @@ act_about (GSimpleAction *a, GVariant *p, gpointer d)
                                  TR ("Chat simple con modelos de IA que corren en la NPU de AMD Ryzen AI, usando FastFlowLM.",
                                      "Simple chat with AI models running on the AMD Ryzen AI NPU, powered by FastFlowLM."));
   adw_about_dialog_set_developer_name (ADW_ABOUT_DIALOG (about), "vezzulab");
-  adw_about_dialog_set_website (ADW_ABOUT_DIALOG (about), "https://github.com/vezzulab/NPU-Chat");
+  adw_about_dialog_set_website (ADW_ABOUT_DIALOG (about), "https://github.com/vezzulab/npuchat");
   adw_about_dialog_set_license_type (ADW_ABOUT_DIALOG (about), GTK_LICENSE_MIT_X11);
   adw_dialog_present (about, GTK_WIDGET (A.win));
 }
@@ -3484,6 +3677,10 @@ on_shutdown (GApplication *app, gpointer user_data)
   (void) user_data;
   flm_shutdown ();
   power_shutdown ();
+  updater_shutdown ();
+  update_info_free (g_steal_pointer (&A.update));
+  if (A.restart_after_exit)
+    updater_restart_after_exit ();
 
   if (A.conv && !A.conv_saved)
     conversation_free (A.conv);
@@ -3554,6 +3751,8 @@ on_activate (GApplication *app, gpointer user_data)
     { "about", act_about, NULL, NULL, NULL, { 0 } },
     { "new-assistant", act_new_assistant, NULL, NULL, NULL, { 0 } },
     { "gallery", act_gallery, NULL, NULL, NULL, { 0 } },
+    { "install-update", act_install_update, NULL, NULL, NULL, { 0 } },
+    { "open-release", act_open_release, NULL, NULL, NULL, { 0 } },
     { "quit", act_quit, NULL, NULL, NULL, { 0 } },
   };
   g_action_map_add_action_entries (G_ACTION_MAP (A.win), entries, G_N_ELEMENTS (entries), NULL);
@@ -3587,6 +3786,9 @@ on_activate (GApplication *app, gpointer user_data)
 
   gtk_window_present (A.win);
   gtk_widget_grab_focus (GTK_WIDGET (A.input));
+
+  /* A little after startup, so it never slows the window down. */
+  g_timeout_add_seconds (8, auto_update_check, NULL);
 
 #ifdef NPU_CHAT_SELFTEST
   if (g_getenv ("SELFTEST"))
@@ -3640,6 +3842,8 @@ selftest_tick (gpointer user_data)
         adw_dialog_force_close (editor_current->dialog);
       if (gallery.dialog)
         adw_dialog_force_close (gallery.dialog);
+      if (A.update_dialog)
+        adw_dialog_force_close (A.update_dialog);
     }
   else if (g_str_equal (s, "prefs"))
     open_preferences ();
@@ -3681,6 +3885,10 @@ selftest_tick (gpointer user_data)
                                                                 &GRAPHENE_RECT_INIT (0, 0, wd * 2, ht * 2));
       gdk_texture_save_to_png (tex, s + 5);
     }
+  else if (g_str_equal (s, "checkupdate"))
+    updater_check (on_update_checked, GINT_TO_POINTER (TRUE));
+  else if (g_str_equal (s, "update"))
+    act_install_update (NULL, NULL, NULL);
   else if (g_str_equal (s, "gallery"))
     open_gallery ();
   else if (g_str_has_prefix (s, "gsearch:") && gallery.dialog)

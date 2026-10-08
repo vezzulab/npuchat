@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/vezzulab/NPU-Chat/releases/latest"><img alt="Download" src="https://img.shields.io/github/v/release/vezzulab/NPU-Chat?label=download&color=e01e5a"></a>
+  <a href="https://github.com/vezzulab/npuchat/releases/latest"><img alt="Download" src="https://img.shields.io/github/v/release/vezzulab/npuchat?label=download&color=e01e5a"></a>
   <img alt="Platform" src="https://img.shields.io/badge/linux-x86__64-7b2ff7">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-ff7a18">
 </p>
@@ -26,12 +26,14 @@ Most local AI apps on Linux (Ollama, llama.cpp, LM Studio) run models on the CPU
 - **Only models that fit:** checks your NPU, RAM and disk, and shows the expected speed of each model.
 - **Assistants:** create your own (psychologist, strategist, chef…) or add one of the 48 in the gallery.
 - **Battery-aware:** power saver on battery, full speed when plugged in, and the model is unloaded when idle.
+- **Updates itself:** new versions install in one click, verified with SHA-256.
 - **The basics, done well:** chat history, Markdown and code blocks, light and dark themes, English and Español.
 
 ## Requirements
 
-- An AMD Ryzen AI 300/400 series laptop (XDNA 2 NPU) running Linux kernel 7.0 or newer.
-- [FastFlowLM](https://fastflowlm.com/docs/install_lin/) installed. On Fedora:
+- An AMD Ryzen AI 300/400 series laptop (XDNA 2 NPU) with Linux kernel 7.0 or newer (or the amdxdna DKMS driver).
+- Any current distro: Ubuntu 24.04+, Debian 13, Fedora 39+, Arch and others.
+- [FastFlowLM](https://fastflowlm.com/docs/install_lin/) installed. See its guide for Ubuntu and Arch. On Fedora:
 
   ```bash
   sudo dnf copr enable alessandrolattao/fastflowlm
@@ -41,7 +43,7 @@ Most local AI apps on Linux (Ollama, llama.cpp, LM Studio) run models on the CPU
 
 ## Install
 
-Download `NPU-Chat-x86_64.AppImage` from [Releases](https://github.com/vezzulab/NPU-Chat/releases/latest), then:
+Download `NPU-Chat-x86_64.AppImage` from [Releases](https://github.com/vezzulab/npuchat/releases/latest), then:
 
 ```bash
 chmod +x NPU-Chat-x86_64.AppImage && ./NPU-Chat-x86_64.AppImage

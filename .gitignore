@@ -1,6 +1,4 @@
 /build*/
 /dist/
-/tools/
 *.AppImage
 __pycache__/
-/AppDir/
