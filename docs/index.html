@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NPU Chat — Local AI chat for the AMD Ryzen AI NPU</title>
+<meta name="description" content="A simple, private AI chat for Linux that runs on the NPU of AMD Ryzen AI laptops. Offline, battery-friendly, with custom assistants. English & Español.">
+<meta property="og:title" content="NPU Chat">
+<meta property="og:description" content="A simple, private AI chat that runs on the AMD Ryzen AI NPU. Offline, battery-friendly, English & Español.">
+<meta property="og:image" content="https://vezzulab.github.io/NPU-Chat/og.png">
+<meta property="og:url" content="https://vezzulab.github.io/NPU-Chat/">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #fbfafc; --surface: #ffffff; --text: #1d1726; --muted: #5d5470; --line: #e8e3ef;
+    --code: #f3eff7; --accent: #e01e5a;
+    --grad: linear-gradient(135deg, #ff7a18, #e01e5a 55%, #7b2ff7);
+    --shadow: 0 20px 60px rgba(40, 10, 60, .18);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #110b1c; --surface: #1b1428; --text: #f4eff9; --muted: #b3a8c4; --line: #2c2340;
+      --code: #221a33; --shadow: 0 24px 70px rgba(0, 0, 0, .55);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 17px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  [data-lang="en"] [data-l="es"], [data-lang="es"] [data-l="en"] { display: none !important; }
+  a { color: inherit; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+
+  /* nav */
+  nav { position: sticky; top: 0; z-index: 10; backdrop-filter: saturate(1.4) blur(14px);
+        background: color-mix(in srgb, var(--bg) 78%, transparent); border-bottom: 1px solid var(--line); }
+  nav .wrap { display: flex; align-items: center; gap: 22px; height: 62px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; text-decoration: none; font-size: 1.08rem; }
+  .brand img { width: 30px; height: 30px; }
+  .links { display: flex; gap: 20px; margin-left: auto; }
+  .links a { text-decoration: none; color: var(--muted); font-weight: 600; font-size: .95rem; }
+  .links a:hover { color: var(--text); }
+  .lang { display: flex; border: 1px solid var(--line); border-radius: 99px; padding: 3px; }
+  .lang button { border: 0; background: none; color: var(--muted); font: 700 .8rem/1 inherit; padding: 6px 11px;
+                 border-radius: 99px; cursor: pointer; }
+  .lang button[aria-pressed="true"] { background: var(--grad); color: #fff; }
+  @media (max-width: 720px) { .links { display: none; } .lang { margin-left: auto; } }
+
+  /* hero */
+  header.hero { position: relative; overflow: hidden; padding: 84px 0 0; text-align: center; }
+  header.hero::before { content: ""; position: absolute; inset: -40% -10% auto; height: 900px; z-index: -1;
+    background: radial-gradient(closest-side at 22% 40%, #ff7a1855, transparent),
+                radial-gradient(closest-side at 70% 30%, #e01e5a44, transparent),
+                radial-gradient(closest-side at 85% 75%, #7b2ff744, transparent); filter: blur(30px); }
+  .logo { width: 104px; height: 104px; filter: drop-shadow(0 14px 30px rgba(224, 30, 90, .35)); }
+  h1 { font-size: clamp(2.6rem, 6vw, 4.4rem); line-height: 1.05; margin: 18px 0 14px; letter-spacing: -.03em; }
+  h1 .g { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .tagline { font-size: clamp(1.1rem, 2.2vw, 1.35rem); color: var(--muted); max-width: 680px; margin: 0 auto 30px; }
+  .ctas { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn { display: inline-flex; align-items: center; gap: 9px; padding: 14px 24px; border-radius: 14px; font-weight: 700;
+         text-decoration: none; border: 1px solid var(--line); background: var(--surface); transition: transform .15s; }
+  .btn:hover { transform: translateY(-2px); }
+  .btn.primary { background: var(--grad); color: #fff; border: 0; box-shadow: 0 10px 30px rgba(224, 30, 90, .35); }
+  .btn svg { width: 19px; height: 19px; }
+  .meta { margin-top: 16px; font-size: .9rem; color: var(--muted); }
+  .shot { margin: 56px auto 0; max-width: 1040px; }
+  .shot img { width: 100%; height: auto; display: block; filter: drop-shadow(0 24px 50px rgba(40, 10, 60, .28)); }
+
+  /* sections */
+  section { padding: 96px 0; border-top: 1px solid var(--line); }
+  .eyebrow { color: var(--accent); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; font-size: .8rem; }
+  h2 { font-size: clamp(1.9rem, 3.6vw, 2.6rem); line-height: 1.15; margin: 8px 0 14px; letter-spacing: -.02em; }
+  .lead { color: var(--muted); max-width: 720px; font-size: 1.1rem; margin: 0 0 40px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .stat { background: var(--surface); border: 1px solid var(--line); border-radius: 20px; padding: 28px; }
+  .stat b { display: block; font-size: 2.6rem; line-height: 1; letter-spacing: -.03em;
+            background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .stat h3 { margin: 14px 0 6px; font-size: 1.12rem; }
+  .stat p { margin: 0; color: var(--muted); font-size: .97rem; }
+  .note { margin-top: 18px; font-size: .85rem; color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 20px; padding: 26px; }
+  .card .ico { font-size: 1.7rem; }
+  .card h3 { margin: 10px 0 6px; font-size: 1.08rem; }
+  .card p { margin: 0; color: var(--muted); font-size: .97rem; }
+  @media (max-width: 860px) { .stats, .grid { grid-template-columns: 1fr; } section { padding: 70px 0; } }
+
+  /* install */
+  .steps { display: grid; gap: 16px; counter-reset: s; }
+  .step { display: grid; grid-template-columns: 44px 1fr; gap: 16px; align-items: start; }
+  .step::before { counter-increment: s; content: counter(s); width: 44px; height: 44px; border-radius: 50%;
+                  background: var(--grad); color: #fff; font-weight: 800; display: grid; place-items: center; }
+  .step h3 { margin: 8px 0 8px; font-size: 1.08rem; }
+  .step p { margin: 0 0 10px; color: var(--muted); }
+  pre { position: relative; margin: 0; background: var(--code); border: 1px solid var(--line); border-radius: 14px;
+        padding: 16px 52px 16px 18px; overflow-x: auto; font: 14px/1.6 ui-monospace, "JetBrains Mono", Menlo, monospace; }
+  .copy { position: absolute; top: 9px; right: 9px; border: 1px solid var(--line); background: var(--surface);
+          color: var(--muted); border-radius: 9px; padding: 5px 9px; font: 600 .75rem/1 inherit; cursor: pointer; }
+  details { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; margin-top: 16px; }
+  summary { cursor: pointer; font-weight: 700; }
+  details p { color: var(--muted); }
+
+  footer { border-top: 1px solid var(--line); padding: 36px 0 50px; color: var(--muted); font-size: .92rem; }
+  footer .wrap { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+  footer .right { margin-left: auto; display: flex; gap: 18px; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#"><img src="icon.svg" alt="">NPU Chat</a>
+    <div class="links">
+      <a href="#why"><span data-l="en">Why NPU</span><span data-l="es">¿Por qué la NPU?</span></a>
+      <a href="#features"><span data-l="en">Features</span><span data-l="es">Funciones</span></a>
+      <a href="#install"><span data-l="en">Install</span><span data-l="es">Instalar</span></a>
+      <a href="https://github.com/vezzulab/NPU-Chat">GitHub</a>
+    </div>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-set="en" aria-pressed="true">EN</button>
+      <button type="button" data-set="es" aria-pressed="false">ES</button>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <img class="logo" src="icon.svg" alt="NPU Chat logo">
+    <h1>
+      <span data-l="en">Your AI chat, <span class="g">on the NPU</span></span>
+      <span data-l="es">Tu chat de IA, <span class="g">en la NPU</span></span>
+    </h1>
+    <p class="tagline">
+      <span data-l="en">A simple, private chat app for Linux that runs AI models on the NPU of AMD Ryzen AI laptops. No cloud, no browser, no clutter.</span>
+      <span data-l="es">Una app de chat simple y privada para Linux que corre modelos de IA en la NPU de las laptops AMD Ryzen AI. Sin nube, sin navegador, sin complicaciones.</span>
+    </p>
+    <div class="ctas">
+      <a class="btn primary" href="https://github.com/vezzulab/NPU-Chat/releases/latest/download/NPU-Chat-x86_64.AppImage">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0-5-5m5 5 5-5M4 21h16"/></svg>
+        <span data-l="en">Download AppImage</span><span data-l="es">Descargar AppImage</span>
+      </a>
+      <a class="btn" href="https://github.com/vezzulab/NPU-Chat">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.2.8-.6v-2.1c-3.2.7-3.9-1.5-3.9-1.5-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.7-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0c2.2-1.5 3.2-1.2 3.2-1.2.6 1.6.2 2.8.1 3.1.8.8 1.2 1.9 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.2c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .5Z"/></svg>
+        <span data-l="en">View on GitHub</span><span data-l="es">Ver en GitHub</span>
+      </a>
+    </div>
+    <p class="meta">
+      <span data-l="en">Linux x86_64 · AMD Ryzen AI 300/400 · Free &amp; open source (MIT)</span>
+      <span data-l="es">Linux x86_64 · AMD Ryzen AI 300/400 · Gratis y de código abierto (MIT)</span>
+    </p>
+    <div class="shot">
+      <picture data-l="en">
+        <source srcset="app-en-dark.webp" media="(prefers-color-scheme: dark)">
+        <img src="app-en-light.webp" width="1600" height="1032" alt="NPU Chat window with a Psychologist assistant conversation">
+      </picture>
+      <picture data-l="es">
+        <source srcset="app-es-dark.webp" media="(prefers-color-scheme: dark)">
+        <img src="app-es-light.webp" width="1600" height="1032" alt="Ventana de NPU Chat con una conversación con el asistente Psicólogo">
+      </picture>
+    </div>
+  </div>
+</header>
+
+<section id="why">
+  <div class="wrap">
+    <div class="eyebrow"><span data-l="en">Why NPU Chat</span><span data-l="es">Por qué NPU Chat</span></div>
+    <h2>
+      <span data-l="en">Put the chip you're not using to work</span>
+      <span data-l="es">Pon a trabajar el chip que no estás usando</span>
+    </h2>
+    <p class="lead">
+      <span data-l="en">Most local AI apps on Linux (Ollama, llama.cpp, LM Studio) run models on the CPU or GPU. Ryzen AI laptops also have an NPU, a chip built for AI that usually sits idle. NPU Chat runs the model there.</span>
+      <span data-l="es">La mayoría de apps de IA local en Linux (Ollama, llama.cpp, LM Studio) corren los modelos en la CPU o la GPU. Las laptops Ryzen AI también tienen una NPU, un chip hecho para IA que normalmente no se usa. NPU Chat corre el modelo ahí.</span>
+    </p>
+    <div class="stats">
+      <div class="stat">
+        <b>6 %</b>
+        <h3><span data-l="en">CPU while generating</span><span data-l="es">de CPU mientras genera</span></h3>
+        <p><span data-l="en">Your processor stays free for everything else; it was at 3.5 % idle.</span><span data-l="es">Tu procesador queda libre para todo lo demás; en reposo estaba en 3.5 %.</span></p>
+      </div>
+      <div class="stat">
+        <b>1 %</b>
+        <h3><span data-l="en">GPU while generating</span><span data-l="es">de GPU mientras genera</span></h3>
+        <p><span data-l="en">The graphics chip stays out of it, ready for video, games or your desktop.</span><span data-l="es">La gráfica no participa y queda libre para video, juegos o tu escritorio.</span></p>
+      </div>
+      <div class="stat">
+        <b>~8.4 W</b>
+        <h3><span data-l="en">Whole laptop, on battery</span><span data-l="es">Toda la laptop, en batería</span></h3>
+        <p><span data-l="en">About the same as idle (8.6 W). AI that doesn't drain your battery.</span><span data-l="es">Casi lo mismo que en reposo (8.6 W). IA que no te agota la batería.</span></p>
+      </div>
+    </div>
+    <p class="note">
+      <span data-l="en">Measured on a Ryzen AI 5 430 on battery with qwen3.5:9b in power-saver mode, generating 400 tokens at 11.7 tok/s.</span>
+      <span data-l="es">Medido en una Ryzen AI 5 430 en batería con qwen3.5:9b en modo ahorro, generando 400 tokens a 11.7 tok/s.</span>
+    </p>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="eyebrow"><span data-l="en">Features</span><span data-l="es">Funciones</span></div>
+    <h2><span data-l="en">Everything you need, nothing you don't</span><span data-l="es">Todo lo que necesitas, nada que sobre</span></h2>
+    <p class="lead">
+      <span data-l="en">Built as a small native GTK app, because a chat shouldn't need a web server.</span>
+      <span data-l="es">Hecha como una app nativa y ligera en GTK, porque un chat no debería necesitar un servidor web.</span>
+    </p>
+    <div class="grid">
+      <div class="card"><div class="ico">🔒</div>
+        <h3><span data-l="en">100% local</span><span data-l="es">100 % local</span></h3>
+        <p><span data-l="en">Your chats never leave your laptop. Works offline.</span><span data-l="es">Tus chats nunca salen de tu laptop. Funciona sin internet.</span></p></div>
+      <div class="card"><div class="ico">🎯</div>
+        <h3><span data-l="en">Only models that fit</span><span data-l="es">Solo modelos que caben</span></h3>
+        <p><span data-l="en">Checks your NPU, RAM and disk, and shows the expected speed of each model.</span><span data-l="es">Revisa tu NPU, RAM y disco, y muestra la velocidad esperada de cada modelo.</span></p></div>
+      <div class="card"><div class="ico">🧠</div>
+        <h3><span data-l="en">Assistants</span><span data-l="es">Asistentes</span></h3>
+        <p><span data-l="en">Create your own or pick from 48 in the gallery: psychologist, strategist, chef, tutor…</span><span data-l="es">Crea los tuyos o elige entre 48 en la galería: psicólogo, estratega, chef, tutor…</span></p></div>
+      <div class="card"><div class="ico">🔋</div>
+        <h3><span data-l="en">Battery-aware</span><span data-l="es">Cuida la batería</span></h3>
+        <p><span data-l="en">Power saver on battery, full speed when plugged in, and the model is unloaded when idle.</span><span data-l="es">Ahorro en batería, máxima velocidad conectada, y libera el modelo cuando no lo usas.</span></p></div>
+      <div class="card"><div class="ico">⚡</div>
+        <h3><span data-l="en">Short replies, fast answers</span><span data-l="es">Respuestas cortas y rápidas</span></h3>
+        <p><span data-l="en">Concise mode gets you to the point in seconds; ask for detail when you want it.</span><span data-l="es">El modo breve va al grano en segundos; pide detalle cuando lo quieras.</span></p></div>
+      <div class="card"><div class="ico">🌗</div>
+        <h3><span data-l="en">Light, dark &amp; bilingual</span><span data-l="es">Claro, oscuro y bilingüe</span></h3>
+        <p><span data-l="en">Follows your system theme. Interface in English and Español.</span><span data-l="es">Sigue el tema de tu sistema. Interfaz en español e inglés.</span></p></div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="eyebrow"><span data-l="en">Install</span><span data-l="es">Instalar</span></div>
+    <h2><span data-l="en">Up and running in three steps</span><span data-l="es">Listo en tres pasos</span></h2>
+    <p class="lead">
+      <span data-l="en">You need an AMD Ryzen AI 300/400 series laptop (XDNA 2 NPU) with Linux kernel 7.0 or newer.</span>
+      <span data-l="es">Necesitas una laptop AMD Ryzen AI serie 300/400 (NPU XDNA 2) con kernel de Linux 7.0 o más nuevo.</span>
+    </p>
+    <div class="steps">
+      <div class="step"><div>
+        <h3><span data-l="en">Install FastFlowLM (the NPU engine)</span><span data-l="es">Instala FastFlowLM (el motor de la NPU)</span></h3>
+        <p><span data-l="en">On Fedora:</span><span data-l="es">En Fedora:</span></p>
+        <pre><code>sudo dnf copr enable alessandrolattao/fastflowlm
+sudo dnf install --exclude=xdna-driver-dkms fastflowlm
+sudo flm-fetch-kernels</code></pre>
+        <p style="margin-top:10px"><span data-l="en">Other distros: see the <a href="https://fastflowlm.com/docs/install_lin/">FastFlowLM guide</a>.</span><span data-l="es">Otras distribuciones: consulta la <a href="https://fastflowlm.com/docs/install_lin/">guía de FastFlowLM</a>.</span></p>
+      </div></div>
+      <div class="step"><div>
+        <h3><span data-l="en">Download and run NPU Chat</span><span data-l="es">Descarga y abre NPU Chat</span></h3>
+        <pre><code>chmod +x NPU-Chat-x86_64.AppImage
+./NPU-Chat-x86_64.AppImage</code></pre>
+      </div></div>
+      <div class="step"><div>
+        <h3><span data-l="en">Pick a model and chat</span><span data-l="es">Elige un modelo y conversa</span></h3>
+        <p><span data-l="en">Open the model menu, download one that fits your laptop, and start typing.</span><span data-l="es">Abre el menú de modelos, descarga uno que quepa en tu laptop y empieza a escribir.</span></p>
+      </div></div>
+    </div>
+    <details>
+      <summary><span data-l="en">“The NPU needs a system setting to work”</span><span data-l="es">«La NPU necesita un ajuste del sistema para funcionar»</span></summary>
+      <p><span data-l="en">systemd caps locked memory at 8 MB, and the NPU needs more to load a model. Run this once, then reboot:</span><span data-l="es">systemd limita la memoria fija a 8 MB y la NPU necesita más para cargar un modelo. Ejecuta esto una vez y reinicia:</span></p>
+      <pre><code>sudo mkdir -p /etc/systemd/system/user@.service.d /etc/systemd/user.conf.d
+printf '[Service]\nLimitMEMLOCK=infinity\n' | sudo tee /etc/systemd/system/user@.service.d/memlock.conf
+printf '[Manager]\nDefaultLimitMEMLOCK=infinity\n' | sudo tee /etc/systemd/user.conf.d/memlock.conf</code></pre>
+    </details>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>NPU Chat · MIT License</span>
+    <span data-l="en">Powered by <a href="https://github.com/FastFlowLM/FastFlowLM">FastFlowLM</a></span>
+    <span data-l="es">Funciona con <a href="https://github.com/FastFlowLM/FastFlowLM">FastFlowLM</a></span>
+    <div class="right">
+      <a href="https://github.com/vezzulab/NPU-Chat">GitHub</a>
+      <a href="https://github.com/vezzulab/NPU-Chat/releases"><span data-l="en">Releases</span><span data-l="es">Versiones</span></a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    function set(lang) {
+      root.dataset.lang = lang;
+      root.lang = lang;
+      document.querySelectorAll('.lang button').forEach(function (b) {
+        b.setAttribute('aria-pressed', b.dataset.set === lang ? 'true' : 'false');
+      });
+      document.title = lang === 'es'
+        ? 'NPU Chat — Chat de IA local para la NPU AMD Ryzen AI'
+        : 'NPU Chat — Local AI chat for the AMD Ryzen AI NPU';
+      document.querySelectorAll('.copy').forEach(function (c) { c.textContent = copyLabel(); });
+    }
+    function copyLabel() { return root.lang === 'es' ? 'Copiar' : 'Copy'; }
+    var param = new URLSearchParams(location.search).get('lang');
+    var saved = null;
+    try { saved = localStorage.getItem('lang'); } catch (e) {}
+    var initial = (param === 'es' || param === 'en') ? param
+      : saved || ((navigator.language || 'en').toLowerCase().indexOf('es') === 0 ? 'es' : 'en');
+    document.querySelectorAll('.lang button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        set(b.dataset.set);
+        try { localStorage.setItem('lang', b.dataset.set); } catch (e) {}
+      });
+    });
+
+    document.querySelectorAll('pre').forEach(function (pre) {
+      var btn = document.createElement('button');
+      btn.className = 'copy';
+      btn.type = 'button';
+      btn.addEventListener('click', function () {
+        navigator.clipboard.writeText(pre.querySelector('code').innerText).then(function () {
+          btn.textContent = '✓';
+          setTimeout(function () { btn.textContent = copyLabel(); }, 1500);
+        });
+      });
+      pre.appendChild(btn);
+    });
+    set(initial);
+  })();
+</script>
+</body>
+</html>
