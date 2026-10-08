@@ -149,6 +149,7 @@ static struct {
   GtkLabel     *import_label;
   GtkWidget    *import_bar;
   AdwDialog    *libs_dialog;
+  AdwDialog    *skills_dialog;
   gboolean      team_answered; /* someone has answered the current user message */
   gint64        search_start;  /* when document search began (µs), 0 if none */
   double        search_secs;   /* how long it took, shown with the reply stats */
@@ -3825,26 +3826,6 @@ open_preferences (void)
   g_signal_connect (concise, "notify::active", G_CALLBACK (on_concise_toggled), NULL);
   adw_preferences_group_add (chat, concise);
 
-  AdwPreferencesGroup *skills_group = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
-  adw_preferences_group_set_title (skills_group, TR ("Habilidades", "Skills"));
-  g_autofree char *skills_hint = g_strdup_printf ("%s%s",
-    TR ("El modelo decide cuándo usarlas y te muestra lo que hizo. Funcionan con modelos que admiten herramientas (como qwen3 y qwen3.5).",
-        "The model decides when to use them and shows you what it did. They work with models that support tools (such as qwen3 and qwen3.5)."),
-    model_supports_tools () || !A.model ? "" : TR (" El modelo actual no las admite.", " The current model does not support them."));
-  adw_preferences_group_set_description (skills_group, skills_hint);
-  guint n_skills;
-  const Skill *all_skills = skills_list (&n_skills);
-  for (guint i = 0; i < n_skills; i++)
-    {
-      GtkWidget *row = adw_switch_row_new ();
-      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), TR (all_skills[i].name_es, all_skills[i].name_en));
-      adw_action_row_set_subtitle (ADW_ACTION_ROW (row), TR (all_skills[i].desc_es, all_skills[i].desc_en));
-      adw_switch_row_set_active (ADW_SWITCH_ROW (row), g_hash_table_contains (A.skills_on, all_skills[i].id));
-      g_object_set_data (G_OBJECT (row), "id", (gpointer) all_skills[i].id);
-      g_signal_connect (row, "notify::active", G_CALLBACK (on_skill_toggled), NULL);
-      adw_preferences_group_add (skills_group, row);
-    }
-
   AdwPreferencesGroup *keys_group = NULL;
   if (copilotkey_supported ())
     {
@@ -3883,7 +3864,6 @@ open_preferences (void)
 
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), look);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), chat);
-  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), skills_group);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), npu);
   if (keys_group)
     adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), keys_group);
@@ -3894,6 +3874,52 @@ open_preferences (void)
   adw_dialog_present (dialog, GTK_WIDGET (A.win));
 }
 
+static void
+on_skills_dialog_closed (AdwDialog *dialog, gpointer user_data)
+{
+  (void) dialog;
+  (void) user_data;
+  A.skills_dialog = NULL;
+}
+
+static void
+open_skills_dialog (void)
+{
+  if (A.skills_dialog)
+    return;
+  A.skills_dialog = TRACK (adw_dialog_new ());
+  adw_dialog_set_title (A.skills_dialog, TR ("Habilidades", "Skills"));
+  adw_dialog_set_content_width (A.skills_dialog, 560);
+  adw_dialog_set_content_height (A.skills_dialog, 560);
+  GtkWidget *page = adw_preferences_page_new ();
+  AdwPreferencesGroup *skills_group = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+    g_autofree char *skills_hint = g_strdup_printf ("%s%s",
+    TR ("El modelo decide cuándo usarlas y te muestra lo que hizo. Funcionan con modelos que admiten herramientas (como qwen3 y qwen3.5).",
+        "The model decides when to use them and shows you what it did. They work with models that support tools (such as qwen3 and qwen3.5)."),
+    model_supports_tools () || !A.model ? "" : TR (" El modelo actual no las admite.", " The current model does not support them."));
+  adw_preferences_group_set_description (skills_group, skills_hint);
+  guint n_skills;
+  const Skill *all_skills = skills_list (&n_skills);
+  for (guint i = 0; i < n_skills; i++)
+    {
+      GtkWidget *row = adw_switch_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), TR (all_skills[i].name_es, all_skills[i].name_en));
+      adw_action_row_set_subtitle (ADW_ACTION_ROW (row), TR (all_skills[i].desc_es, all_skills[i].desc_en));
+      adw_switch_row_set_active (ADW_SWITCH_ROW (row), g_hash_table_contains (A.skills_on, all_skills[i].id));
+      g_object_set_data (G_OBJECT (row), "id", (gpointer) all_skills[i].id);
+      g_signal_connect (row, "notify::active", G_CALLBACK (on_skill_toggled), NULL);
+      adw_preferences_group_add (skills_group, row);
+    }
+
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), skills_group);
+  GtkWidget *tv = adw_toolbar_view_new ();
+  adw_toolbar_view_add_top_bar (ADW_TOOLBAR_VIEW (tv), adw_header_bar_new ());
+  adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (tv), page);
+  adw_dialog_set_child (A.skills_dialog, tv);
+  g_signal_connect (A.skills_dialog, "closed", G_CALLBACK (on_skills_dialog_closed), NULL);
+  adw_dialog_present (A.skills_dialog, GTK_WIDGET (A.win));
+}
+
 /* ---- actions ---------------------------------------------------------- */
 
 #define UNUSED_ACTION_ARGS (void) a; (void) p; (void) d
@@ -3901,6 +3927,7 @@ open_preferences (void)
 static void act_new_chat (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; new_chat (); }
 static void act_models (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_models_dialog (FALSE); }
 static void act_download (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_models_dialog (TRUE); }
+static void act_skills (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_skills_dialog (); }
 static void act_prefs (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_preferences (); }
 static void act_refresh (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; refresh_models (); }
 static void act_retry (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; ensure_loaded (); }
@@ -5790,6 +5817,7 @@ build_menu (void)
   g_menu_append (top, TR ("Nueva conversación", "New chat"), "win.new-chat");
   g_menu_append (top, TR ("Galería de asistentes", "Assistant gallery"), "win.gallery");
   g_menu_append (top, TR ("Bibliotecas de documentos", "Document libraries"), "win.libraries");
+  g_menu_append (top, TR ("Habilidades", "Skills"), "win.skills");
   g_menu_append (top, TR ("Administrar modelos", "Manage models"), "win.models");
   g_menu_append_section (menu, NULL, G_MENU_MODEL (top));
   GMenu *bottom = g_menu_new ();
@@ -5997,6 +6025,7 @@ on_activate (GApplication *app, gpointer user_data)
     { "new-assistant", act_new_assistant, NULL, NULL, NULL, { 0 } },
     { "gallery", act_gallery, NULL, NULL, NULL, { 0 } },
     { "libraries", act_libraries, NULL, NULL, NULL, { 0 } },
+    { "skills", act_skills, NULL, NULL, NULL, { 0 } },
     { "install-update", act_install_update, NULL, NULL, NULL, { 0 } },
     { "open-release", act_open_release, NULL, NULL, NULL, { 0 } },
     { "quit", act_quit, NULL, NULL, NULL, { 0 } },
@@ -6090,6 +6119,8 @@ selftest_tick (gpointer user_data)
         adw_dialog_force_close (gallery.dialog);
       if (A.libs_dialog)
         adw_dialog_force_close (A.libs_dialog);
+      if (A.skills_dialog)
+        adw_dialog_force_close (A.skills_dialog);
       if (A.update_dialog)
         adw_dialog_force_close (A.update_dialog);
     }
@@ -6233,6 +6264,8 @@ selftest_tick (gpointer user_data)
           sw = gtk_widget_get_first_child (sw);
         }
     }
+  else if (g_str_equal (s, "skillsdlg"))
+    open_skills_dialog ();
   else if (g_str_equal (s, "libdlg"))
     open_libraries_dialog ();
   else if (g_str_equal (s, "docsmenu"))

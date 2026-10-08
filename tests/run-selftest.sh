@@ -48,7 +48,7 @@ steps+=";newchat;import:$work/docs/manual.md|$work/docs/roto.txt;waitimport"
 steps+=";send:¿Cuánto dura la garantía?;wait;send:NOMATCH pregunta sin relacion;wait"
 steps+=";newlib:Envios;libimport:1:$work/docs/envios.txt;waitimport;attach:1;libdlg;sleep:1;rmdoc:1;dellib:1;closedlg"
 steps+=";assistlib:0:0;newchat;pick:0;send:Pregunta con asistente;wait;pick:-1;newchat"
-steps+=";newchat;skill:wikipedia:on;send:CALCTEST calcula;wait;send:BADTOOL;wait;send:STATUSTEST;wait"
+steps+=";newchat;skillsdlg;sleep:1;closedlg;skill:wikipedia:on;send:CALCTEST calcula;wait;send:BADTOOL;wait;send:STATUSTEST;wait"
 steps+=";send:WIKITEST;wait;send:WIKI404;wait;skill:calculator:off;send:CALCTEST otra vez;wait;skill:calculator:on;send:DATESYS;wait;send:TOOLSYS;wait;send:HISTCHECK;wait;skill:current_datetime:off;send:DATESYS otra;wait;skill:current_datetime:on;newchat"
 steps+=";lang:en;theme:light;sleep:1;send:English;wait;close"
 
