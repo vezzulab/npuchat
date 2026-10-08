@@ -35,6 +35,9 @@ typedef struct {
   GString      *reasoning;
   Conversation *conv;
   gboolean      detached;
+  GtkWidget    *avatar;
+  GtkWidget    *title;
+  int           member; /* team chats: index into conv->team, -1 until routed */
 } Reply;
 
 typedef struct {
@@ -67,6 +70,8 @@ static struct {
   GtkMenuButton          *assistant_button;
   GtkLabel               *assistant_label;
   GtkListBox             *assistant_list;
+  GtkSwitch              *team_switch;
+  GtkWidget              *clear_assistant;
   GtkWidget              *suggestions;
   GtkWidget              *messages;
   GtkScrolledWindow      *scroller;
@@ -94,6 +99,10 @@ static struct {
   GPtrArray    *convs;     /* Conversation*, newest first */
   GPtrArray    *assistants;
   char         *pick_id;   /* assistant for the next new chat; NULL = general */
+  gboolean      team_mode; /* the assistant picker selects several */
+  GPtrArray    *pick_team; /* char* assistant ids for the next team chat */
+  GArray       *queue;     /* team members (int) still to answer this turn */
+  gboolean      team_answered; /* someone has answered the current user message */
   Conversation *conv;      /* current; owned by convs once saved */
   gboolean      conv_saved;
   GHashTable   *pulling;   /* names being downloaded */
@@ -128,6 +137,9 @@ static void update_header (const char *message);
 static void open_models_dialog (gboolean download);
 static void md_refresh (void);
 static void update_assistant_ui (void);
+static void answer_next_in_queue (void);
+static const char *skip_speaker_tag (const char *text);
+static gboolean could_become_pass (const char *text);
 static void open_assistant_editor (Assistant *a);
 static void open_gallery (void);
 static void on_gallery_clicked (GtkButton *button, gpointer user_data);
@@ -732,10 +744,11 @@ reply_new (const char *model, const char *emoji, const char *name)
   gtk_widget_add_css_class (r->root, "reply");
 
   GtkWidget *header = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
-  GtkWidget *avatar = gtk_label_new (emoji && *emoji ? emoji : "✦");
+  r->member = -1;
+  GtkWidget *avatar = r->avatar = gtk_label_new (emoji && *emoji ? emoji : "✦");
   gtk_widget_add_css_class (avatar, "avatar");
   gtk_widget_set_valign (avatar, GTK_ALIGN_CENTER);
-  GtkWidget *title = gtk_label_new (name ? name : (model ? model : ""));
+  GtkWidget *title = r->title = gtk_label_new (name ? name : (model ? model : ""));
   gtk_widget_add_css_class (title, "model-name");
   r->typing = gtk_spinner_new ();
   gtk_spinner_set_spinning (GTK_SPINNER (r->typing), TRUE);
@@ -857,7 +870,14 @@ render_reply (gboolean final)
   g_autoptr (GString) think = g_string_new (NULL);
   g_autofree char *answer = split_thinking (r, think);
   g_autofree char *think_text = g_strstrip (g_strdup (think->str));
-  reply_show (r, answer, think_text, !final && *answer == '\0');
+  const char *shown = answer;
+  if (r->member >= 0)
+    {
+      shown = skip_speaker_tag (answer);
+      if (could_become_pass (shown))
+        shown = "";
+    }
+  reply_show (r, shown, think_text, !final && *shown == '\0');
 }
 
 static gboolean
@@ -923,7 +943,8 @@ render_conversation (void)
           add_user_bubble (m->content);
           continue;
         }
-      Reply *r = reply_new (A.conv->model, A.conv->assistant_emoji, A.conv->assistant_name);
+      Reply *r = m->author ? reply_new (A.conv->model, m->author_emoji, m->author)
+                           : reply_new (A.conv->model, A.conv->assistant_emoji, A.conv->assistant_name);
       reply_show (r, m->content, m->think, FALSE);
       reply_finish_footer (r, m->content, m->stats, NULL);
       gtk_box_append (GTK_BOX (A.messages), r->root);
@@ -1117,7 +1138,12 @@ chat_row (Conversation *c)
   gtk_widget_add_css_class (title, "chat-title");
 
   g_autofree char *when = relative_time (c->updated);
-  g_autofree char *sub_text = c->assistant_name
+  g_autoptr (GString) team_emojis = g_string_new (NULL);
+  for (guint i = 0; c->team && i < c->team->len; i++)
+    g_string_append_printf (team_emojis, "%s", ((TeamMember *) c->team->pdata[i])->emoji);
+  g_autofree char *sub_text = c->team && c->team->len >= 2
+    ? g_strdup_printf ("%s %s · %s", team_emojis->str, TR ("Equipo", "Team"), when)
+    : c->assistant_name
     ? g_strdup_printf ("%s %s · %s", c->assistant_emoji ? c->assistant_emoji : "", c->assistant_name, when)
     : g_strdup_printf ("%s · %s", c->model && *c->model ? c->model : "—", when);
   GtkWidget *sub = gtk_label_new (sub_text);
@@ -1162,6 +1188,112 @@ on_chat_activated (GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
   open_conversation (g_object_get_data (G_OBJECT (row), "conv"));
 }
 
+/* ---- teams ------------------------------------------------------------ */
+
+static gboolean
+conv_is_team (Conversation *c)
+{
+  return c && c->team && c->team->len >= 2;
+}
+
+/* First sentence of an assistant's instructions: enough to describe its
+ * specialty to the router. */
+static char *
+first_sentence (const char *text)
+{
+  const char *end = text;
+  while (*end && *end != '.' && *end != '\n')
+    end++;
+  g_autofree char *s = g_strndup (text, end - text);
+  if (g_utf8_strlen (s, -1) > 160)
+    {
+      g_autofree char *cut = g_utf8_substring (s, 0, 160);
+      return g_strdup (cut);
+    }
+  return g_steal_pointer (&s);
+}
+
+/* Members the user addressed by name, in the order they were mentioned. */
+static GArray *
+mentioned_members (Conversation *c, const char *text)
+{
+  GArray *found = g_array_new (FALSE, FALSE, sizeof (int));
+  g_autoptr (GArray) pos = g_array_new (FALSE, FALSE, sizeof (glong));
+  g_autofree char *hay = g_utf8_casefold (text, -1);
+
+  for (guint i = 0; i < c->team->len; i++)
+    {
+      TeamMember *t = c->team->pdata[i];
+      g_autofree char *full = g_utf8_casefold (t->name, -1);
+      const char *at = strstr (hay, full);
+      if (!at)
+        {
+          /* "Entrenador personal" can be called just "entrenador". */
+          g_auto (GStrv) words = g_strsplit (full, " ", 2);
+          if (words[0] && g_utf8_strlen (words[0], -1) >= 5)
+            {
+              gboolean unique = TRUE;
+              for (guint j = 0; j < c->team->len && unique; j++)
+                {
+                  g_autofree char *other = g_utf8_casefold (((TeamMember *) c->team->pdata[j])->name, -1);
+                  unique = j == i || !g_str_has_prefix (other, words[0]);
+                }
+              if (unique)
+                at = strstr (hay, words[0]);
+            }
+        }
+      if (!at)
+        continue;
+      glong p = at - hay;
+      guint k = 0;
+      while (k < pos->len && g_array_index (pos, glong, k) < p)
+        k++;
+      g_array_insert_val (pos, k, p);
+      int idx = (int) i;
+      g_array_insert_val (found, k, idx);
+    }
+  return found;
+}
+
+/* Models in a team sometimes start with their own "[Name]:" tag, copying the
+ * format they see for their teammates. Returns the text without it. */
+static const char *
+skip_speaker_tag (const char *text)
+{
+  if (*text != '[')
+    return text;
+  const char *close = strchr (text, ']');
+  if (!close || close - text > 48 || close[1] != ':')
+    return text;
+  const char *rest = close + 2;
+  while (*rest == ' ')
+    rest++;
+  return rest;
+}
+
+/* A member with nothing to add replies "[PASS]" and the turn moves on. */
+static gboolean
+is_pass_reply (const char *text)
+{
+  return g_str_has_prefix (text, "[PASS]");
+}
+
+/* While "[PASS]" is still being typed, do not flash it on screen. */
+static gboolean
+could_become_pass (const char *text)
+{
+  return *text && !is_pass_reply (text) ? g_str_has_prefix ("[PASS]", text) : is_pass_reply (text);
+}
+
+static void
+reply_set_member (Reply *r, int member)
+{
+  TeamMember *t = r->conv->team->pdata[member];
+  r->member = member;
+  gtk_label_set_text (GTK_LABEL (r->avatar), t->emoji && *t->emoji ? t->emoji : "✦");
+  gtk_label_set_text (GTK_LABEL (r->title), t->name);
+}
+
 /* ---- chat request ----------------------------------------------------- */
 
 static void
@@ -1175,9 +1307,10 @@ finish_reply (const char *error)
   g_clear_handle_id (&A.render_id, g_source_remove);
 
   g_autoptr (GString) think_buf = g_string_new (NULL);
-  g_autofree char *answer = split_thinking (r, think_buf);
+  g_autofree char *raw_answer = split_thinking (r, think_buf);
   g_autofree char *think = g_strstrip (g_strdup (think_buf->str));
-  reply_show (r, answer, think, FALSE);
+  const char *answer = r->member >= 0 ? skip_speaker_tag (raw_answer) : raw_answer;
+  gboolean passed = r->member >= 0 && is_pass_reply (answer);
 
   int tokens = A.usage_tokens > 0 ? A.usage_tokens : A.n_chunks;
   g_autoptr (GString) stats = g_string_new (NULL);
@@ -1190,24 +1323,59 @@ finish_reply (const char *error)
       g_string_append_printf (stats, "%s %.2f s   ·   %d tokens",
                               TR ("primer token", "first token"), ttft, tokens);
     }
-  reply_finish_footer (r, answer, stats->str, error);
 
   Conversation *c = r->conv;
-  if (c && *answer)
+  if (passed)
     {
-      store_load_messages (c);
-      conversation_add (c, "assistant", answer, think, stats->str);
-      store_save (c);
-      if (c != A.conv)
-        store_unload_messages (c);
+      /* This member has nothing to add: drop its bubble, the next one goes on. */
+      if (gtk_widget_get_parent (r->root))
+        gtk_box_remove (GTK_BOX (A.messages), r->root);
+    }
+  else
+    {
+      reply_show (r, answer, think, FALSE);
+      reply_finish_footer (r, answer, stats->str, error);
+      if (c && *answer)
+        {
+          store_load_messages (c);
+          conversation_add (c, "assistant", answer, think, stats->str);
+          if (r->member >= 0)
+            {
+              TeamMember *t = c->team->pdata[r->member];
+              conversation_set_author (c, t->name, t->emoji);
+              A.team_answered = TRUE;
+            }
+          store_save (c);
+          if (c != A.conv)
+            store_unload_messages (c);
+        }
     }
 
   gboolean rerender = r->detached && c && c == A.conv;
+  /* Team turn: the next member answers, unless this one failed or was stopped. */
+  gboolean next = !error && !A.quitting && !r->detached && c && conv_is_team (c) && A.queue->len > 0;
+  if (!next)
+    {
+      g_array_set_size (A.queue, 0);
+      if (passed && !A.team_answered && !A.quitting)
+        toast ("%s", TR ("Ningún especialista tenía algo que añadir. Nombra a uno para hablarle directo.",
+                         "No specialist had anything to add. Name one to talk to them directly."));
+    }
   reply_free (r);
   g_clear_object (&A.cancel);
 
   if (A.quitting)
     return;
+  if (next)
+    {
+      A.reply = reply_new (A.model, NULL, NULL);
+      A.reply->conv = c;
+      gtk_box_append (GTK_BOX (A.messages), A.reply->root);
+      A.cancel = TRACK (g_cancellable_new ());
+      scroll_to_bottom ();
+      answer_next_in_queue ();
+      return;
+    }
   if (rerender)
     render_conversation ();
   refresh_chat_list ();
@@ -1382,7 +1550,24 @@ start_request (void)
   /* The assistant's instructions, plus the short-replies hint: decode speed
    * is fixed by memory bandwidth, so shorter answers are the biggest win.
    * Both stay constant within a chat so flm can reuse its prompt cache. */
-  g_autoptr (GString) system = g_string_new (A.reply->conv->system);
+  Conversation *conv = A.reply->conv;
+  TeamMember *me = A.reply->member >= 0 ? conv->team->pdata[A.reply->member] : NULL;
+  g_autoptr (GString) system = g_string_new (me ? me->instructions : conv->system);
+  if (me)
+    {
+      g_string_append_printf (system, "\n\nYou are %s, one of several specialists in this chat. The team:", me->name);
+      for (guint i = 0; i < conv->team->len; i++)
+        {
+          TeamMember *t = conv->team->pdata[i];
+          g_autofree char *role = first_sentence (t->instructions);
+          g_string_append_printf (system, "\n- %s: %s", t->name, role);
+        }
+      g_string_append (system, "\nBuild on what teammates already said and never repeat it. Only cover what belongs "
+                               "to your specialty. If nothing in the user's message needs your specialty, or a "
+                               "teammate already covered it, reply with exactly [PASS] and nothing else. "
+                               "Teammates' messages appear as \"[Name]: text\"; never start your own message "
+                               "with a name tag.");
+    }
   if (A.concise)
     {
       if (system->len)
@@ -1400,14 +1585,18 @@ start_request (void)
       json_builder_add_string_value (b, system->str);
       json_builder_end_object (b);
     }
-  for (guint i = 0; i < A.reply->conv->msgs->len; i++)
+  for (guint i = 0; i < conv->msgs->len; i++)
     {
-      StoreMsg *m = A.reply->conv->msgs->pdata[i];
+      StoreMsg *m = conv->msgs->pdata[i];
+      /* In a team, other members' replies are shown to this one as tagged
+       * messages, so it knows who said what. */
+      gboolean other = me && m->author && !g_str_equal (m->author, me->name);
+      g_autofree char *tagged = other ? g_strdup_printf ("[%s]: %s", m->author, m->content) : NULL;
       json_builder_begin_object (b);
       json_builder_set_member_name (b, "role");
-      json_builder_add_string_value (b, m->role);
+      json_builder_add_string_value (b, other ? "user" : m->role);
       json_builder_set_member_name (b, "content");
-      json_builder_add_string_value (b, m->content);
+      json_builder_add_string_value (b, tagged ? tagged : m->content);
       json_builder_end_object (b);
     }
   json_builder_end_array (b);
@@ -1428,6 +1617,176 @@ start_request (void)
   g_string_truncate (A.http_error, 0);
 
   soup_session_send_async (flm_session (), msg, G_PRIORITY_DEFAULT, A.cancel, on_chat_sent, msg);
+}
+
+/* Picks the next team member from the queue and starts its reply. */
+static void
+answer_next_in_queue (void)
+{
+  int member = g_array_index (A.queue, int, 0);
+  g_array_remove_index (A.queue, 0);
+  reply_set_member (A.reply, member);
+  start_request ();
+}
+
+static void
+on_routed (GObject *src, GAsyncResult *res, gpointer user_data)
+{
+  (void) user_data;
+  g_autoptr (GError) error = NULL;
+  SoupMessage *msg = soup_session_get_async_result_message (SOUP_SESSION (src), res);
+  g_autoptr (GBytes) body = soup_session_send_and_read_finish (SOUP_SESSION (src), res, &error);
+
+  if (!A.reply || A.quitting)
+    return;
+  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    {
+      finish_reply (TR ("Detenido", "Stopped"));
+      return;
+    }
+
+  Conversation *c = A.reply->conv;
+  g_autofree char *answer = NULL;
+  if (body && soup_message_get_status (msg) == SOUP_STATUS_OK)
+    {
+      g_autoptr (JsonParser) parser = json_parser_new ();
+      if (json_parser_load_from_data (parser, g_bytes_get_data (body, NULL), g_bytes_get_size (body), NULL))
+        {
+          JsonNode *root = json_parser_get_root (parser);
+          JsonObject *o = JSON_NODE_HOLDS_OBJECT (root) ? json_node_get_object (root) : NULL;
+          JsonNode *ch = o ? json_object_get_member (o, "choices") : NULL;
+          if (ch && JSON_NODE_HOLDS_ARRAY (ch) && json_array_get_length (json_node_get_array (ch)) > 0)
+            {
+              JsonObject *c0 = json_array_get_object_element (json_node_get_array (ch), 0);
+              JsonNode *m = c0 ? json_object_get_member (c0, "message") : NULL;
+              if (m && JSON_NODE_HOLDS_OBJECT (m))
+                answer = g_strdup (json_object_get_string_member_with_default (json_node_get_object (m), "content", ""));
+            }
+        }
+    }
+
+  /* Read member numbers in order, skipping any reasoning block. */
+  g_array_set_size (A.queue, 0);
+  const char *p = answer ? answer : "";
+  const char *think_end = strstr (p, "</think>");
+  if (think_end)
+    p = think_end + strlen ("</think>");
+  for (; *p; p++)
+    if (g_ascii_isdigit (*p))
+      {
+        int n = (int) strtol (p, (char **) &p, 10) - 1;
+        gboolean dup = FALSE;
+        for (guint i = 0; i < A.queue->len; i++)
+          dup |= g_array_index (A.queue, int, i) == n;
+        if (n >= 0 && n < (int) c->team->len && !dup)
+          g_array_append_val (A.queue, n);
+        if (!*p)
+          break;
+      }
+
+  if (A.queue->len == 0)
+    {
+      /* Router unsure: the member who spoke last continues, else the first. */
+      int n = 0;
+      for (guint i = c->msgs->len; i-- > 0;)
+        {
+          StoreMsg *m = c->msgs->pdata[i];
+          if (!m->author)
+            continue;
+          for (guint j = 0; j < c->team->len; j++)
+            if (g_str_equal (((TeamMember *) c->team->pdata[j])->name, m->author))
+              n = (int) j;
+          break;
+        }
+      g_array_append_val (A.queue, n);
+    }
+  answer_next_in_queue ();
+}
+
+/* Decides which team members answer: the ones the user named, otherwise a
+ * short, non-streamed question to the model. */
+static void
+route_team_turn (void)
+{
+  Conversation *c = A.reply->conv;
+  StoreMsg *last = c->msgs->pdata[c->msgs->len - 1];
+
+  g_autoptr (GArray) named = mentioned_members (c, last->content);
+  if (named->len > 0)
+    {
+      g_array_set_size (A.queue, 0);
+      g_array_append_vals (A.queue, named->data, named->len);
+      answer_next_in_queue ();
+      return;
+    }
+
+  g_autoptr (GString) sys = g_string_new ("You decide which team members should answer the user's last message. Team:");
+  for (guint i = 0; i < c->team->len; i++)
+    {
+      TeamMember *t = c->team->pdata[i];
+      g_autofree char *role = first_sentence (t->instructions);
+      g_string_append_printf (sys, "\n%u. %s: %s", i + 1, t->name, role);
+    }
+  g_string_append (sys, "\nReply with only the member numbers, separated by commas. Pick the single best member "
+                        "when the message fits one specialty; list several only if the message clearly mixes "
+                        "different specialties, one number per specialty needed, most relevant first.");
+
+  g_autoptr (GString) question = g_string_new (NULL);
+  for (guint i = c->msgs->len - 1; i-- > 0;)
+    {
+      StoreMsg *m = c->msgs->pdata[i];
+      if (m->author)
+        {
+          g_string_append_printf (question, "(The previous reply was from %s.)\n", m->author);
+          break;
+        }
+    }
+  g_string_append_printf (question, "User's last message: %s", last->content);
+
+  g_autoptr (JsonBuilder) b = json_builder_new ();
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "model");
+  json_builder_add_string_value (b, A.model);
+  json_builder_set_member_name (b, "stream");
+  json_builder_add_boolean_value (b, FALSE);
+  json_builder_set_member_name (b, "max_tokens");
+  json_builder_add_int_value (b, 12);
+  json_builder_set_member_name (b, "temperature");
+  json_builder_add_double_value (b, 0);
+  json_builder_set_member_name (b, "messages");
+  json_builder_begin_array (b);
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "role");
+  json_builder_add_string_value (b, "system");
+  json_builder_set_member_name (b, "content");
+  json_builder_add_string_value (b, sys->str);
+  json_builder_end_object (b);
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "role");
+  json_builder_add_string_value (b, "user");
+  json_builder_set_member_name (b, "content");
+  json_builder_add_string_value (b, question->str);
+  json_builder_end_object (b);
+  json_builder_end_array (b);
+  json_builder_end_object (b);
+
+  g_autoptr (JsonNode) root = json_builder_get_root (b);
+  char *body = json_to_string (root, FALSE);
+  g_autoptr (GBytes) bytes = g_bytes_new_take (body, strlen (body));
+  g_autofree char *url = flm_url ("/v1/chat/completions");
+  g_autoptr (SoupMessage) msg = TRACK (soup_message_new ("POST", url));
+  soup_message_set_request_body_from_bytes (msg, "application/json", bytes);
+  soup_session_send_and_read_async (flm_session (), msg, G_PRIORITY_DEFAULT, A.cancel, on_routed, NULL);
+}
+
+/* Starts the reply in A.reply: routes team turns first. */
+static void
+begin_reply (void)
+{
+  if (conv_is_team (A.reply->conv) && A.reply->member < 0)
+    route_team_turn ();
+  else
+    start_request ();
 }
 
 static char *
@@ -1462,6 +1821,19 @@ send_text (const char *raw)
     {
       A.conv->title = make_title (text);
       Assistant *as = assistants_find (A.assistants, A.pick_id);
+      if (A.team_mode)
+        {
+          for (guint i = 0; i < A.pick_team->len; i++)
+            {
+              Assistant *m = assistants_find (A.assistants, A.pick_team->pdata[i]);
+              if (m)
+                g_ptr_array_add (A.conv->team, team_member_new (m->id, m->name, m->emoji, m->instructions));
+            }
+          /* A one-member "team" is just that assistant. */
+          as = A.conv->team->len == 1 ? assistants_find (A.assistants, ((TeamMember *) A.conv->team->pdata[0])->id) : NULL;
+          if (as)
+            g_ptr_array_set_size (A.conv->team, 0);
+        }
       if (as)
         {
           A.conv->assistant_id = g_strdup (as->id);
@@ -1475,6 +1847,7 @@ send_text (const char *raw)
 
   g_free (A.conv->model);
   A.conv->model = g_strdup (A.model);
+  A.team_answered = FALSE;
   conversation_add (A.conv, "user", text, NULL, NULL);
   store_save (A.conv);
   conv_to_front (A.conv);
@@ -1485,7 +1858,10 @@ send_text (const char *raw)
   gtk_stack_set_visible_child_name (A.chat_stack, "chat");
   add_user_bubble (text);
 
-  A.reply = reply_new (A.model, A.conv->assistant_emoji, A.conv->assistant_name);
+  if (conv_is_team (A.conv))
+    A.reply = reply_new (A.model, "✦", TR ("El equipo está eligiendo…", "The team is choosing…"));
+  else
+    A.reply = reply_new (A.model, A.conv->assistant_emoji, A.conv->assistant_name);
   A.reply->conv = A.conv;
   gtk_box_append (GTK_BOX (A.messages), A.reply->root);
   A.cancel = TRACK (g_cancellable_new ());
@@ -1494,7 +1870,7 @@ send_text (const char *raw)
   update_send_button ();
 
   if (flm_state () == FLM_READY)
-    start_request ();
+    begin_reply ();
   else
     {
       A.waiting_for_model = TRUE;
@@ -2183,7 +2559,7 @@ on_flm_state (FlmState state, const char *message, gpointer user_data)
       if (state == FLM_READY)
         {
           A.waiting_for_model = FALSE;
-          start_request ();
+          begin_reply ();
         }
       else if (state == FLM_ERROR || state == FLM_STOPPED)
         finish_reply (message ? message : TR ("Detenido", "Stopped"));
@@ -2638,6 +3014,24 @@ static void
 update_welcome_header (void)
 {
   Assistant *as = assistants_find (A.assistants, current_assistant_id ());
+  if (A.team_mode && !(A.conv && A.conv_saved) && A.pick_team->len >= 2)
+    {
+      g_autoptr (GString) t = g_string_new (NULL);
+      for (guint i = 0; i < A.pick_team->len; i++)
+        {
+          Assistant *m = assistants_find (A.assistants, A.pick_team->pdata[i]);
+          if (m)
+            g_string_append_printf (t, "%s ", m->emoji);
+        }
+      g_string_append (t, TR ("Equipo", "Team"));
+      adw_status_page_set_title (A.welcome, t->str);
+      adw_status_page_set_description (A.welcome, TR ("Pregunta lo que quieras: responde el especialista que corresponda. "
+                                                      "Nómbralo para hablarle directo.",
+                                                      "Ask anything: the right specialist answers. "
+                                                      "Name one to talk to them directly."));
+      gtk_widget_set_visible (A.suggestions, FALSE);
+      return;
+    }
   if (as)
     {
       g_autofree char *title = g_strdup_printf ("%s %s", as->emoji, as->name);
@@ -2677,9 +3071,86 @@ choose_assistant (const char *id)
       A.conv->assistant_name = as ? g_strdup (as->name) : NULL;
       A.conv->assistant_emoji = as ? g_strdup (as->emoji) : NULL;
       A.conv->system = as ? g_strdup (as->instructions) : NULL;
+      g_ptr_array_set_size (A.conv->team, 0);
       store_save (A.conv);
       refresh_chat_list ();
     }
+  update_assistant_ui ();
+}
+
+/* Whether an assistant is in the team being edited: the open chat's team,
+ * or the one picked for the next chat. */
+static gboolean
+in_current_team (const char *id)
+{
+  if (A.conv && A.conv_saved)
+    {
+      for (guint i = 0; i < A.conv->team->len; i++)
+        if (g_strcmp0 (((TeamMember *) A.conv->team->pdata[i])->id, id) == 0)
+          return TRUE;
+      return A.conv->team->len == 0 && g_strcmp0 (A.conv->assistant_id, id) == 0;
+    }
+  for (guint i = 0; i < A.pick_team->len; i++)
+    if (g_str_equal (A.pick_team->pdata[i], id))
+      return TRUE;
+  return FALSE;
+}
+
+/* Adds or removes a member. In an open chat, a one-member team becomes
+ * that single assistant and an empty one falls back to General. */
+static void
+toggle_team_member (const char *id)
+{
+  Assistant *as = assistants_find (A.assistants, id);
+  if (!as)
+    return;
+
+  if (!(A.conv && A.conv_saved))
+    {
+      for (guint i = 0; i < A.pick_team->len; i++)
+        if (g_str_equal (A.pick_team->pdata[i], id))
+          {
+            g_ptr_array_remove_index (A.pick_team, i);
+            update_assistant_ui ();
+            return;
+          }
+      g_ptr_array_add (A.pick_team, g_strdup (id));
+      update_assistant_ui ();
+      return;
+    }
+
+  Conversation *c = A.conv;
+  if (c->team->len == 0 && c->assistant_id)
+    {
+      Assistant *cur = assistants_find (A.assistants, c->assistant_id);
+      g_ptr_array_add (c->team, team_member_new (c->assistant_id, c->assistant_name, c->assistant_emoji,
+                                                 cur ? cur->instructions : c->system));
+    }
+  gboolean removed = FALSE;
+  for (guint i = 0; i < c->team->len && !removed; i++)
+    if (g_strcmp0 (((TeamMember *) c->team->pdata[i])->id, id) == 0)
+      {
+        g_ptr_array_remove_index (c->team, i);
+        removed = TRUE;
+      }
+  if (!removed)
+    g_ptr_array_add (c->team, team_member_new (as->id, as->name, as->emoji, as->instructions));
+
+  g_clear_pointer (&c->assistant_id, g_free);
+  g_clear_pointer (&c->assistant_name, g_free);
+  g_clear_pointer (&c->assistant_emoji, g_free);
+  g_clear_pointer (&c->system, g_free);
+  if (c->team->len == 1)
+    {
+      TeamMember *t = c->team->pdata[0];
+      c->assistant_id = g_strdup (t->id);
+      c->assistant_name = g_strdup (t->name);
+      c->assistant_emoji = g_strdup (t->emoji);
+      c->system = g_strdup (t->instructions);
+      g_ptr_array_set_size (c->team, 0);
+    }
+  store_save (c);
+  refresh_chat_list ();
   update_assistant_ui ();
 }
 
@@ -2688,8 +3159,58 @@ on_assistant_row_activated (GtkListBox *box, GtkListBoxRow *row, gpointer user_d
 {
   (void) box;
   (void) user_data;
+  const char *id = g_object_get_data (G_OBJECT (row), "id");
+  if (A.team_mode && id)
+    {
+      toggle_team_member (id); /* keep the popover open to pick several */
+      return;
+    }
   gtk_menu_button_popdown (A.assistant_button);
-  choose_assistant (g_object_get_data (G_OBJECT (row), "id"));
+  choose_assistant (id);
+}
+
+static void
+on_team_switch (GObject *sw, GParamSpec *pspec, gpointer user_data)
+{
+  (void) pspec;
+  (void) user_data;
+  gboolean on = gtk_switch_get_active (GTK_SWITCH (sw));
+  if (on == A.team_mode)
+    return;
+  A.team_mode = on;
+
+  if (on)
+    {
+      /* Start the team with the current assistant. */
+      if (!(A.conv && A.conv_saved) && A.pick_id && A.pick_team->len == 0)
+        g_ptr_array_add (A.pick_team, g_strdup (A.pick_id));
+    }
+  else
+    {
+      /* Back to one assistant: keep the first member. */
+      const char *first = NULL;
+      if (A.conv && A.conv_saved && A.conv->team->len > 0)
+        first = ((TeamMember *) A.conv->team->pdata[0])->id;
+      else if (!(A.conv && A.conv_saved) && A.pick_team->len > 0)
+        first = A.pick_team->pdata[0];
+      else
+        first = current_assistant_id ();
+      g_autofree char *keep = g_strdup (first);
+      g_ptr_array_set_size (A.pick_team, 0);
+      choose_assistant (keep);
+      return;
+    }
+  update_assistant_ui ();
+}
+
+static void
+on_clear_assistant (GtkButton *button, gpointer user_data)
+{
+  (void) button;
+  (void) user_data;
+  A.team_mode = FALSE;
+  g_ptr_array_set_size (A.pick_team, 0);
+  choose_assistant (NULL);
 }
 
 static void
@@ -2723,10 +3244,21 @@ assistant_row (const char *id, const char *emoji, const char *name, const char *
   gtk_list_box_row_set_activatable (GTK_LIST_BOX_ROW (row), TRUE);
   g_object_set_data_full (G_OBJECT (row), "id", g_strdup (id), g_free);
 
-  GtkWidget *check = gtk_image_new_from_icon_name ("object-select-symbolic");
-  gtk_widget_add_css_class (check, "accent");
-  gtk_widget_set_opacity (check, g_strcmp0 (id, current_assistant_id ()) == 0 ? 1 : 0);
-  adw_action_row_add_suffix (ADW_ACTION_ROW (row), check);
+  if (A.team_mode)
+    {
+      GtkWidget *box = gtk_check_button_new ();
+      gtk_check_button_set_active (GTK_CHECK_BUTTON (box), in_current_team (id));
+      gtk_widget_set_can_target (box, FALSE); /* the whole row toggles it */
+      gtk_widget_set_valign (box, GTK_ALIGN_CENTER);
+      adw_action_row_add_prefix (ADW_ACTION_ROW (row), box);
+    }
+  else
+    {
+      GtkWidget *check = gtk_image_new_from_icon_name ("object-select-symbolic");
+      gtk_widget_add_css_class (check, "accent");
+      gtk_widget_set_opacity (check, g_strcmp0 (id, current_assistant_id ()) == 0 ? 1 : 0);
+      adw_action_row_add_suffix (ADW_ACTION_ROW (row), check);
+    }
 
   if (id)
     {
@@ -2765,11 +3297,40 @@ update_assistant_ui (void)
         }
     }
   g_autofree char *label = g_strdup_printf ("%s  %s", emoji, name);
-  gtk_label_set_text (A.assistant_label, label);
+
+  /* Teams show their members' emojis: "🏋️ 🍎  Team". */
+  g_autoptr (GString) team = g_string_new (NULL);
+  guint members = 0;
+  if (A.conv && A.conv_saved)
+    for (guint i = 0; i < A.conv->team->len; i++, members++)
+      g_string_append_printf (team, "%s ", ((TeamMember *) A.conv->team->pdata[i])->emoji);
+  else if (A.team_mode)
+    for (guint i = 0; i < A.pick_team->len; i++)
+      {
+        Assistant *m = assistants_find (A.assistants, A.pick_team->pdata[i]);
+        if (m)
+          {
+            g_string_append_printf (team, "%s ", m->emoji);
+            members++;
+          }
+      }
+  if (members >= 2)
+    {
+      g_string_append_printf (team, " %s", TR ("Equipo", "Team"));
+      gtk_label_set_text (A.assistant_label, team->str);
+    }
+  else
+    gtk_label_set_text (A.assistant_label, label);
+
+  gboolean general = members < 2 && current_assistant_id () == NULL &&
+                     !(A.team_mode && members == 1);
+  gtk_widget_set_visible (A.clear_assistant, !general);
+  gtk_switch_set_active (A.team_switch, A.team_mode);
 
   gtk_list_box_remove_all (A.assistant_list);
-  gtk_list_box_append (A.assistant_list, assistant_row (NULL, "✦", TR ("General", "General"),
-                                                       TR ("Sin instrucciones especiales", "No special instructions")));
+  if (!A.team_mode)
+    gtk_list_box_append (A.assistant_list, assistant_row (NULL, "✦", TR ("General", "General"),
+                                                         TR ("Sin instrucciones especiales", "No special instructions")));
   for (guint i = 0; i < A.assistants->len; i++)
     {
       Assistant *as = A.assistants->pdata[i];
@@ -2817,7 +3378,25 @@ build_assistant_button (void)
   gtk_box_append (GTK_BOX (actions), explore);
   gtk_box_append (GTK_BOX (actions), add);
 
+  GtkWidget *team_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 10);
+  gtk_widget_add_css_class (team_row, "team-row");
+  GtkWidget *team_text = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_widget_set_hexpand (team_text, TRUE);
+  GtkWidget *team_title = gtk_label_new (TR ("Modo equipo", "Team mode"));
+  gtk_label_set_xalign (GTK_LABEL (team_title), 0);
+  gtk_widget_add_css_class (team_title, "heading");
+  GtkWidget *team_sub = dim_label (TR ("Elige varios: responde el especialista de cada tema",
+                                       "Pick several: the right specialist answers each topic"), "caption");
+  gtk_box_append (GTK_BOX (team_text), team_title);
+  gtk_box_append (GTK_BOX (team_text), team_sub);
+  A.team_switch = GTK_SWITCH (gtk_switch_new ());
+  gtk_widget_set_valign (GTK_WIDGET (A.team_switch), GTK_ALIGN_CENTER);
+  g_signal_connect (A.team_switch, "notify::active", G_CALLBACK (on_team_switch), NULL);
+  gtk_box_append (GTK_BOX (team_row), team_text);
+  gtk_box_append (GTK_BOX (team_row), GTK_WIDGET (A.team_switch));
+
   gtk_box_append (GTK_BOX (pop_box), title);
+  gtk_box_append (GTK_BOX (pop_box), team_row);
   gtk_box_append (GTK_BOX (pop_box), sw);
   gtk_box_append (GTK_BOX (pop_box), actions);
 
@@ -2832,7 +3411,18 @@ build_assistant_button (void)
   gtk_widget_add_css_class (GTK_WIDGET (A.assistant_button), "model-button");
   gtk_widget_set_tooltip_text (GTK_WIDGET (A.assistant_button), TR ("Asistente", "Assistant"));
   gtk_widget_set_valign (GTK_WIDGET (A.assistant_button), GTK_ALIGN_CENTER);
-  return GTK_WIDGET (A.assistant_button);
+
+  /* × next to the selector: back to General in one click. */
+  A.clear_assistant = icon_button ("window-close-symbolic", TR ("Quitar asistente (volver a General)",
+                                                                "Remove assistant (back to General)"));
+  gtk_widget_add_css_class (A.clear_assistant, "clear-assistant");
+  g_signal_connect (A.clear_assistant, "clicked", G_CALLBACK (on_clear_assistant), NULL);
+
+  GtkWidget *wrap = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_set_valign (wrap, GTK_ALIGN_CENTER);
+  gtk_box_append (GTK_BOX (wrap), GTK_WIDGET (A.assistant_button));
+  gtk_box_append (GTK_BOX (wrap), A.clear_assistant);
+  return wrap;
 }
 
 static char *
@@ -3047,13 +3637,54 @@ typedef struct {
 
 static Gallery gallery;
 
+/* Added templates offer "Remove"; the others offer "Add". */
 static void
-gallery_mark_added (GtkWidget *button)
+gallery_mark_added (GtkWidget *button, gboolean added)
 {
-  gtk_button_set_label (GTK_BUTTON (button), TR ("Añadido", "Added"));
-  gtk_widget_remove_css_class (button, "suggested-action");
-  gtk_widget_add_css_class (button, "flat");
-  gtk_widget_set_sensitive (button, FALSE);
+  gtk_button_set_label (GTK_BUTTON (button), added ? TR ("Quitar", "Remove") : TR ("Añadir", "Add"));
+  if (added)
+    {
+      gtk_widget_remove_css_class (button, "suggested-action");
+      gtk_widget_set_tooltip_text (button, TR ("Quitar de tu lista (tus chats se conservan)",
+                                               "Remove from your list (your chats are kept)"));
+    }
+  else
+    {
+      gtk_widget_add_css_class (button, "suggested-action");
+      gtk_widget_set_tooltip_text (button, NULL);
+    }
+}
+
+static void
+gallery_sync_button (const char *key, gboolean added)
+{
+  for (guint i = 0; gallery.rows && i < gallery.rows->len; i++)
+    {
+      GObject *row = gallery.rows->pdata[i];
+      const AssistantTemplate *t = g_object_get_data (row, "template");
+      if (g_str_equal (t->key, key))
+        gallery_mark_added (g_object_get_data (row, "button"), added);
+    }
+}
+
+static void
+gallery_remove (const char *key)
+{
+  for (guint i = 0; i < A.assistants->len; i++)
+    {
+      Assistant *a = A.assistants->pdata[i];
+      if (g_strcmp0 (a->template_key, key) != 0)
+        continue;
+      toast (TR ("%s %s quitado de tu lista", "%s %s removed from your list"), a->emoji, a->name);
+      for (guint j = 0; j < A.pick_team->len; j++)
+        if (g_str_equal (A.pick_team->pdata[j], a->id))
+          g_ptr_array_remove_index (A.pick_team, j--);
+      g_ptr_array_remove_index (A.assistants, i);
+      break;
+    }
+  assistants_save (A.assistants);
+  gallery_sync_button (key, FALSE);
+  update_assistant_ui ();
 }
 
 static Assistant *
@@ -3064,13 +3695,7 @@ gallery_add (const char *key)
   Assistant *a = assistant_new_from_template (key);
   if (!a)
     return NULL;
-  for (guint i = 0; gallery.rows && i < gallery.rows->len; i++)
-    {
-      GObject *row = gallery.rows->pdata[i];
-      const AssistantTemplate *t = g_object_get_data (row, "template");
-      if (g_str_equal (t->key, key))
-        gallery_mark_added (g_object_get_data (row, "button"));
-    }
+  gallery_sync_button (key, TRUE);
   g_ptr_array_add (A.assistants, a);
   assistants_save (A.assistants);
   update_assistant_ui ();
@@ -3083,7 +3708,11 @@ static void
 on_gallery_add (GtkButton *button, gpointer user_data)
 {
   (void) user_data;
-  gallery_add (g_object_get_data (G_OBJECT (button), "key"));
+  const char *key = g_object_get_data (G_OBJECT (button), "key");
+  if (assistants_has_template (A.assistants, key))
+    gallery_remove (key);
+  else
+    gallery_add (key);
 }
 
 static gboolean
@@ -3182,8 +3811,7 @@ open_gallery (void)
       g_object_set_data (G_OBJECT (add), "key", (gpointer) t->key);
       g_signal_connect (add, "clicked", G_CALLBACK (on_gallery_add), NULL);
       g_object_set_data (G_OBJECT (row), "button", add);
-      if (assistants_has_template (A.assistants, t->key))
-        gallery_mark_added (add);
+      gallery_mark_added (add, assistants_has_template (A.assistants, t->key));
       adw_action_row_add_suffix (ADW_ACTION_ROW (row), add);
 
       adw_preferences_group_add (ADW_PREFERENCES_GROUP (gallery.groups[t->category]), row);
@@ -3688,6 +4316,8 @@ on_shutdown (GApplication *app, gpointer user_data)
   g_clear_pointer (&A.convs, g_ptr_array_unref);
   g_clear_pointer (&A.assistants, g_ptr_array_unref);
   g_clear_pointer (&A.pick_id, g_free);
+  g_clear_pointer (&A.pick_team, g_ptr_array_unref);
+  g_clear_pointer (&A.queue, g_array_unref);
   g_clear_pointer (&A.installed, g_ptr_array_unref);
   g_clear_pointer (&A.pulling, g_hash_table_unref);
   g_clear_pointer (&A.md.sys, sysinfo_free);
@@ -3733,6 +4363,8 @@ on_activate (GApplication *app, gpointer user_data)
   A.pulling = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   A.convs = store_load_all ();
   A.assistants = assistants_load ();
+  A.pick_team = g_ptr_array_new_with_free_func (g_free);
+  A.queue = g_array_new (FALSE, FALSE, sizeof (int));
   A.stick_bottom = TRUE;
 
   A.win = GTK_WINDOW (adw_application_window_new (GTK_APPLICATION (app)));
@@ -3861,6 +4493,22 @@ selftest_tick (gpointer user_data)
     }
   else if (g_str_equal (s, "newchat"))
     new_chat ();
+  else if (g_str_has_prefix (s, "team:"))
+    {
+      g_auto (GStrv) idx = g_strsplit (s + 5, ",", -1);
+      A.team_mode = TRUE;
+      g_ptr_array_set_size (A.pick_team, 0);
+      for (int k = 0; idx[k]; k++)
+        if ((guint) atoi (idx[k]) < A.assistants->len)
+          g_ptr_array_add (A.pick_team, g_strdup (((Assistant *) A.assistants->pdata[atoi (idx[k])])->id));
+      update_assistant_ui ();
+    }
+  else if (g_str_has_prefix (s, "toggle:") && (guint) atoi (s + 7) < A.assistants->len)
+    toggle_team_member (((Assistant *) A.assistants->pdata[atoi (s + 7)])->id);
+  else if (g_str_equal (s, "clearassistant"))
+    on_clear_assistant (NULL, NULL);
+  else if (g_str_has_prefix (s, "galleryremove:"))
+    gallery_remove (s + 14);
   else if (g_str_has_prefix (s, "pick:"))
     {
       guint n = (guint) atoi (s + 5);

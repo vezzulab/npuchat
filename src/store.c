@@ -11,7 +11,31 @@ store_msg_free (gpointer p)
   g_free (m->content);
   g_free (m->think);
   g_free (m->stats);
+  g_free (m->author);
+  g_free (m->author_emoji);
   g_free (m);
+}
+
+TeamMember *
+team_member_new (const char *id, const char *name, const char *emoji, const char *instructions)
+{
+  TeamMember *t = g_new0 (TeamMember, 1);
+  t->id = g_strdup (id);
+  t->name = g_strdup (name);
+  t->emoji = g_strdup (emoji);
+  t->instructions = g_strdup (instructions ? instructions : "");
+  return t;
+}
+
+void
+team_member_free (gpointer p)
+{
+  TeamMember *t = p;
+  g_free (t->id);
+  g_free (t->name);
+  g_free (t->emoji);
+  g_free (t->instructions);
+  g_free (t);
 }
 
 Conversation *
@@ -24,6 +48,7 @@ conversation_new (void)
   c->id = g_strdup_printf ("%s-%04x", stamp, g_random_int_range (0, 0xffff));
   c->updated = g_date_time_to_unix (now);
   c->msgs = g_ptr_array_new_with_free_func (store_msg_free);
+  c->team = g_ptr_array_new_with_free_func (team_member_free);
   c->loaded = TRUE;
   return c;
 }
@@ -40,6 +65,7 @@ conversation_free (Conversation *c)
   g_free (c->assistant_name);
   g_free (c->assistant_emoji);
   g_free (c->system);
+  g_ptr_array_unref (c->team);
   g_ptr_array_unref (c->msgs);
   g_free (c);
 }
@@ -55,6 +81,18 @@ conversation_add (Conversation *c, const char *role, const char *content,
   m->stats = stats && *stats ? g_strdup (stats) : NULL;
   g_ptr_array_add (c->msgs, m);
   c->updated = g_get_real_time () / G_USEC_PER_SEC;
+}
+
+void
+conversation_set_author (Conversation *c, const char *name, const char *emoji)
+{
+  if (c->msgs->len == 0)
+    return;
+  StoreMsg *m = c->msgs->pdata[c->msgs->len - 1];
+  g_free (m->author);
+  g_free (m->author_emoji);
+  m->author = g_strdup (name);
+  m->author_emoji = g_strdup (emoji);
 }
 
 static char *
@@ -101,6 +139,15 @@ load_file (const char *path, gboolean with_messages)
   c->system = g_strdup (str_member (o, "system"));
   c->updated = json_object_get_int_member_with_default (o, "updated", 0);
   c->msgs = g_ptr_array_new_with_free_func (store_msg_free);
+  c->team = g_ptr_array_new_with_free_func (team_member_free);
+  JsonNode *team = json_object_get_member (o, "team");
+  for (guint i = 0; team && JSON_NODE_HOLDS_ARRAY (team) && i < json_array_get_length (json_node_get_array (team)); i++)
+    {
+      JsonObject *t = json_array_get_object_element (json_node_get_array (team), i);
+      if (t && str_member (t, "name"))
+        g_ptr_array_add (c->team, team_member_new (str_member (t, "id"), str_member (t, "name"),
+                                                   str_member (t, "emoji"), str_member (t, "instructions")));
+    }
   c->loaded = with_messages;
   if (!with_messages)
     return c;
@@ -117,6 +164,8 @@ load_file (const char *path, gboolean with_messages)
       sm->content = g_strdup (str_member (m, "content"));
       sm->think = g_strdup (str_member (m, "think"));
       sm->stats = g_strdup (str_member (m, "stats"));
+      sm->author = g_strdup (str_member (m, "author"));
+      sm->author_emoji = g_strdup (str_member (m, "author_emoji"));
       g_ptr_array_add (c->msgs, sm);
     }
   return c;
@@ -201,6 +250,26 @@ store_save (Conversation *c)
       json_builder_set_member_name (b, "system");
       json_builder_add_string_value (b, c->system);
     }
+  if (c->team->len)
+    {
+      json_builder_set_member_name (b, "team");
+      json_builder_begin_array (b);
+      for (guint i = 0; i < c->team->len; i++)
+        {
+          TeamMember *t = c->team->pdata[i];
+          json_builder_begin_object (b);
+          json_builder_set_member_name (b, "id");
+          json_builder_add_string_value (b, t->id ? t->id : "");
+          json_builder_set_member_name (b, "name");
+          json_builder_add_string_value (b, t->name);
+          json_builder_set_member_name (b, "emoji");
+          json_builder_add_string_value (b, t->emoji ? t->emoji : "");
+          json_builder_set_member_name (b, "instructions");
+          json_builder_add_string_value (b, t->instructions);
+          json_builder_end_object (b);
+        }
+      json_builder_end_array (b);
+    }
   json_builder_set_member_name (b, "updated");
   json_builder_add_int_value (b, c->updated);
   json_builder_set_member_name (b, "messages");
@@ -222,6 +291,13 @@ store_save (Conversation *c)
         {
           json_builder_set_member_name (b, "stats");
           json_builder_add_string_value (b, m->stats);
+        }
+      if (m->author)
+        {
+          json_builder_set_member_name (b, "author");
+          json_builder_add_string_value (b, m->author);
+          json_builder_set_member_name (b, "author_emoji");
+          json_builder_add_string_value (b, m->author_emoji ? m->author_emoji : "");
         }
       json_builder_end_object (b);
     }

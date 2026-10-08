@@ -22,6 +22,10 @@ steps="send:Hola;wait;newchat;send:Otra;wait;newchat;send:Tercera;wait;open:1;de
 steps+=";models;sleep:3;closedlg;installed;sleep:2;closedlg;prefs;sleep:2;closedlg"
 steps+=";pick:0;send:Me siento estresado;wait;newchat;mkassistant;sleep:1;send:Plan de comidas;wait"
 steps+=";gallery;sleep:2;galleryadd:chef;galleryadd:linux;closedlg;assistmenu;sleep:1;popdown;pick:1;editor;sleep:1;closedlg;pick:-1;newchat"
+steps+=";newchat;team:0,1;send:Quiero una rutina y un plan de comidas;wait;wait"
+steps+=";send:PASSTEST algo mas;wait;wait;send:TAGTEST otra vez;wait;wait"
+steps+=";send:Estratega, ¿cómo me organizo?;wait;toggle:2;send:¿Y para estudiar?;wait"
+steps+=";clearassistant;galleryremove:chef;galleryremove:linux;newchat"
 steps+=";lang:en;theme:light;sleep:1;send:English;wait;close"
 
 set +e
@@ -55,6 +59,24 @@ if grep -q 'SELFTEST-LIVE ' "$work/asan.log"; then
   echo "FAIL: objects leaked" >&2
   exit 1
 fi
+
+# Team chat: one chat holds replies from two different members. Authors are
+# stored per message, so they survive the later "remove assistant" step.
+found=0
+for f in "$work"/data/npu-chat/chats/*.json; do
+  n=$( { grep -o '"author" : "[^"]*"' "$f" || true; } | sort -u | wc -l)
+  [ "$n" -ge 2 ] && found=1
+done
+[ "$found" -eq 1 ] || { echo "FAIL: no chat with replies from 2+ team members" >&2; exit 1; }
+
+# A member that passes leaves nothing behind, and a copied "[Name]:" tag is stripped.
+if grep -lq '\[PASS\]' "$work"/data/npu-chat/chats/*.json; then
+  echo "FAIL: a [PASS] reply was saved" >&2; exit 1
+fi
+if grep -hq '"content" : "\[[^]]*\]:' "$work"/data/npu-chat/chats/*.json; then
+  echo "FAIL: a speaker tag was kept in a reply" >&2; exit 1
+fi
+grep -lq 'Respuesta con etiqueta propia' "$work"/data/npu-chat/chats/*.json || { echo "FAIL: tagged reply missing" >&2; exit 1; }
 
 # 2) Plain memory leaks. GTK, GLib and fontconfig keep some one-time
 # allocations until exit; a leak counts as ours when our code made the

@@ -1,5 +1,5 @@
 project('npu-chat', 'c',
-  version: '0.4.0',
+  version: '0.5.0',
   default_options: ['warning_level=2', 'c_std=gnu11', 'buildtype=release'])
 
 gnome = import('gnome')

@@ -337,3 +337,20 @@ image.warning {
   padding: 12px;
   font-size: 1.02em;
 }
+
+/* ---- teams ---- */
+
+.team-row {
+  padding: 8px 10px 10px 10px;
+}
+
+.clear-assistant {
+  min-width: 26px;
+  min-height: 26px;
+  margin-left: -2px;
+  opacity: 0.6;
+}
+
+.clear-assistant:hover {
+  opacity: 1;
+}

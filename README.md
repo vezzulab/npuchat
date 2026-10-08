@@ -25,6 +25,7 @@ Most local AI apps on Linux (Ollama, llama.cpp, LM Studio) run models on the CPU
 - **100% local:** runs on the NPU, works offline.
 - **Only models that fit:** checks your NPU, RAM and disk, and shows the expected speed of each model.
 - **Assistants:** create your own (psychologist, strategist, chef…) or add one of the 48 in the gallery.
+- **Teams:** pick several assistants (e.g. personal trainer + nutritionist) and the right specialist answers each topic; one with nothing to add passes to the next.
 - **Battery-aware:** power saver on battery, full speed when plugged in, and the model is unloaded when idle.
 - **Updates itself:** new versions install in one click, verified with SHA-256.
 - **The basics, done well:** chat history, Markdown and code blocks, light and dark themes, English and Español.
