@@ -15,6 +15,9 @@ store_msg_free (gpointer p)
   g_free (m->author_emoji);
   if (m->sources)
     g_ptr_array_unref (m->sources);
+  if (m->tools)
+    g_ptr_array_unref (m->tools);
+  g_free (m->note);
   g_free (m);
 }
 
@@ -25,6 +28,16 @@ store_source_free (gpointer p)
   g_free (s->file);
   g_free (s->text);
   g_free (s);
+}
+
+static void
+store_tool_free (gpointer p)
+{
+  StoreTool *t = p;
+  g_free (t->name);
+  g_free (t->args);
+  g_free (t->result);
+  g_free (t);
 }
 
 TeamMember *
@@ -120,6 +133,32 @@ conversation_add_source (Conversation *c, const char *file, int page, const char
   s->page = page;
   s->text = g_strdup (text);
   g_ptr_array_add (m->sources, s);
+}
+
+void
+conversation_set_note (Conversation *c, const char *note)
+{
+  if (c->msgs->len == 0)
+    return;
+  StoreMsg *m = c->msgs->pdata[c->msgs->len - 1];
+  g_free (m->note);
+  m->note = g_strdup (note);
+}
+
+void
+conversation_add_tool (Conversation *c, const char *name, const char *args, const char *result, gboolean ok)
+{
+  if (c->msgs->len == 0)
+    return;
+  StoreMsg *m = c->msgs->pdata[c->msgs->len - 1];
+  if (!m->tools)
+    m->tools = g_ptr_array_new_with_free_func (store_tool_free);
+  StoreTool *t = g_new0 (StoreTool, 1);
+  t->name = g_strdup (name);
+  t->args = g_strdup (args ? args : "");
+  t->result = g_strdup (result ? result : "");
+  t->ok = ok;
+  g_ptr_array_add (m->tools, t);
 }
 
 gboolean
@@ -248,6 +287,24 @@ load_file (const char *path, gboolean with_messages)
               g_ptr_array_add (sm->sources, s);
             }
         }
+      JsonNode *tl = json_object_get_member (m, "tools");
+      if (tl && JSON_NODE_HOLDS_ARRAY (tl))
+        {
+          sm->tools = g_ptr_array_new_with_free_func (store_tool_free);
+          for (guint k = 0; k < json_array_get_length (json_node_get_array (tl)); k++)
+            {
+              JsonObject *to = json_array_get_object_element (json_node_get_array (tl), k);
+              if (!to)
+                continue;
+              StoreTool *t = g_new0 (StoreTool, 1);
+              t->name = g_strdup (str_member (to, "n"));
+              t->args = g_strdup (str_member (to, "a"));
+              t->result = g_strdup (str_member (to, "r"));
+              t->ok = json_object_get_boolean_member_with_default (to, "ok", TRUE);
+              g_ptr_array_add (sm->tools, t);
+            }
+        }
+      sm->note = g_strdup (str_member (m, "note"));
       sm->author = g_strdup (str_member (m, "author"));
       sm->author_emoji = g_strdup (str_member (m, "author_emoji"));
       g_ptr_array_add (c->msgs, sm);
@@ -398,6 +455,31 @@ store_save (Conversation *c)
               json_builder_add_int_value (b, s->page);
               json_builder_set_member_name (b, "t");
               json_builder_add_string_value (b, s->text ? s->text : "");
+              json_builder_end_object (b);
+            }
+          json_builder_end_array (b);
+        }
+      if (m->note)
+        {
+          json_builder_set_member_name (b, "note");
+          json_builder_add_string_value (b, m->note);
+        }
+      if (m->tools)
+        {
+          json_builder_set_member_name (b, "tools");
+          json_builder_begin_array (b);
+          for (guint k = 0; k < m->tools->len; k++)
+            {
+              StoreTool *t = m->tools->pdata[k];
+              json_builder_begin_object (b);
+              json_builder_set_member_name (b, "n");
+              json_builder_add_string_value (b, t->name ? t->name : "");
+              json_builder_set_member_name (b, "a");
+              json_builder_add_string_value (b, t->args ? t->args : "");
+              json_builder_set_member_name (b, "r");
+              json_builder_add_string_value (b, t->result ? t->result : "");
+              json_builder_set_member_name (b, "ok");
+              json_builder_add_boolean_value (b, t->ok);
               json_builder_end_object (b);
             }
           json_builder_end_array (b);

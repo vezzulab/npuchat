@@ -6,41 +6,11 @@
 #include <libsoup/soup.h>
 #include <string.h>
 
+#include "net.h"
 #include "selftest.h"
 
 #define RELEASES_API "https://api.github.com/repos/vezzulab/npuchat/releases/latest"
 #define ASSET_NAME   "NPU-Chat-x86_64.AppImage"
-
-static SoupSession *session;
-
-/* The AppImage bundles its own TLS backend but not a CA list, so point it at
- * the host's certificates (paths differ between distros). */
-static SoupSession *
-get_session (void)
-{
-  if (session)
-    return session;
-
-  session = TRACK (soup_session_new_with_options ("timeout", 30, "user-agent", "NPU-Chat/" NPU_CHAT_VERSION, NULL));
-  static const char *ca_files[] = {
-    "/etc/ssl/certs/ca-certificates.crt", /* Debian, Ubuntu, Arch */
-    "/etc/pki/tls/certs/ca-bundle.crt",   /* Fedora, RHEL */
-    "/etc/ssl/ca-bundle.pem",             /* openSUSE */
-    "/etc/ssl/cert.pem",                  /* Alpine, others */
-    NULL,
-  };
-  for (int i = 0; ca_files[i]; i++)
-    if (g_file_test (ca_files[i], G_FILE_TEST_EXISTS))
-      {
-        g_autoptr (GTlsDatabase) db = g_tls_file_database_new (ca_files[i], NULL);
-        if (db)
-          {
-            soup_session_set_tls_database (session, db);
-            break;
-          }
-      }
-  return session;
-}
 
 static const char *
 api_url (void)
@@ -144,7 +114,7 @@ updater_check (UpdateCheckCb cb, gpointer data)
   ctx->data = data;
   g_autoptr (SoupMessage) msg = soup_message_new ("GET", api_url ());
   soup_message_headers_append (soup_message_get_request_headers (msg), "Accept", "application/vnd.github+json");
-  soup_session_send_and_read_async (get_session (), msg, G_PRIORITY_LOW, NULL, check_done, ctx);
+  soup_session_send_and_read_async (net_session (), msg, G_PRIORITY_LOW, NULL, check_done, ctx);
 }
 
 gboolean
@@ -307,7 +277,7 @@ sha_downloaded (GObject *src, GAsyncResult *res, gpointer user_data)
   ctx->expected_sha = g_strdup (text);
 
   g_autoptr (SoupMessage) next = soup_message_new ("GET", ctx->appimage_url);
-  soup_session_send_async (get_session (), next, G_PRIORITY_LOW, NULL, appimage_opened, ctx);
+  soup_session_send_async (net_session (), next, G_PRIORITY_LOW, NULL, appimage_opened, ctx);
 }
 
 void
@@ -329,7 +299,7 @@ updater_install (const UpdateInfo *info, UpdateProgressCb progress, UpdateDoneCb
   ctx->sha = g_checksum_new (G_CHECKSUM_SHA256);
 
   g_autoptr (SoupMessage) msg = soup_message_new ("GET", info->sha256_url);
-  soup_session_send_and_read_async (get_session (), msg, G_PRIORITY_LOW, NULL, sha_downloaded, ctx);
+  soup_session_send_and_read_async (net_session (), msg, G_PRIORITY_LOW, NULL, sha_downloaded, ctx);
 }
 
 void
@@ -346,5 +316,5 @@ updater_restart_after_exit (void)
 void
 updater_shutdown (void)
 {
-  g_clear_object (&session);
+  net_shutdown ();
 }

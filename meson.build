@@ -1,5 +1,5 @@
 project('npu-chat', 'c',
-  version: '0.6.0',
+  version: '0.7.0',
   default_options: ['warning_level=2', 'c_std=gnu11', 'buildtype=release'])
 
 gnome = import('gnome')
@@ -27,7 +27,7 @@ resources = gnome.compile_resources('resources',
 executable('npu-chat',
   'src/main.c', 'src/flm.c', 'src/markdown.c', 'src/i18n.c',
   'src/sysinfo.c', 'src/catalog.c', 'src/store.c', 'src/power.c',
-  'src/assistants.c', 'src/templates.c', 'src/updater.c', 'src/rag.c',
+  'src/assistants.c', 'src/templates.c', 'src/updater.c', 'src/rag.c', 'src/net.c', 'src/skills.c',
   resources,
   dependencies: deps,
   install: true)
@@ -40,5 +40,8 @@ install_data('data/io.github.vezzulab.NpuChat.svg',
 if get_option('tests')
   executable('test-rag',
     'tests/test-rag.c', 'src/rag.c',
+    dependencies: deps)
+  executable('test-skills',
+    'tests/test-skills.c', 'src/skills.c', 'src/net.c', 'src/sysinfo.c', 'src/i18n.c',
     dependencies: deps)
 endif

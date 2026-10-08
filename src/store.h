@@ -9,12 +9,22 @@ typedef struct {
   char *text;
 } StoreSource;
 
+/* One use of a skill while writing a reply. */
+typedef struct {
+  char    *name;   /* skill id, e.g. "calculator" */
+  char    *args;   /* arguments as the model wrote them (JSON) */
+  char    *result;
+  gboolean ok;
+} StoreTool;
+
 typedef struct {
   char *role;    /* "user" or "assistant" */
   char *content; /* answer text sent back to the model */
   char *think;   /* reasoning shown collapsed, may be NULL */
   char *stats;   /* footer line, may be NULL */
   GPtrArray *sources; /* user messages: StoreSource*; NULL = documents were not searched */
+  GPtrArray *tools;   /* assistant messages: StoreTool* used before answering, or NULL */
+  char *note;    /* user messages: context line (date and time) sent to the model, never shown */
   char *author;  /* team chats: assistant that wrote it, may be NULL */
   char *author_emoji;
 } StoreMsg;
@@ -47,6 +57,8 @@ void          conversation_free (Conversation *c);
 void          conversation_add (Conversation *c, const char *role, const char *content,
                                 const char *think, const char *stats);
 void          conversation_set_author (Conversation *c, const char *name, const char *emoji); /* last msg */
+void          conversation_set_note (Conversation *c, const char *note); /* last msg */
+void          conversation_add_tool (Conversation *c, const char *name, const char *args, const char *result, gboolean ok);
 /* Marks the last message as searched (even with no hits) and adds a passage to it. */
 void          conversation_begin_sources (Conversation *c);
 void          conversation_add_source (Conversation *c, const char *file, int page, const char *text);

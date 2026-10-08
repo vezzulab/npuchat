@@ -12,6 +12,8 @@ toolbox run -c npu-dev meson compile -C build-test
 
 # The retrieval engine on its own, under ASan/LeakSanitizer.
 toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-rag
+# The calculator and the other local skills.
+toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-skills
 
 # A separate port and D-Bus session let this run next to a real NPU Chat.
 port=52690
@@ -46,6 +48,8 @@ steps+=";newchat;import:$work/docs/manual.md|$work/docs/roto.txt;waitimport"
 steps+=";send:¿Cuánto dura la garantía?;wait;send:NOMATCH pregunta sin relacion;wait"
 steps+=";newlib:Envios;libimport:1:$work/docs/envios.txt;waitimport;attach:1;libdlg;sleep:1;rmdoc:1;dellib:1;closedlg"
 steps+=";assistlib:0:0;newchat;pick:0;send:Pregunta con asistente;wait;pick:-1;newchat"
+steps+=";newchat;skill:wikipedia:on;send:CALCTEST calcula;wait;send:BADTOOL;wait;send:STATUSTEST;wait"
+steps+=";send:WIKITEST;wait;send:WIKI404;wait;skill:calculator:off;send:CALCTEST otra vez;wait;skill:calculator:on;send:DATESYS;wait;send:TOOLSYS;wait;send:HISTCHECK;wait;skill:current_datetime:off;send:DATESYS otra;wait;skill:current_datetime:on;newchat"
 steps+=";lang:en;theme:light;sleep:1;send:English;wait;close"
 
 set +e
@@ -53,7 +57,7 @@ toolbox run -c npu-dev env \
   PATH="$PWD/tests/mock:/usr/bin:/bin" \
   XDG_CONFIG_HOME="$work/config" XDG_DATA_HOME="$work/data" \
   MOCK_FLM_STATE="$work/installed.json" \
-  NPU_CHAT_PORT=$port ASAN_OPTIONS=detect_leaks=1 SELFTEST="$steps" \
+  NPU_CHAT_PORT=$port NPU_CHAT_WIKI_URL="http://127.0.0.1:$port" ASAN_OPTIONS=detect_leaks=1 SELFTEST="$steps" \
   timeout 120 dbus-run-session -- ./build-test/npu-chat > "$work/asan.log" 2>&1
 status=$?
 set -e
@@ -109,6 +113,28 @@ if grep -q 'roto.txt' "$work"/data/npu-chat/libraries/*/meta.json; then
   echo "FAIL: a binary file was indexed" >&2; exit 1
 fi
 
+# Skills: the model asked, the app ran the tool, and the answer used the result.
+skill_chat=$(grep -l '"n" : "calculator"' "$work"/data/npu-chat/chats/*.json | head -1 || true)
+[ -n "$skill_chat" ] || { echo "FAIL: no chat recorded a skill" >&2; exit 1; }
+grep -q '"r" : "42"' "$skill_chat" || { echo "FAIL: the calculator did not return 42" >&2; exit 1; }
+grep -q 'El resultado es 42' "$skill_chat" || { echo "FAIL: the answer did not use the tool result" >&2; exit 1; }
+grep -q '"ok" : false' "$skill_chat" || { echo "FAIL: a failing tool was not recorded as failed" >&2; exit 1; }
+grep -q 'Hubo un error con la herramienta' "$skill_chat" || { echo "FAIL: the model never saw the tool error" >&2; exit 1; }
+grep -q '"n" : "system_status"' "$skill_chat" || { echo "FAIL: status skill missing" >&2; exit 1; }
+[ "$(grep -c '"n" : "wikipedia"' "$skill_chat")" -ge 2 ] || { echo "FAIL: Wikipedia (exact title and the search fallback) did not both work" >&2; exit 1; }
+grep -q 'Según Wikipedia' "$skill_chat" || { echo "FAIL: the Wikipedia result did not reach the answer" >&2; exit 1; }
+# Earlier tool calls are replayed to the model, and a laptop reading is marked outdated.
+grep -q 'Historial con herramientas: sí; caducado: sí' "$skill_chat" || { echo "FAIL: earlier tool calls were not replayed (or the battery reading was not marked outdated)" >&2; exit 1; }
+# The date and time note reaches the model, and disappears when its skill is off.
+grep -q 'Contexto de hora: sí' "$skill_chat" || { echo "FAIL: the date and time note was not added to the message" >&2; exit 1; }
+grep -q 'Instrucción de herramientas: sí' "$skill_chat" || { echo "FAIL: the tool instruction was not sent" >&2; exit 1; }
+grep -q 'Contexto de hora: no' "$skill_chat" || { echo "FAIL: the date note stayed with its skill off" >&2; exit 1; }
+# The note is stored beside the message, never inside what is shown.
+if grep -q '"content" : "[^"]*\[Context: it is now' "$skill_chat"; then echo "FAIL: the context note leaked into the visible message" >&2; exit 1; fi
+grep -q '"note" : "\[Context: it is now' "$skill_chat" || { echo "FAIL: the note was not stored with the message" >&2; exit 1; }
+# With the calculator switched off, the same request must not call it.
+[ "$(grep -c '"n" : "calculator"' "$skill_chat")" -eq 2 ] || { echo "FAIL: a disabled skill was still used" >&2; exit 1; }
+
 # 2) Plain memory leaks. GTK, GLib and fontconfig keep some one-time
 # allocations until exit; a leak counts as ours when our code made the
 # allocation directly, i.e. no event/signal dispatch sits between malloc and
@@ -123,13 +149,16 @@ dispatch = re.compile(r' in (g_signal_emit\w*|signal_emit\w*|g_closure_invoke|g_
                       r'|gtk_at_context\w*|gtk_accessible\w*|g_dbus_\w+|g_task_\w+|g_source_\w+|gtk_css_\w+'
                       r'|gtk_style_\w+|gtk_settings_\w+|g_type_class_\w+|g_type_init\w*|g_io_module\w*'
                       r'|try_implementation|_g_io_modules\w*|gtk_init\w*|adw_init\w*|g_vfs_\w+)\b')
+# Font and rendering libraries build one-time caches the first time something is
+# laid out; an allocation made inside them is theirs even if our code asked for the text.
+foreign = re.compile(r'/lib(pango|pangocairo|pangoft2|fontconfig|freetype|cairo|harfbuzz|pixman|fribidi|epoxy)')
 ours = []
 for b in blocks:
     frames = [l.strip() for l in b.split('\n') if re.search(r'#\d+ ', l)]
     idx = next((i for i, f in enumerate(frames) if '/src/' in f), None)
     if idx is None or idx > 14:
         continue
-    if not any(dispatch.search(f) for f in frames[:idx]):
+    if not any(dispatch.search(f) or foreign.search(f) for f in frames[:idx]):
         ours.append((b.split('\n')[0], frames[:idx + 1]))
 for head, frames in ours:
     print(head, file=sys.stderr)

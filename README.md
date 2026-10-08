@@ -26,6 +26,7 @@ Most local AI apps on Linux (Ollama, llama.cpp, LM Studio) run models on the CPU
 - **Only models that fit:** checks your NPU, RAM and disk, and shows the expected speed of each model.
 - **Assistants:** create your own (psychologist, strategist, chef…) or add one of the 48 in the gallery.
 - **Chat with your documents:** add PDF, text or Markdown files (or drop them into a chat) and get answers with sources. Libraries stay on your computer, and you can attach them to a chat or to an assistant.
+- **Skills:** the model can use a calculator, know the date and time, check your laptop's battery and memory, and look things up on Wikipedia (opt-in). It decides when, and you see what it did.
 - **Teams:** pick several assistants (e.g. personal trainer + nutritionist) and the right specialist answers each topic; one with nothing to add passes to the next.
 - **Battery-aware:** power saver on battery, full speed when plugged in, and the model is unloaded when idle.
 - **Updates itself:** new versions install in one click, verified with SHA-256.

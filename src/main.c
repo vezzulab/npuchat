@@ -13,6 +13,7 @@
 #include "power.h"
 #include "rag.h"
 #include "selftest.h"
+#include "skills.h"
 #include "store.h"
 #include "templates.h"
 #include "updater.h"
@@ -39,8 +40,39 @@ typedef struct {
   GtkWidget    *avatar;
   GtkWidget    *title;
   GtkWidget    *sources; /* expander with the passages used, NULL until known */
+  GtkWidget    *tools_box; /* one line per skill used, NULL until the first one */
+  GPtrArray    *steps;   /* ToolStep*: skills used for this reply */
+  guint         next_step;
+  guint         rounds;  /* how many times the model asked for tools */
+  gboolean      no_tools; /* stop offering tools: the model must answer now */
+  guint         serial;  /* tells a late skill result which reply it belongs to */
   int           member; /* team chats: index into conv->team, -1 until routed */
 } Reply;
+
+/* A skill the model asked for, and what came back. */
+typedef struct {
+  char      *call_id;
+  char      *name;
+  char      *args;
+  char      *result;
+  gboolean   ok;
+  gboolean   done;
+  GtkWidget *label;
+} ToolStep;
+
+/* A tool call being assembled from the streamed reply. */
+typedef struct {
+  char    *id;
+  char    *name;
+  GString *args;
+} PendingCall;
+
+typedef struct {
+  guint serial;
+  guint index;
+} ToolCtx;
+
+#define MAX_TOOL_ROUNDS 4
 
 typedef struct {
   AdwDialog    *dialog;
@@ -104,6 +136,9 @@ static struct {
   gboolean      team_mode; /* the assistant picker selects several */
   GPtrArray    *pick_team; /* char* assistant ids for the next team chat */
   GArray       *queue;     /* team members (int) still to answer this turn */
+  GPtrArray    *calls;     /* PendingCall*: tool calls in the reply being streamed */
+  GHashTable   *skills_on; /* ids of the enabled skills */
+  guint         reply_serial;
   GPtrArray    *libraries; /* RagLibrary*: every document library */
   RagIndex     *rag_index; /* index of the libraries the open chat uses */
   char         *rag_key;   /* what rag_index was built from */
@@ -154,6 +189,9 @@ static void refresh_docs_ui (void);
 static void open_libraries_dialog (void);
 static void libs_dialog_refresh (void);
 static void begin_retrieval (void);
+static void run_tool_round (void);
+static void start_request (void);
+static void tool_step_free (gpointer p);
 static char *library_subtitle (const RagLibrary *lib);
 static void answer_next_in_queue (void);
 static const char *skip_speaker_tag (const char *text);
@@ -200,6 +238,24 @@ settings_load (void)
   if (error)
     A.concise = TRUE;
   g_clear_error (&error);
+  /* Skills: the saved list wins; a fresh install gets the default set. */
+  A.skills_on = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  g_auto (GStrv) saved_skills = ok ? g_key_file_get_string_list (kf, "skills", "enabled", NULL, NULL) : NULL;
+  if (saved_skills)
+    for (int i = 0; saved_skills[i]; i++)
+      {
+        if (skill_find (saved_skills[i]))
+          g_hash_table_add (A.skills_on, g_strdup (saved_skills[i]));
+      }
+  else
+    {
+      guint n;
+      const Skill *all = skills_list (&n);
+      for (guint i = 0; i < n; i++)
+        if (all[i].default_on)
+          g_hash_table_add (A.skills_on, g_strdup (all[i].id));
+    }
+  g_clear_error (&error);
   A.auto_update = ok ? g_key_file_get_boolean (kf, "updates", "automatic", &error) : TRUE;
   if (error)
     A.auto_update = TRUE;
@@ -228,6 +284,15 @@ settings_save (void)
   g_key_file_set_string (kf, "chat", "theme", A.theme);
   g_key_file_set_boolean (kf, "chat", "idle-unload", A.idle_unload);
   g_key_file_set_boolean (kf, "chat", "concise", A.concise);
+  {
+    g_autoptr (GPtrArray) on = g_ptr_array_new ();
+    guint n;
+    const Skill *all = skills_list (&n);
+    for (guint i = 0; i < n; i++)
+      if (g_hash_table_contains (A.skills_on, all[i].id))
+        g_ptr_array_add (on, (gpointer) all[i].id);
+    g_key_file_set_string_list (kf, "skills", "enabled", (const char *const *) on->pdata, on->len);
+  }
   g_key_file_set_boolean (kf, "updates", "automatic", A.auto_update);
   g_key_file_set_int64 (kf, "updates", "last-check", A.last_update_check);
   g_key_file_set_integer (kf, "window", "width", A.width);
@@ -757,6 +822,8 @@ reply_new (const char *model, const char *emoji, const char *name)
   Reply *r = g_new0 (Reply, 1);
   r->text = g_string_new (NULL);
   r->reasoning = g_string_new (NULL);
+  r->steps = g_ptr_array_new_with_free_func (tool_step_free);
+  r->serial = ++A.reply_serial;
 
   r->root = TRACK (g_object_ref_sink (gtk_box_new (GTK_ORIENTATION_VERTICAL, 8)));
   gtk_widget_add_css_class (r->root, "reply");
@@ -813,6 +880,98 @@ reply_new (const char *model, const char *emoji, const char *name)
   gtk_box_append (GTK_BOX (r->root), r->body);
   gtk_box_append (GTK_BOX (r->root), r->footer);
   return r;
+}
+
+static void
+tool_step_free (gpointer p)
+{
+  ToolStep *t = p;
+  g_free (t->call_id);
+  g_free (t->name);
+  g_free (t->args);
+  g_free (t->result);
+  g_free (t);
+}
+
+static const char *
+skill_title (const char *id)
+{
+  const Skill *sk = skill_find (id);
+  return sk ? TR (sk->name_es, sk->name_en) : id;
+}
+
+/* "1847*392+15" for the calculator, "Ada Lovelace" for Wikipedia. */
+static char *
+tool_subject (const char *args)
+{
+  g_autoptr (JsonParser) parser = json_parser_new ();
+  if (!args || !json_parser_load_from_data (parser, args, -1, NULL) || !JSON_NODE_HOLDS_OBJECT (json_parser_get_root (parser)))
+    return g_strdup ("");
+  JsonObject *o = json_node_get_object (json_parser_get_root (parser));
+  const char *v = json_object_get_string_member_with_default (o, "expression", NULL);
+  if (!v)
+    v = json_object_get_string_member_with_default (o, "topic", NULL);
+  return g_strdup (v ? v : "");
+}
+
+static char *
+one_line (const char *text, int max_chars)
+{
+  g_autofree char *flat = g_strdup (text ? text : "");
+  for (char *c = flat; *c; c++)
+    if (*c == '\n')
+      {
+        *c = '\0';
+        break;
+      }
+  if (g_utf8_strlen (flat, -1) <= max_chars)
+    return g_steal_pointer (&flat);
+  g_autofree char *cut = g_utf8_substring (flat, 0, max_chars - 1);
+  return g_strconcat (cut, "…", NULL);
+}
+
+/* "Calculator   1847*392+15  →  724039" */
+static void
+tool_label_update (GtkWidget *label, const char *name, const char *args, const char *result, gboolean ok, gboolean running)
+{
+  g_autofree char *subject = tool_subject (args);
+  g_autofree char *subject_line = one_line (subject, 60);
+  g_autofree char *res = running ? g_strdup (TR ("consultando…", "working…")) : one_line (result, 90);
+  g_autofree char *e_title = g_markup_escape_text (skill_title (name), -1);
+  g_autofree char *e_subject = g_markup_escape_text (subject_line, -1);
+  g_autofree char *e_res = g_markup_escape_text (res, -1);
+  g_autofree char *markup = g_strdup_printf ("<b>%s</b>%s%s  →  %s%s%s", e_title, *e_subject ? "  " : "", e_subject,
+                                             ok ? "" : "<span foreground=\"#e5484d\">", e_res, ok ? "" : "</span>");
+  gtk_label_set_markup (GTK_LABEL (label), markup);
+}
+
+static GtkWidget *
+reply_tool_row (Reply *r, const char *name, const char *args, const char *result, gboolean ok, gboolean running)
+{
+  if (!r->tools_box)
+    {
+      r->tools_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+      gtk_widget_add_css_class (r->tools_box, "tools");
+      gtk_box_insert_child_after (GTK_BOX (r->root), r->tools_box, r->think_expander);
+    }
+  GtkWidget *label = gtk_label_new (NULL);
+  gtk_label_set_xalign (GTK_LABEL (label), 0);
+  gtk_label_set_ellipsize (GTK_LABEL (label), PANGO_ELLIPSIZE_END);
+  gtk_label_set_selectable (GTK_LABEL (label), TRUE);
+  gtk_widget_add_css_class (label, "tool-step");
+  tool_label_update (label, name, args, result, ok, running);
+  gtk_box_append (GTK_BOX (r->tools_box), label);
+  return label;
+}
+
+static void
+reply_set_tools (Reply *r, GPtrArray *tools)
+{
+  for (guint i = 0; tools && i < tools->len; i++)
+    {
+      StoreTool *t = tools->pdata[i];
+      reply_tool_row (r, t->name, t->args, t->result, t->ok, FALSE);
+    }
 }
 
 /* Lists the passages the answer was based on, below the reply. */
@@ -878,6 +1037,7 @@ reply_set_sources (Reply *r, GPtrArray *sources)
 static void
 reply_free (Reply *r)
 {
+  g_ptr_array_unref (r->steps);
   g_object_unref (r->root);
   g_string_free (r->text, TRUE);
   g_string_free (r->reasoning, TRUE);
@@ -1027,6 +1187,7 @@ render_conversation (void)
                            : reply_new (A.conv->model, A.conv->assistant_emoji, A.conv->assistant_name);
       reply_show (r, m->content, m->think, FALSE);
       reply_finish_footer (r, m->content, m->stats, NULL);
+      reply_set_tools (r, m->tools);
       reply_set_sources (r, turn_sources);
       gtk_box_append (GTK_BOX (A.messages), r->root);
       reply_free (r);
@@ -1450,6 +1611,12 @@ finish_reply (const char *error)
               conversation_set_author (c, t->name, t->emoji);
               A.team_answered = TRUE;
             }
+          for (guint i = 0; i < r->steps->len; i++)
+            {
+              ToolStep *st = r->steps->pdata[i];
+              if (st->done)
+                conversation_add_tool (c, st->name, st->args, st->result, st->ok);
+            }
           store_save (c);
           if (c != A.conv)
             store_unload_messages (c);
@@ -1556,6 +1723,49 @@ handle_sse_line (const char *line)
   if (!reasoning)
     reasoning = json_object_get_string_member_with_default (delta, "reasoning", NULL);
 
+  /* Tool calls arrive as deltas keyed by index; flm sends each whole, but
+   * the OpenAI format allows the arguments to be split across chunks. */
+  JsonNode *tool_calls = json_object_get_member (delta, "tool_calls");
+  if (tool_calls && JSON_NODE_HOLDS_ARRAY (tool_calls))
+    {
+      JsonArray *arr = json_node_get_array (tool_calls);
+      for (guint i = 0; i < json_array_get_length (arr); i++)
+        {
+          JsonObject *tc = json_array_get_object_element (arr, i);
+          if (!tc)
+            continue;
+          guint index = (guint) json_object_get_int_member_with_default (tc, "index", i);
+          if (index > 8)
+            continue;
+          while (A.calls->len <= index)
+            {
+              PendingCall *pc = g_new0 (PendingCall, 1);
+              pc->args = g_string_new (NULL);
+              g_ptr_array_add (A.calls, pc);
+            }
+          PendingCall *pc = A.calls->pdata[index];
+          const char *id = json_object_get_string_member_with_default (tc, "id", NULL);
+          if (id && *id && !pc->id)
+            pc->id = g_strdup (id);
+          JsonNode *fn_node = json_object_get_member (tc, "function");
+          if (fn_node && JSON_NODE_HOLDS_OBJECT (fn_node))
+            {
+              JsonObject *fn = json_node_get_object (fn_node);
+              const char *fname = json_object_get_string_member_with_default (fn, "name", NULL);
+              if (fname && *fname && !pc->name)
+                pc->name = g_strdup (fname);
+              JsonNode *an = json_object_get_member (fn, "arguments");
+              if (an && JSON_NODE_HOLDS_VALUE (an) && json_node_get_value_type (an) == G_TYPE_STRING)
+                g_string_append (pc->args, json_node_get_string (an));
+              else if (an && JSON_NODE_HOLDS_OBJECT (an))
+                {
+                  g_autofree char *as_text = json_to_string (an, FALSE);
+                  g_string_append (pc->args, as_text);
+                }
+            }
+        }
+    }
+
   gboolean got = FALSE;
   if (content && *content)
     {
@@ -1605,6 +1815,8 @@ on_sse_line (GObject *src, GAsyncResult *res, gpointer user_data)
           g_autofree char *msg = g_strdup_printf ("HTTP %u %s", A.http_status, A.http_error->str);
           finish_reply (msg);
         }
+      else if (!A.http_error->len && A.calls->len > 0)
+        run_tool_round ();
       else
         finish_reply (A.http_error->len ? A.http_error->str : NULL);
       return;
@@ -1639,6 +1851,134 @@ on_chat_sent (GObject *src, GAsyncResult *res, gpointer user_data)
   GDataInputStream *ds = TRACK (g_data_input_stream_new (in));
   g_object_unref (in);
   read_next_line (ds);
+}
+
+/* ---- skills ----------------------------------------------------------- */
+
+static gboolean
+skill_enabled_cb (const char *id, gpointer data)
+{
+  (void) data;
+  return g_hash_table_contains (A.skills_on, id);
+}
+
+/* Not every model can call tools: flm labels the ones that can. */
+static gboolean
+model_supports_tools (void)
+{
+  FlmModel *m = installed_find (A.model);
+  return m && m->labels && g_strv_contains ((const char *const *) m->labels, "tool-calling");
+}
+
+static gboolean
+tools_active (const Reply *r)
+{
+  return !r->no_tools && g_hash_table_size (A.skills_on) > 0 && model_supports_tools ();
+}
+
+static void
+pending_call_free (gpointer p)
+{
+  PendingCall *pc = p;
+  g_free (pc->id);
+  g_free (pc->name);
+  g_string_free (pc->args, TRUE);
+  g_free (pc);
+}
+
+static void run_next_step (void);
+
+static void
+on_skill_done (char *result, gboolean ok, gpointer data)
+{
+  ToolCtx *ctx = data;
+  guint serial = ctx->serial, index = ctx->index;
+  g_free (ctx);
+  g_autofree char *text = result;
+
+  /* The reply may be gone (stopped, chat closed) by the time a slow skill answers. */
+  if (A.quitting || !A.reply || A.reply->serial != serial)
+    return;
+  if (g_cancellable_is_cancelled (A.cancel))
+    {
+      finish_reply (TR ("Detenido", "Stopped"));
+      return;
+    }
+
+  ToolStep *st = A.reply->steps->pdata[index];
+  st->result = (g_utf8_strlen (text, -1) > 1500) ? g_utf8_substring (text, 0, 1500) : g_strdup (text);
+  st->ok = ok;
+  st->done = TRUE;
+  tool_label_update (st->label, st->name, st->args, st->result, st->ok, FALSE);
+  A.reply->next_step = index + 1;
+  run_next_step ();
+}
+
+/* Runs the next requested skill, or goes back to the model with the results. */
+static void
+run_next_step (void)
+{
+  Reply *r = A.reply;
+  if (!r)
+    return;
+
+  if (r->next_step < r->steps->len)
+    {
+      ToolStep *st = r->steps->pdata[r->next_step];
+      g_autofree char *status = g_strdup_printf (TR ("Usando %s…", "Using %s…"), skill_title (st->name));
+      gtk_label_set_text (GTK_LABEL (r->stats), status);
+      gtk_widget_set_visible (r->copy, FALSE);
+      gtk_widget_set_visible (r->footer, TRUE);
+
+      ToolCtx *ctx = g_new0 (ToolCtx, 1);
+      ctx->serial = r->serial;
+      ctx->index = r->next_step;
+      skill_run (st->name, st->args, A.cancel, on_skill_done, ctx);
+      return;
+    }
+
+  gtk_widget_set_visible (r->footer, FALSE);
+  if (r->rounds >= MAX_TOOL_ROUNDS)
+    r->no_tools = TRUE; /* stop offering tools so the model has to answer */
+  start_request ();
+}
+
+/* The model asked for skills: run them, then ask again with the results. */
+static void
+run_tool_round (void)
+{
+  Reply *r = A.reply;
+  r->rounds++;
+
+  /* Whatever it wrote before asking is not the answer. */
+  g_string_truncate (r->text, 0);
+  g_string_truncate (r->reasoning, 0);
+  render_reply (FALSE);
+
+  guint first = r->steps->len;
+  for (guint i = 0; i < A.calls->len; i++)
+    {
+      PendingCall *pc = A.calls->pdata[i];
+      if (!pc->name)
+        continue;
+      ToolStep *st = g_new0 (ToolStep, 1);
+      st->call_id = pc->id ? g_strdup (pc->id) : g_strdup_printf ("call_%u_%u", r->serial, r->steps->len + 1);
+      st->name = g_strdup (pc->name);
+      st->args = g_strdup (pc->args->len ? pc->args->str : "{}");
+      st->label = reply_tool_row (r, st->name, st->args, NULL, TRUE, TRUE);
+      g_ptr_array_add (r->steps, st);
+    }
+  g_ptr_array_set_size (A.calls, 0);
+
+  if (r->steps->len == first)
+    {
+      /* A call with no name is useless: answer without tools. */
+      r->no_tools = TRUE;
+      start_request ();
+      return;
+    }
+  r->next_step = first;
+  run_next_step ();
 }
 
 /* The question plus the passages found for it, in the format the model is
@@ -1709,6 +2049,13 @@ start_request (void)
                                "unless the user asks for more detail. Reply in the same language "
                                "the user writes in.");
     }
+  /* Skills: a standing instruction that makes the model reach for the tools. */
+  if (tools_active (A.reply))
+    {
+      g_autofree char *hint = skills_instructions (skill_enabled_cb, NULL);
+      if (hint)
+        g_string_append_printf (system, "%s%s", system->len ? "\n\n" : "", hint);
+    }
   if (system->len)
     {
       json_builder_begin_object (b);
@@ -1735,6 +2082,68 @@ start_request (void)
       g_autofree char *grounded = i == last_user && m->sources ? build_grounded_prompt (m) : NULL;
       if (grounded)
         tagged = g_steal_pointer (&grounded);
+
+      /* The date and time stored with the message. Saved rather than recomputed,
+       * so the history is the same every turn and flm's cache keeps working:
+       * recomputing it made every turn without tools about 2 s slower. */
+      if (m->note && g_str_equal (m->role, "user"))
+        {
+          g_autofree char *base = tagged ? g_steal_pointer (&tagged) : g_strdup (m->content);
+          tagged = g_strdup_printf ("%s\n\n%s", base, m->note);
+        }
+      /* Earlier replies keep their tool calls in the history. Without them the
+       * model sees a run of answers that never used a tool and copies that:
+       * measured on qwen3.5:9b, 0/16 calls after three such turns, against
+       * 16/16 when the calls are replayed. */
+      if (!other && m->tools && m->tools->len > 0 && g_str_equal (m->role, "assistant") && tools_active (A.reply))
+        {
+          json_builder_begin_object (b);
+          json_builder_set_member_name (b, "role");
+          json_builder_add_string_value (b, "assistant");
+          json_builder_set_member_name (b, "content");
+          json_builder_add_string_value (b, "");
+          json_builder_set_member_name (b, "tool_calls");
+          json_builder_begin_array (b);
+          for (guint k = 0; k < m->tools->len; k++)
+            {
+              StoreTool *t = m->tools->pdata[k];
+              g_autofree char *call_id = g_strdup_printf ("call_h%u_%u", i, k);
+              json_builder_begin_object (b);
+              json_builder_set_member_name (b, "id");
+              json_builder_add_string_value (b, call_id);
+              json_builder_set_member_name (b, "type");
+              json_builder_add_string_value (b, "function");
+              json_builder_set_member_name (b, "function");
+              json_builder_begin_object (b);
+              json_builder_set_member_name (b, "name");
+              json_builder_add_string_value (b, t->name);
+              json_builder_set_member_name (b, "arguments");
+              json_builder_add_string_value (b, t->args);
+              json_builder_end_object (b);
+              json_builder_end_object (b);
+            }
+          json_builder_end_array (b);
+          json_builder_end_object (b);
+          for (guint k = 0; k < m->tools->len; k++)
+            {
+              StoreTool *t = m->tools->pdata[k];
+              g_autofree char *call_id = g_strdup_printf ("call_h%u_%u", i, k);
+              /* A reading of the laptop is stale by the next question: say so,
+               * or the model reuses it. Other results are kept, shortened. */
+              g_autofree char *result = g_str_equal (t->name, "system_status")
+                ? g_strdup ("(outdated: this value changes, call the tool again if you need it)")
+                : (g_utf8_strlen (t->result, -1) > 300 ? g_utf8_substring (t->result, 0, 300) : g_strdup (t->result));
+              json_builder_begin_object (b);
+              json_builder_set_member_name (b, "role");
+              json_builder_add_string_value (b, "tool");
+              json_builder_set_member_name (b, "tool_call_id");
+              json_builder_add_string_value (b, call_id);
+              json_builder_set_member_name (b, "content");
+              json_builder_add_string_value (b, result);
+              json_builder_end_object (b);
+            }
+        }
+
       json_builder_begin_object (b);
       json_builder_set_member_name (b, "role");
       json_builder_add_string_value (b, other ? "user" : m->role);
@@ -1742,7 +2151,59 @@ start_request (void)
       json_builder_add_string_value (b, tagged ? tagged : m->content);
       json_builder_end_object (b);
     }
+  /* This turn's tool calls and what they returned, so the model can use them. */
+  Reply *rep_ = A.reply;
+  guint answered = 0;
+  for (guint i = 0; i < rep_->steps->len; i++)
+    answered += ((ToolStep *) rep_->steps->pdata[i])->done;
+  if (answered > 0)
+    {
+      json_builder_begin_object (b);
+      json_builder_set_member_name (b, "role");
+      json_builder_add_string_value (b, "assistant");
+      json_builder_set_member_name (b, "content");
+      json_builder_add_string_value (b, "");
+      json_builder_set_member_name (b, "tool_calls");
+      json_builder_begin_array (b);
+      for (guint i = 0; i < rep_->steps->len; i++)
+        {
+          ToolStep *st = rep_->steps->pdata[i];
+          if (!st->done)
+            continue;
+          json_builder_begin_object (b);
+          json_builder_set_member_name (b, "id");
+          json_builder_add_string_value (b, st->call_id);
+          json_builder_set_member_name (b, "type");
+          json_builder_add_string_value (b, "function");
+          json_builder_set_member_name (b, "function");
+          json_builder_begin_object (b);
+          json_builder_set_member_name (b, "name");
+          json_builder_add_string_value (b, st->name);
+          json_builder_set_member_name (b, "arguments");
+          json_builder_add_string_value (b, st->args);
+          json_builder_end_object (b);
+          json_builder_end_object (b);
+        }
+      json_builder_end_array (b);
+      json_builder_end_object (b);
+      for (guint i = 0; i < rep_->steps->len; i++)
+        {
+          ToolStep *st = rep_->steps->pdata[i];
+          if (!st->done)
+            continue;
+          json_builder_begin_object (b);
+          json_builder_set_member_name (b, "role");
+          json_builder_add_string_value (b, "tool");
+          json_builder_set_member_name (b, "tool_call_id");
+          json_builder_add_string_value (b, st->call_id);
+          json_builder_set_member_name (b, "content");
+          json_builder_add_string_value (b, st->result);
+          json_builder_end_object (b);
+        }
+    }
   json_builder_end_array (b);
+  if (tools_active (rep_))
+    skills_build_tools (b, skill_enabled_cb, NULL);
   json_builder_end_object (b);
 
   g_autoptr (JsonNode) root = json_builder_get_root (b);
@@ -1752,6 +2213,7 @@ start_request (void)
   SoupMessage *msg = TRACK (soup_message_new ("POST", url));
   soup_message_set_request_body_from_bytes (msg, "application/json", bytes);
 
+  g_ptr_array_set_size (A.calls, 0);
   A.t_start = g_get_monotonic_time ();
   A.t_first = 0;
   A.n_chunks = 0;
@@ -2217,6 +2679,11 @@ send_text (const char *raw)
   A.team_answered = FALSE;
   A.search_secs = 0;
   conversation_add (A.conv, "user", text, NULL, NULL);
+  if (g_hash_table_contains (A.skills_on, "current_datetime"))
+    {
+      g_autofree char *note = skill_now_note ();
+      conversation_set_note (A.conv, note);
+    }
   store_save (A.conv);
   conv_to_front (A.conv);
   refresh_chat_list ();
@@ -2347,7 +2814,9 @@ model_subtitle (const FlmModel *m)
   catalog_describe (m, &info);
   const char *family = catalog_family (m->name);
   g_autofree char *size = size_text (&info);
-  return g_strdup_printf ("%s%s%s", family ? family : "", family ? " · " : "", size);
+  gboolean tools = m->labels && g_strv_contains ((const char *const *) m->labels, "tool-calling");
+  return g_strdup_printf ("%s%s%s%s%s", family ? family : "", family ? " · " : "", size,
+                          tools ? " · " : "", tools ? TR ("herramientas", "tools") : "");
 }
 
 static void
@@ -3182,6 +3651,19 @@ on_idle_toggled (AdwSwitchRow *row, GParamSpec *pspec, gpointer user_data)
 }
 
 static void
+on_skill_toggled (AdwSwitchRow *row, GParamSpec *pspec, gpointer user_data)
+{
+  (void) pspec;
+  (void) user_data;
+  const char *id = g_object_get_data (G_OBJECT (row), "id");
+  if (adw_switch_row_get_active (row))
+    g_hash_table_add (A.skills_on, g_strdup (id));
+  else
+    g_hash_table_remove (A.skills_on, id);
+  settings_save ();
+}
+
+static void
 on_concise_toggled (AdwSwitchRow *row, GParamSpec *pspec, gpointer user_data)
 {
   (void) pspec;
@@ -3237,6 +3719,7 @@ static void
 open_preferences (void)
 {
   AdwDialog *dialog = TRACK (adw_preferences_dialog_new ());
+  adw_dialog_set_title (dialog, TR ("Preferencias", "Preferences"));
   GtkWidget *page = adw_preferences_page_new ();
 
   AdwPreferencesGroup *look = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
@@ -3279,6 +3762,26 @@ open_preferences (void)
   g_signal_connect (concise, "notify::active", G_CALLBACK (on_concise_toggled), NULL);
   adw_preferences_group_add (chat, concise);
 
+  AdwPreferencesGroup *skills_group = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_title (skills_group, TR ("Habilidades", "Skills"));
+  g_autofree char *skills_hint = g_strdup_printf ("%s%s",
+    TR ("El modelo decide cuándo usarlas y te muestra lo que hizo. Funcionan con modelos que admiten herramientas (como qwen3 y qwen3.5).",
+        "The model decides when to use them and shows you what it did. They work with models that support tools (such as qwen3 and qwen3.5)."),
+    model_supports_tools () || !A.model ? "" : TR (" El modelo actual no las admite.", " The current model does not support them."));
+  adw_preferences_group_set_description (skills_group, skills_hint);
+  guint n_skills;
+  const Skill *all_skills = skills_list (&n_skills);
+  for (guint i = 0; i < n_skills; i++)
+    {
+      GtkWidget *row = adw_switch_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), TR (all_skills[i].name_es, all_skills[i].name_en));
+      adw_action_row_set_subtitle (ADW_ACTION_ROW (row), TR (all_skills[i].desc_es, all_skills[i].desc_en));
+      adw_switch_row_set_active (ADW_SWITCH_ROW (row), g_hash_table_contains (A.skills_on, all_skills[i].id));
+      g_object_set_data (G_OBJECT (row), "id", (gpointer) all_skills[i].id);
+      g_signal_connect (row, "notify::active", G_CALLBACK (on_skill_toggled), NULL);
+      adw_preferences_group_add (skills_group, row);
+    }
+
   AdwPreferencesGroup *upd = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
   adw_preferences_group_set_title (upd, TR ("Actualizaciones", "Updates"));
   adw_preferences_group_set_description (upd, TR ("Es la única conexión a internet de NPU Chat: consulta GitHub una vez al día.",
@@ -3300,6 +3803,7 @@ open_preferences (void)
 
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), look);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), chat);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), skills_group);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), npu);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), upd);
   adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dialog), ADW_PREFERENCES_PAGE (page));
@@ -5336,6 +5840,8 @@ on_shutdown (GApplication *app, gpointer user_data)
   g_clear_pointer (&A.assistants, g_ptr_array_unref);
   drop_rag_index ();
   g_clear_pointer (&A.libraries, g_ptr_array_unref);
+  g_clear_pointer (&A.calls, g_ptr_array_unref);
+  g_clear_pointer (&A.skills_on, g_hash_table_unref);
   g_clear_pointer (&A.pick_id, g_free);
   g_clear_pointer (&A.pick_team, g_ptr_array_unref);
   g_clear_pointer (&A.queue, g_array_unref);
@@ -5385,6 +5891,7 @@ on_activate (GApplication *app, gpointer user_data)
   A.convs = store_load_all ();
   A.assistants = assistants_load ();
   A.libraries = rag_libraries_load ();
+  A.calls = g_ptr_array_new_with_free_func (pending_call_free);
   A.pick_team = g_ptr_array_new_with_free_func (g_free);
   A.queue = g_array_new (FALSE, FALSE, sizeof (int));
   A.stick_bottom = TRUE;
@@ -5605,6 +6112,41 @@ selftest_tick (gpointer user_data)
           assistants_save (A.assistants);
           drop_rag_index ();
           refresh_all_docs_ui ();
+        }
+    }
+  else if (g_str_has_prefix (s, "skill:"))
+    {
+      /* skill:<id>:on|off */
+      g_auto (GStrv) parts = g_strsplit (s + 6, ":", 2);
+      if (parts[0] && parts[1])
+        {
+          if (g_str_equal (parts[1], "on"))
+            g_hash_table_add (A.skills_on, g_strdup (parts[0]));
+          else
+            g_hash_table_remove (A.skills_on, parts[0]);
+        }
+    }
+  else if (g_str_equal (s, "scrollprefs") && A.prefs)
+    {
+      /* Scroll the open preferences down so lower groups can be photographed. */
+      GtkWidget *sw = gtk_widget_get_first_child (GTK_WIDGET (A.prefs));
+      for (int depth = 0; sw && depth < 30; depth++)
+        {
+          GtkWidget *found = NULL;
+          GtkWidget *kid = gtk_widget_get_first_child (sw);
+          while (kid && !found)
+            {
+              if (GTK_IS_SCROLLED_WINDOW (kid))
+                found = kid;
+              kid = gtk_widget_get_next_sibling (kid);
+            }
+          if (found)
+            {
+              GtkAdjustment *adj = gtk_scrolled_window_get_vadjustment (GTK_SCROLLED_WINDOW (found));
+              gtk_adjustment_set_value (adj, gtk_adjustment_get_upper (adj));
+              break;
+            }
+          sw = gtk_widget_get_first_child (sw);
         }
     }
   else if (g_str_equal (s, "libdlg"))
