@@ -14,6 +14,7 @@
 #include "rag.h"
 #include "selftest.h"
 #include "skills.h"
+#include "copilotkey.h"
 #include "store.h"
 #include "templates.h"
 #include "updater.h"
@@ -3688,6 +3689,27 @@ rebuild_idle (gpointer user_data)
 }
 
 static void
+on_copilot_key_done (gboolean ok, gpointer user_data)
+{
+  GtkWidget *btn = user_data; /* kept alive by the reference taken when it was clicked */
+  gboolean now = copilotkey_installed ();
+  gtk_button_set_label (GTK_BUTTON (btn), now ? TR ("Quitar", "Remove") : TR ("Activar", "Enable"));
+  gtk_widget_set_sensitive (btn, TRUE);
+  g_object_unref (btn);
+  toast ("%s", ok ? (now ? TR ("Tecla Copilot lista: abre NPU Chat", "Copilot key ready: it opens NPU Chat")
+                         : TR ("Tecla Copilot restaurada", "Copilot key restored"))
+                  : TR ("No se pudo cambiar la tecla Copilot", "Could not change the Copilot key"));
+}
+
+static void
+on_copilot_key_clicked (GtkButton *btn, gpointer user_data)
+{
+  (void) user_data;
+  gtk_widget_set_sensitive (GTK_WIDGET (btn), FALSE);
+  copilotkey_set (!copilotkey_installed (), on_copilot_key_done, g_object_ref (btn));
+}
+
+static void
 on_prefs_closed (AdwDialog *dialog, gpointer user_data)
 {
   (void) dialog;
@@ -3782,6 +3804,23 @@ open_preferences (void)
       adw_preferences_group_add (skills_group, row);
     }
 
+  AdwPreferencesGroup *keys_group = NULL;
+  if (copilotkey_supported ())
+    {
+      keys_group = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+      adw_preferences_group_set_title (keys_group, TR ("Teclado", "Keyboard"));
+      GtkWidget *krow = adw_action_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (krow), TR ("Tecla Copilot abre NPU Chat", "Copilot key opens NPU Chat"));
+      adw_action_row_set_subtitle (ADW_ACTION_ROW (krow),
+                                   TR ("Pide la contraseña una vez. Solo para laptops con tecla Copilot.",
+                                       "Asks for your password once. Only for laptops with a Copilot key."));
+      GtkWidget *kbtn = gtk_button_new_with_label (copilotkey_installed () ? TR ("Quitar", "Remove") : TR ("Activar", "Enable"));
+      gtk_widget_set_valign (kbtn, GTK_ALIGN_CENTER);
+      g_signal_connect (kbtn, "clicked", G_CALLBACK (on_copilot_key_clicked), NULL);
+      adw_action_row_add_suffix (ADW_ACTION_ROW (krow), kbtn);
+      adw_preferences_group_add (keys_group, krow);
+    }
+
   AdwPreferencesGroup *upd = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
   adw_preferences_group_set_title (upd, TR ("Actualizaciones", "Updates"));
   adw_preferences_group_set_description (upd, TR ("Es la única conexión a internet de NPU Chat: consulta GitHub una vez al día.",
@@ -3805,6 +3844,8 @@ open_preferences (void)
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), chat);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), skills_group);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), npu);
+  if (keys_group)
+    adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), keys_group);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), upd);
   adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dialog), ADW_PREFERENCES_PAGE (page));
   g_signal_connect (dialog, "closed", G_CALLBACK (on_prefs_closed), NULL);
@@ -5871,6 +5912,8 @@ on_activate (GApplication *app, gpointer user_data)
   if (A.win)
     {
       gtk_window_present (A.win);
+      if (A.input)
+        gtk_widget_grab_focus (GTK_WIDGET (A.input));
       return;
     }
 

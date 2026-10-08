@@ -59,6 +59,12 @@ sudo dnf install gcc meson gtk4-devel libadwaita-devel libsoup3-devel json-glib-
 ./build.sh   # builds and installs to ~/.local
 ```
 
+## Copilot key (optional)
+
+On KDE, **Preferences → Keyboard → Copilot key opens NPU Chat → Enable** does it for you: it asks for your password once, installs a udev rule that makes the key send F19 (KDE cannot bind it otherwise, because layouts name it "Assistant"), and assigns `Meta+Shift+F19` to NPU Chat. Pressing it again brings the window forward. Remove restores the key.
+
+The same rule by hand: [packaging/90-copilot-key.hwdb](packaging/90-copilot-key.hwdb).
+
 ## Troubleshooting
 
 **"The NPU needs a system setting to work"** means systemd caps locked memory at 8 MB, and the NPU needs more to load a model. Run this once, then reboot:

@@ -1,0 +1,4 @@
+# HP OmniBook: the Copilot key (scancode 0x6e) sends F23, whose second level keyboard
+# layouts call "Assistant", a name desktops cannot bind. Send F19 instead.
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnHP*:pnHPOmniBookXFlipLaptop14-kc0xxx:*
+ KEYBOARD_KEY_6e=f19
