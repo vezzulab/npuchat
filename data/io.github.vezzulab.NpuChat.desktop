@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NPU Chat
+Comment=Chat con modelos de IA en la NPU de Ryzen AI
+Exec=npu-chat
+Icon=io.github.vezzulab.NpuChat
+Terminal=false
+Categories=Utility;GTK;
+Keywords=AI;LLM;NPU;chat;
+StartupNotify=true

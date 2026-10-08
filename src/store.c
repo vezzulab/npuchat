@@ -1,0 +1,244 @@
+#include "store.h"
+
+#include <glib/gstdio.h>
+#include <json-glib/json-glib.h>
+
+static void
+store_msg_free (gpointer p)
+{
+  StoreMsg *m = p;
+  g_free (m->role);
+  g_free (m->content);
+  g_free (m->think);
+  g_free (m->stats);
+  g_free (m);
+}
+
+Conversation *
+conversation_new (void)
+{
+  Conversation *c = g_new0 (Conversation, 1);
+  g_autoptr (GDateTime) now = g_date_time_new_now_local ();
+  g_autofree char *stamp = g_date_time_format (now, "%Y%m%d-%H%M%S");
+
+  c->id = g_strdup_printf ("%s-%04x", stamp, g_random_int_range (0, 0xffff));
+  c->updated = g_date_time_to_unix (now);
+  c->msgs = g_ptr_array_new_with_free_func (store_msg_free);
+  c->loaded = TRUE;
+  return c;
+}
+
+void
+conversation_free (Conversation *c)
+{
+  if (!c)
+    return;
+  g_free (c->id);
+  g_free (c->title);
+  g_free (c->model);
+  g_free (c->assistant_id);
+  g_free (c->assistant_name);
+  g_free (c->assistant_emoji);
+  g_free (c->system);
+  g_ptr_array_unref (c->msgs);
+  g_free (c);
+}
+
+void
+conversation_add (Conversation *c, const char *role, const char *content,
+                  const char *think, const char *stats)
+{
+  StoreMsg *m = g_new0 (StoreMsg, 1);
+  m->role = g_strdup (role);
+  m->content = g_strdup (content);
+  m->think = think && *think ? g_strdup (think) : NULL;
+  m->stats = stats && *stats ? g_strdup (stats) : NULL;
+  g_ptr_array_add (c->msgs, m);
+  c->updated = g_get_real_time () / G_USEC_PER_SEC;
+}
+
+static char *
+chats_dir (void)
+{
+  return g_build_filename (g_get_user_data_dir (), "npu-chat", "chats", NULL);
+}
+
+static char *
+chat_path (const char *id)
+{
+  g_autofree char *dir = chats_dir ();
+  g_autofree char *file = g_strconcat (id, ".json", NULL);
+  return g_build_filename (dir, file, NULL);
+}
+
+static const char *
+str_member (JsonObject *o, const char *name)
+{
+  return json_object_get_string_member_with_default (o, name, NULL);
+}
+
+static Conversation *
+load_file (const char *path, gboolean with_messages)
+{
+  g_autoptr (JsonParser) parser = json_parser_new ();
+  if (!json_parser_load_from_file (parser, path, NULL))
+    return NULL;
+
+  JsonNode *root = json_parser_get_root (parser);
+  if (!JSON_NODE_HOLDS_OBJECT (root))
+    return NULL;
+  JsonObject *o = json_node_get_object (root);
+  if (!str_member (o, "id"))
+    return NULL;
+
+  Conversation *c = g_new0 (Conversation, 1);
+  c->id = g_strdup (str_member (o, "id"));
+  c->title = g_strdup (str_member (o, "title"));
+  c->model = g_strdup (str_member (o, "model"));
+  c->assistant_id = g_strdup (str_member (o, "assistant_id"));
+  c->assistant_name = g_strdup (str_member (o, "assistant"));
+  c->assistant_emoji = g_strdup (str_member (o, "assistant_emoji"));
+  c->system = g_strdup (str_member (o, "system"));
+  c->updated = json_object_get_int_member_with_default (o, "updated", 0);
+  c->msgs = g_ptr_array_new_with_free_func (store_msg_free);
+  c->loaded = with_messages;
+  if (!with_messages)
+    return c;
+
+  JsonArray *msgs = json_object_has_member (o, "messages")
+                      ? json_object_get_array_member (o, "messages") : NULL;
+  for (guint i = 0; msgs && i < json_array_get_length (msgs); i++)
+    {
+      JsonObject *m = json_array_get_object_element (msgs, i);
+      if (!m || !str_member (m, "role") || !str_member (m, "content"))
+        continue;
+      StoreMsg *sm = g_new0 (StoreMsg, 1);
+      sm->role = g_strdup (str_member (m, "role"));
+      sm->content = g_strdup (str_member (m, "content"));
+      sm->think = g_strdup (str_member (m, "think"));
+      sm->stats = g_strdup (str_member (m, "stats"));
+      g_ptr_array_add (c->msgs, sm);
+    }
+  return c;
+}
+
+static int
+by_updated_desc (gconstpointer a, gconstpointer b)
+{
+  const Conversation *ca = *(Conversation **) a;
+  const Conversation *cb = *(Conversation **) b;
+  return (cb->updated > ca->updated) - (cb->updated < ca->updated);
+}
+
+GPtrArray *
+store_load_all (void)
+{
+  GPtrArray *all = g_ptr_array_new_with_free_func ((GDestroyNotify) conversation_free);
+  g_autofree char *dir = chats_dir ();
+  g_autoptr (GDir) d = g_dir_open (dir, 0, NULL);
+  const char *name;
+
+  while (d && (name = g_dir_read_name (d)))
+    {
+      if (!g_str_has_suffix (name, ".json"))
+        continue;
+      g_autofree char *path = g_build_filename (dir, name, NULL);
+      Conversation *c = load_file (path, FALSE);
+      if (c)
+        g_ptr_array_add (all, c);
+    }
+
+  g_ptr_array_sort (all, by_updated_desc);
+  return all;
+}
+
+void
+store_load_messages (Conversation *c)
+{
+  if (c->loaded)
+    return;
+  g_autofree char *path = chat_path (c->id);
+  Conversation *full = load_file (path, TRUE);
+  c->loaded = TRUE;
+  if (!full)
+    return;
+  /* Swap the message arrays and drop the temporary copy. */
+  GPtrArray *tmp = c->msgs;
+  c->msgs = full->msgs;
+  full->msgs = tmp;
+  conversation_free (full);
+}
+
+void
+store_unload_messages (Conversation *c)
+{
+  g_ptr_array_set_size (c->msgs, 0);
+  c->loaded = FALSE;
+}
+
+void
+store_save (Conversation *c)
+{
+  g_autoptr (JsonBuilder) b = json_builder_new ();
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "id");
+  json_builder_add_string_value (b, c->id);
+  json_builder_set_member_name (b, "title");
+  json_builder_add_string_value (b, c->title ? c->title : "");
+  json_builder_set_member_name (b, "model");
+  json_builder_add_string_value (b, c->model ? c->model : "");
+  if (c->assistant_name)
+    {
+      json_builder_set_member_name (b, "assistant_id");
+      json_builder_add_string_value (b, c->assistant_id ? c->assistant_id : "");
+      json_builder_set_member_name (b, "assistant");
+      json_builder_add_string_value (b, c->assistant_name);
+      json_builder_set_member_name (b, "assistant_emoji");
+      json_builder_add_string_value (b, c->assistant_emoji ? c->assistant_emoji : "");
+    }
+  if (c->system)
+    {
+      json_builder_set_member_name (b, "system");
+      json_builder_add_string_value (b, c->system);
+    }
+  json_builder_set_member_name (b, "updated");
+  json_builder_add_int_value (b, c->updated);
+  json_builder_set_member_name (b, "messages");
+  json_builder_begin_array (b);
+  for (guint i = 0; i < c->msgs->len; i++)
+    {
+      StoreMsg *m = c->msgs->pdata[i];
+      json_builder_begin_object (b);
+      json_builder_set_member_name (b, "role");
+      json_builder_add_string_value (b, m->role);
+      json_builder_set_member_name (b, "content");
+      json_builder_add_string_value (b, m->content);
+      if (m->think)
+        {
+          json_builder_set_member_name (b, "think");
+          json_builder_add_string_value (b, m->think);
+        }
+      if (m->stats)
+        {
+          json_builder_set_member_name (b, "stats");
+          json_builder_add_string_value (b, m->stats);
+        }
+      json_builder_end_object (b);
+    }
+  json_builder_end_array (b);
+  json_builder_end_object (b);
+
+  g_autoptr (JsonNode) root = json_builder_get_root (b);
+  g_autofree char *json = json_to_string (root, TRUE);
+  g_autofree char *dir = chats_dir ();
+  g_autofree char *path = chat_path (c->id);
+  g_mkdir_with_parents (dir, 0700);
+  g_file_set_contents_full (path, json, -1, G_FILE_SET_CONTENTS_CONSISTENT, 0600, NULL);
+}
+
+void
+store_delete (Conversation *c)
+{
+  g_autofree char *path = chat_path (c->id);
+  g_unlink (path);
+}

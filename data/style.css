@@ -1,0 +1,336 @@
+/* ---- conversation ---- */
+
+.messages {
+  padding: 24px 20px 32px 20px;
+}
+
+.bubble {
+  padding: 10px 16px;
+  border-radius: 20px;
+}
+
+.bubble.user {
+  background-image: linear-gradient(135deg,
+                    var(--accent-bg-color),
+                    color-mix(in srgb, var(--accent-bg-color) 75%, #7b2ff7));
+  color: var(--accent-fg-color);
+  border-bottom-right-radius: 6px;
+  margin-left: 80px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+.reply .avatar {
+  min-width: 26px;
+  min-height: 26px;
+  border-radius: 13px;
+  background-image: linear-gradient(135deg, #ff7a18, #e01e5a 55%, #7b2ff7);
+  color: white;
+  font-weight: 800;
+  font-size: 0.8em;
+}
+
+.reply .model-name {
+  font-weight: 700;
+  font-size: 0.92em;
+}
+
+.reply-body {
+  margin-left: 34px;
+}
+
+.reply-footer {
+  margin-left: 34px;
+}
+
+.reply-footer button {
+  min-width: 26px;
+  min-height: 26px;
+  opacity: 0.6;
+}
+
+.reply-footer button:hover {
+  opacity: 1;
+}
+
+.reply-body label.md {
+  font-size: 1.04em;
+  line-height: 1.45;
+}
+
+.think {
+  margin-left: 34px;
+}
+
+.think > title {
+  font-size: 0.9em;
+  opacity: 0.7;
+}
+
+.think .think-text {
+  font-size: 0.92em;
+  font-style: italic;
+  opacity: 0.68;
+  padding: 6px 0 4px 12px;
+  border-left: 2px solid color-mix(in srgb, var(--view-fg-color) 18%, transparent);
+}
+
+.stats {
+  font-size: 0.8em;
+  opacity: 0.55;
+  font-feature-settings: "tnum";
+}
+
+.stats.error {
+  color: var(--error-color);
+  opacity: 1;
+}
+
+/* ---- code ---- */
+
+.codeblock {
+  border-radius: 12px;
+  background-color: color-mix(in srgb, var(--view-fg-color) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--view-fg-color) 9%, transparent);
+}
+
+.codeblock .code-header {
+  padding: 2px 4px 0 14px;
+}
+
+.codeblock .code-lang {
+  font-size: 0.78em;
+  font-weight: 600;
+  opacity: 0.55;
+  text-transform: uppercase;
+}
+
+.codeblock label.code {
+  font-family: monospace;
+  font-size: 0.95em;
+  padding: 2px 14px 14px 14px;
+}
+
+/* ---- welcome ---- */
+
+.suggestion {
+  padding: 14px 18px;
+  border-radius: 16px;
+  min-width: 230px;
+  font-weight: normal;
+  background-color: var(--card-bg-color);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--view-fg-color) 9%, transparent);
+}
+
+.suggestion:hover {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 10%, var(--card-bg-color));
+}
+
+/* ---- composer ---- */
+
+.composer-area {
+  padding: 4px 16px 18px 16px;
+}
+
+.composer {
+  background-color: var(--card-bg-color);
+  border-radius: 22px;
+  padding: 4px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12),
+              0 0 0 1px color-mix(in srgb, var(--view-fg-color) 10%, transparent);
+}
+
+.composer:focus-within {
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12),
+              0 0 0 2px color-mix(in srgb, var(--accent-color) 60%, transparent);
+}
+
+.composer textview,
+.composer textview > text {
+  background: transparent;
+}
+
+.composer textview {
+  font-size: 1.05em;
+  padding: 6px 4px 6px 14px;
+}
+
+.composer .placeholder {
+  font-size: 1.05em;
+  opacity: 0.45;
+  margin-left: 14px;
+}
+
+.composer .send {
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+}
+
+/* ---- sidebar ---- */
+
+.navigation-sidebar row {
+  padding: 8px 6px 8px 12px;
+}
+
+.chat-title {
+  font-weight: 600;
+}
+
+.chat-sub {
+  font-size: 0.82em;
+  opacity: 0.55;
+}
+
+.chat-group {
+  font-size: 0.78em;
+  font-weight: 700;
+  opacity: 0.5;
+  padding: 14px 12px 4px 12px;
+}
+
+.navigation-sidebar .row-delete {
+  opacity: 0;
+  min-width: 28px;
+  min-height: 28px;
+}
+
+.navigation-sidebar row:hover .row-delete,
+.navigation-sidebar row:selected .row-delete {
+  opacity: 0.6;
+}
+
+.navigation-sidebar row .row-delete:hover {
+  opacity: 1;
+}
+
+.power-bar {
+  padding: 10px 16px;
+  font-size: 0.85em;
+  opacity: 0.7;
+}
+
+/* ---- header model picker ---- */
+
+.model-button {
+  padding: 2px 12px;
+  border-radius: 10px;
+}
+
+.model-button .heading {
+  font-size: 1em;
+}
+
+.picker {
+  padding: 6px;
+}
+
+.picker .boxed-list row {
+  min-height: 52px;
+}
+
+.placeholder-row {
+  padding: 18px;
+}
+
+.status-dot {
+  min-width: 7px;
+  min-height: 7px;
+  border-radius: 4px;
+  background-color: color-mix(in srgb, var(--view-fg-color) 35%, transparent);
+}
+
+.status-dot.ready {
+  background-color: var(--success-color);
+}
+
+.status-dot.loading {
+  background-color: var(--warning-color);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.status-dot.error {
+  background-color: var(--error-color);
+}
+
+@keyframes pulse {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.3; }
+  100% { opacity: 1; }
+}
+
+/* ---- models dialog ---- */
+
+.badge {
+  font-size: 0.75em;
+  font-weight: 700;
+  padding: 2px 9px;
+  border-radius: 99px;
+  background-color: color-mix(in srgb, var(--view-fg-color) 10%, transparent);
+}
+
+.badge.accent {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 18%, transparent);
+  color: var(--accent-color);
+}
+
+image.success {
+  color: var(--success-color);
+}
+
+image.warning {
+  color: var(--warning-color);
+}
+
+/* ---- setup page ---- */
+
+.cmd-card {
+  font-family: monospace;
+  font-size: 0.92em;
+  padding: 14px 18px;
+  border-radius: 12px;
+  background-color: color-mix(in srgb, var(--view-fg-color) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--view-fg-color) 10%, transparent);
+}
+
+/* No scroll shadows inside the one-line composer. */
+.composer scrolledwindow > undershoot,
+.composer scrolledwindow > overshoot {
+  background: none;
+  box-shadow: none;
+  border: none;
+}
+
+/* ---- assistants ---- */
+
+.assistant-chip {
+  border-radius: 99px;
+  padding: 6px 16px;
+  font-weight: 600;
+}
+
+.assistant-chip:checked {
+  background-color: color-mix(in srgb, var(--accent-bg-color) 22%, transparent);
+  color: var(--accent-color);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 45%, transparent);
+}
+
+.assistant-chip.new {
+  background: none;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--view-fg-color) 18%, transparent);
+  opacity: 0.8;
+}
+
+.reply .reply-model {
+  font-size: 0.8em;
+  opacity: 0.5;
+}
+
+.instructions textview,
+.instructions textview > text {
+  background: transparent;
+}
+
+.instructions textview {
+  padding: 12px;
+  font-size: 1.02em;
+}

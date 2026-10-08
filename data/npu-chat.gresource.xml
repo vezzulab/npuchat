@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/vezzulab/NpuChat">
+    <file>style.css</file>
+    <file alias="icons/scalable/apps/io.github.vezzulab.NpuChat.svg">io.github.vezzulab.NpuChat.svg</file>
+    <file alias="icons/scalable/actions/npu-ok-symbolic.svg">icons/npu-ok-symbolic.svg</file>
+    <file alias="icons/scalable/actions/npu-new-chat-symbolic.svg">icons/npu-new-chat-symbolic.svg</file>
+    <file alias="icons/scalable/actions/npu-plugged-symbolic.svg">icons/npu-plugged-symbolic.svg</file>
+    <file alias="icons/scalable/actions/npu-battery-symbolic.svg">icons/npu-battery-symbolic.svg</file>
+    <file alias="icons/scalable/actions/npu-edit-symbolic.svg">icons/npu-edit-symbolic.svg</file>
+  </gresource>
+</gresources>
