@@ -27,7 +27,7 @@ resources = gnome.compile_resources('resources',
 executable('npu-chat',
   'src/main.c', 'src/flm.c', 'src/markdown.c', 'src/i18n.c',
   'src/sysinfo.c', 'src/catalog.c', 'src/store.c', 'src/power.c',
-  'src/assistants.c', 'src/templates.c', 'src/updater.c', 'src/rag.c', 'src/net.c', 'src/skills.c', 'src/copilotkey.c', 'src/calendar.c',
+  'src/assistants.c', 'src/templates.c', 'src/updater.c', 'src/rag.c', 'src/net.c', 'src/skills.c', 'src/copilotkey.c', 'src/calendar.c', 'src/calendar-ui.c',
   resources,
   dependencies: deps,
   install: true)

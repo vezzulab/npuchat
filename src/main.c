@@ -15,6 +15,8 @@
 #include "selftest.h"
 #include "skills.h"
 #include "copilotkey.h"
+#include "calendar.h"
+#include "calendar-ui.h"
 #include "store.h"
 #include "templates.h"
 #include "updater.h"
@@ -3928,6 +3930,7 @@ static void act_new_chat (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_AC
 static void act_models (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_models_dialog (FALSE); }
 static void act_download (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_models_dialog (TRUE); }
 static void act_skills (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_skills_dialog (); }
+static void act_calendar (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; calendar_ui_open (GTK_WIDGET (A.win)); }
 static void act_prefs (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_preferences (); }
 static void act_refresh (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; refresh_models (); }
 static void act_retry (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; ensure_loaded (); }
@@ -5817,6 +5820,7 @@ build_menu (void)
   g_menu_append (top, TR ("Nueva conversación", "New chat"), "win.new-chat");
   g_menu_append (top, TR ("Galería de asistentes", "Assistant gallery"), "win.gallery");
   g_menu_append (top, TR ("Bibliotecas de documentos", "Document libraries"), "win.libraries");
+  g_menu_append (top, TR ("Calendario", "Calendar"), "win.calendar");
   g_menu_append (top, TR ("Habilidades", "Skills"), "win.skills");
   g_menu_append (top, TR ("Administrar modelos", "Manage models"), "win.models");
   g_menu_append_section (menu, NULL, G_MENU_MODEL (top));
@@ -5936,6 +5940,7 @@ on_shutdown (GApplication *app, gpointer user_data)
   (void) app;
   (void) user_data;
   flm_shutdown ();
+  calendar_default_free ();
   rag_shutdown ();
   power_shutdown ();
   updater_shutdown ();
@@ -6026,6 +6031,7 @@ on_activate (GApplication *app, gpointer user_data)
     { "gallery", act_gallery, NULL, NULL, NULL, { 0 } },
     { "libraries", act_libraries, NULL, NULL, NULL, { 0 } },
     { "skills", act_skills, NULL, NULL, NULL, { 0 } },
+    { "calendar", act_calendar, NULL, NULL, NULL, { 0 } },
     { "install-update", act_install_update, NULL, NULL, NULL, { 0 } },
     { "open-release", act_open_release, NULL, NULL, NULL, { 0 } },
     { "quit", act_quit, NULL, NULL, NULL, { 0 } },
@@ -6121,6 +6127,7 @@ selftest_tick (gpointer user_data)
         adw_dialog_force_close (A.libs_dialog);
       if (A.skills_dialog)
         adw_dialog_force_close (A.skills_dialog);
+      calendar_ui_close ();
       if (A.update_dialog)
         adw_dialog_force_close (A.update_dialog);
     }
@@ -6264,6 +6271,8 @@ selftest_tick (gpointer user_data)
           sw = gtk_widget_get_first_child (sw);
         }
     }
+  else if (g_str_equal (s, "caldlg"))
+    calendar_ui_open (GTK_WIDGET (A.win));
   else if (g_str_equal (s, "skillsdlg"))
     open_skills_dialog ();
   else if (g_str_equal (s, "libdlg"))
