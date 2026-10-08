@@ -3701,12 +3701,53 @@ on_copilot_key_done (gboolean ok, gpointer user_data)
                   : TR ("No se pudo cambiar la tecla Copilot", "Could not change the Copilot key"));
 }
 
+/* The Copilot key reports Shift+Super+F23 (hardware keycode 201), shown by layouts
+ * as "Assistant". Waiting for that exact press is how the app knows the laptop has one. */
+static gboolean
+copilot_key_pressed (GtkEventControllerKey *ctl, guint keyval, guint keycode, GdkModifierType state, gpointer user_data)
+{
+  (void) ctl;
+  if (keyval != 0x10081247 && keycode != 201)
+    return FALSE;
+  if (!(state & GDK_SHIFT_MASK) || !(state & GDK_SUPER_MASK))
+    return FALSE;
+  AdwDialog *dialog = ADW_DIALOG (user_data);
+  GtkWidget *btn = g_object_get_data (G_OBJECT (dialog), "button");
+  adw_dialog_force_close (dialog);
+  copilotkey_set (TRUE, on_copilot_key_done, g_object_ref (btn));
+  return TRUE;
+}
+
+static void
+on_copilot_learn_response (AdwAlertDialog *dialog, const char *response, gpointer user_data)
+{
+  (void) response;
+  (void) dialog;
+  gtk_widget_set_sensitive (GTK_WIDGET (user_data), TRUE);
+}
+
 static void
 on_copilot_key_clicked (GtkButton *btn, gpointer user_data)
 {
   (void) user_data;
-  gtk_widget_set_sensitive (GTK_WIDGET (btn), FALSE);
-  copilotkey_set (!copilotkey_installed (), on_copilot_key_done, g_object_ref (btn));
+  if (copilotkey_installed ())
+    {
+      gtk_widget_set_sensitive (GTK_WIDGET (btn), FALSE);
+      copilotkey_set (FALSE, on_copilot_key_done, g_object_ref (btn));
+      return;
+    }
+  AdwDialog *dialog = adw_alert_dialog_new (TR ("Pulsa la tecla Copilot", "Press the Copilot key"),
+                                            TR ("Así NPU Chat comprueba que tu laptop la tiene. Si no pasa nada, no tiene una.",
+                                                "This is how NPU Chat checks that your laptop has one. If nothing happens, it does not."));
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (dialog), "cancel", TR ("Cancelar", "Cancel"));
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dialog), "cancel");
+  GtkEventController *keys = gtk_event_controller_key_new ();
+  gtk_event_controller_set_propagation_phase (keys, GTK_PHASE_CAPTURE);
+  g_signal_connect (keys, "key-pressed", G_CALLBACK (copilot_key_pressed), dialog);
+  gtk_widget_add_controller (GTK_WIDGET (dialog), keys);
+  g_object_set_data (G_OBJECT (dialog), "button", btn);
+  g_signal_connect (dialog, "response", G_CALLBACK (on_copilot_learn_response), btn);
+  adw_dialog_present (dialog, GTK_WIDGET (A.win));
 }
 
 static void

@@ -61,7 +61,7 @@ sudo dnf install gcc meson gtk4-devel libadwaita-devel libsoup3-devel json-glib-
 
 ## Copilot key (optional)
 
-On KDE, **Preferences → Keyboard → Copilot key opens NPU Chat → Enable** does it for you: it asks for your password once, installs a udev rule that makes the key send F19 (KDE cannot bind it otherwise, because layouts name it "Assistant"), and assigns `Meta+Shift+F19` to NPU Chat. Pressing it again brings the window forward. Remove restores the key.
+On KDE, **Preferences → Keyboard → Copilot key opens NPU Chat → Enable** does it for you: it waits for you to press the key (so it only works on laptops that have one), asks for your password once, installs a udev rule that makes the key send F19 (KDE cannot bind it otherwise, because layouts name it "Assistant"), and assigns `Meta+Shift+F19` to NPU Chat. Pressing it again brings the window forward. Remove restores the key.
 
 The same rule by hand: [packaging/90-copilot-key.hwdb](packaging/90-copilot-key.hwdb).
 
