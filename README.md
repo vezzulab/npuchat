@@ -52,6 +52,10 @@ Download `NPU-Chat-x86_64.AppImage` from [Releases](https://github.com/vezzulab/
 chmod +x NPU-Chat-x86_64.AppImage && ./NPU-Chat-x86_64.AppImage
 ```
 
+## Contributing: Intel and OpenVINO
+
+NPU Chat only supports AMD Ryzen AI today, because [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) only drives AMD NPUs. Intel Core Ultra NPUs could work through [OpenVINO Model Server](https://github.com/openvinotoolkit/model_server), which speaks the same OpenAI-style API the app already uses for chatting. What is missing is a second engine: detecting the chip, and listing, downloading and serving models with OpenVINO instead of `flm` (see `src/flm.c`, `src/sysinfo.c` and `src/catalog.c`). If you have an Intel laptop and want to build and test it, pull requests are welcome.
+
 ## Build from source
 
 ```bash
