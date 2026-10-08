@@ -10,6 +10,7 @@ typedef struct {
   char *emoji;
   char *instructions;
   char *template_key; /* gallery template it came from, or NULL */
+  GPtrArray *libs;    /* char* ids of document libraries this assistant always uses */
 } Assistant;
 
 Assistant *assistant_new (const char *name, const char *emoji, const char *instructions);

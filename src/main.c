@@ -11,6 +11,7 @@
 #include "i18n.h"
 #include "markdown.h"
 #include "power.h"
+#include "rag.h"
 #include "selftest.h"
 #include "store.h"
 #include "templates.h"
@@ -37,6 +38,7 @@ typedef struct {
   gboolean      detached;
   GtkWidget    *avatar;
   GtkWidget    *title;
+  GtkWidget    *sources; /* expander with the passages used, NULL until known */
   int           member; /* team chats: index into conv->team, -1 until routed */
 } Reply;
 
@@ -102,7 +104,18 @@ static struct {
   gboolean      team_mode; /* the assistant picker selects several */
   GPtrArray    *pick_team; /* char* assistant ids for the next team chat */
   GArray       *queue;     /* team members (int) still to answer this turn */
+  GPtrArray    *libraries; /* RagLibrary*: every document library */
+  RagIndex     *rag_index; /* index of the libraries the open chat uses */
+  char         *rag_key;   /* what rag_index was built from */
+  GtkMenuButton *docs_button;
+  GtkListBox   *docs_list;
+  GtkWidget    *import_revealer;
+  GtkLabel     *import_label;
+  GtkWidget    *import_bar;
+  AdwDialog    *libs_dialog;
   gboolean      team_answered; /* someone has answered the current user message */
+  gint64        search_start;  /* when document search began (µs), 0 if none */
+  double        search_secs;   /* how long it took, shown with the reply stats */
   Conversation *conv;      /* current; owned by convs once saved */
   gboolean      conv_saved;
   GHashTable   *pulling;   /* names being downloaded */
@@ -137,6 +150,11 @@ static void update_header (const char *message);
 static void open_models_dialog (gboolean download);
 static void md_refresh (void);
 static void update_assistant_ui (void);
+static void refresh_docs_ui (void);
+static void open_libraries_dialog (void);
+static void libs_dialog_refresh (void);
+static void begin_retrieval (void);
+static char *library_subtitle (const RagLibrary *lib);
 static void answer_next_in_queue (void);
 static const char *skip_speaker_tag (const char *text);
 static gboolean could_become_pass (const char *text);
@@ -797,6 +815,66 @@ reply_new (const char *model, const char *emoji, const char *name)
   return r;
 }
 
+/* Lists the passages the answer was based on, below the reply. */
+static void
+reply_set_sources (Reply *r, GPtrArray *sources)
+{
+  if (r->sources)
+    {
+      gtk_box_remove (GTK_BOX (r->root), r->sources);
+      r->sources = NULL;
+    }
+  if (!sources)
+    return;
+
+  if (sources->len == 0)
+    {
+      r->sources = dim_label (TR ("Sin coincidencias en tus documentos.", "No matches in your documents."), "caption");
+      gtk_widget_add_css_class (r->sources, "sources");
+      gtk_box_insert_child_after (GTK_BOX (r->root), r->sources, r->body);
+      return;
+    }
+
+  g_autofree char *title = g_strdup_printf (TR ("Fuentes (%u)", "Sources (%u)"), sources->len);
+  GtkWidget *expander = gtk_expander_new (title);
+  gtk_widget_add_css_class (expander, "sources");
+  GtkWidget *list = gtk_box_new (GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_margin_top (list, 6);
+
+  for (guint i = 0; i < sources->len; i++)
+    {
+      StoreSource *src = sources->pdata[i];
+      g_autofree char *ref = src->page > 0
+        ? g_strdup_printf ("[%u]  %s · %s %d", i + 1, src->file, TR ("pág.", "p."), src->page)
+        : g_strdup_printf ("[%u]  %s", i + 1, src->file);
+      GtkWidget *name = gtk_label_new (ref);
+      gtk_label_set_xalign (GTK_LABEL (name), 0);
+      gtk_label_set_ellipsize (GTK_LABEL (name), PANGO_ELLIPSIZE_MIDDLE);
+      gtk_widget_add_css_class (name, "source-ref");
+
+      g_autofree char *flat = g_strdup (src->text);
+      for (char *c = flat; *c; c++)
+        if (*c == '\n')
+          *c = ' ';
+      GtkWidget *excerpt = gtk_label_new (flat);
+      gtk_label_set_xalign (GTK_LABEL (excerpt), 0);
+      gtk_label_set_wrap (GTK_LABEL (excerpt), TRUE);
+      gtk_label_set_wrap_mode (GTK_LABEL (excerpt), PANGO_WRAP_WORD_CHAR);
+      gtk_label_set_lines (GTK_LABEL (excerpt), 3);
+      gtk_label_set_ellipsize (GTK_LABEL (excerpt), PANGO_ELLIPSIZE_END);
+      gtk_label_set_selectable (GTK_LABEL (excerpt), TRUE);
+      gtk_widget_add_css_class (excerpt, "source-text");
+
+      GtkWidget *item = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+      gtk_box_append (GTK_BOX (item), name);
+      gtk_box_append (GTK_BOX (item), excerpt);
+      gtk_box_append (GTK_BOX (list), item);
+    }
+  gtk_expander_set_child (GTK_EXPANDER (expander), list);
+  r->sources = expander;
+  gtk_box_insert_child_after (GTK_BOX (r->root), expander, r->body);
+}
+
 static void
 reply_free (Reply *r)
 {
@@ -935,18 +1013,21 @@ render_conversation (void)
       return;
     }
 
+  GPtrArray *turn_sources = NULL; /* of the user message the next replies answer */
   for (guint i = 0; i < A.conv->msgs->len; i++)
     {
       StoreMsg *m = A.conv->msgs->pdata[i];
       if (g_str_equal (m->role, "user"))
         {
           add_user_bubble (m->content);
+          turn_sources = m->sources;
           continue;
         }
       Reply *r = m->author ? reply_new (A.conv->model, m->author_emoji, m->author)
                            : reply_new (A.conv->model, A.conv->assistant_emoji, A.conv->assistant_name);
       reply_show (r, m->content, m->think, FALSE);
       reply_finish_footer (r, m->content, m->stats, NULL);
+      reply_set_sources (r, turn_sources);
       gtk_box_append (GTK_BOX (A.messages), r->root);
       reply_free (r);
     }
@@ -957,6 +1038,8 @@ render_conversation (void)
       if (!gtk_widget_get_parent (A.reply->root))
         gtk_box_append (GTK_BOX (A.messages), A.reply->root);
       A.reply->detached = FALSE;
+      if (turn_sources)
+        reply_set_sources (A.reply, turn_sources);
       render_reply (FALSE);
     }
 
@@ -977,8 +1060,17 @@ conv_to_front (Conversation *c)
 }
 
 static void
+drop_rag_index (void)
+{
+  g_clear_pointer (&A.rag_index, rag_index_free);
+  g_clear_pointer (&A.rag_key, g_free);
+}
+
+static void
 leave_conversation (void)
 {
+  /* The index is only worth its memory while its chat is open. */
+  drop_rag_index ();
   if (!A.conv)
     return;
   if (!A.conv_saved)
@@ -1086,6 +1178,17 @@ on_delete_chat_response (AdwAlertDialog *dialog, const char *response, gpointer 
       A.reply->conv = NULL;
     }
   store_delete (c);
+  /* Files that were dropped into this chat go with it. */
+  for (guint i = 0; i < c->libs->len; i++)
+    {
+      RagLibrary *lib = rag_library_find (A.libraries, c->libs->pdata[i]);
+      if (lib && lib->chat_scoped && !lib->busy)
+        {
+          rag_library_delete (lib);
+          g_ptr_array_remove (A.libraries, lib);
+        }
+    }
+  drop_rag_index ();
   gboolean current = c == A.conv;
   if (current)
     A.conv = NULL;
@@ -1320,6 +1423,8 @@ finish_reply (const char *error)
       double decode = (g_get_monotonic_time () - A.t_first) / (double) G_USEC_PER_SEC;
       if (tokens > 1 && decode > 0)
         g_string_append_printf (stats, "⚡ %.1f tok/s   ·   ", (tokens - 1) / decode);
+      if (A.search_secs > 0 && r->member <= 0)
+        g_string_append_printf (stats, "%s %.1f s   ·   ", TR ("búsqueda", "search"), A.search_secs);
       g_string_append_printf (stats, "%s %.2f s   ·   %d tokens",
                               TR ("primer token", "first token"), ttft, tokens);
     }
@@ -1536,6 +1641,34 @@ on_chat_sent (GObject *src, GAsyncResult *res, gpointer user_data)
   read_next_line (ds);
 }
 
+/* The question plus the passages found for it, in the format the model is
+ * told to cite from. */
+static char *
+build_grounded_prompt (const StoreMsg *m)
+{
+  GString *s = g_string_new (NULL);
+  if (m->sources->len == 0)
+    {
+      g_string_append_printf (s, "The user has documents attached, but none of their passages matched this message. "
+                                 "If the message is about their documents, say you could not find it there; "
+                                 "otherwise just answer normally.\n\nMessage: %s", m->content);
+      return g_string_free (s, FALSE);
+    }
+  g_string_append (s, "Answer using only the numbered sources below, and cite them like [1] or [2]. "
+                      "If the sources do not contain the answer, say you could not find it in the user's documents.\n\n"
+                      "Sources:\n");
+  for (guint i = 0; i < m->sources->len; i++)
+    {
+      StoreSource *src = m->sources->pdata[i];
+      if (src->page > 0)
+        g_string_append_printf (s, "[%u] (%s, p. %d)\n%s\n\n", i + 1, src->file, src->page, src->text);
+      else
+        g_string_append_printf (s, "[%u] (%s)\n%s\n\n", i + 1, src->file, src->text);
+    }
+  g_string_append_printf (s, "Question: %s", m->content);
+  return g_string_free (s, FALSE);
+}
+
 static void
 start_request (void)
 {
@@ -1585,6 +1718,11 @@ start_request (void)
       json_builder_add_string_value (b, system->str);
       json_builder_end_object (b);
     }
+  guint last_user = G_MAXUINT;
+  for (guint i = 0; i < conv->msgs->len; i++)
+    if (g_str_equal (((StoreMsg *) conv->msgs->pdata[i])->role, "user"))
+      last_user = i;
+
   for (guint i = 0; i < conv->msgs->len; i++)
     {
       StoreMsg *m = conv->msgs->pdata[i];
@@ -1592,6 +1730,11 @@ start_request (void)
        * messages, so it knows who said what. */
       gboolean other = me && m->author && !g_str_equal (m->author, me->name);
       g_autofree char *tagged = other ? g_strdup_printf ("[%s]: %s", m->author, m->content) : NULL;
+      /* Only the newest question carries passages: older turns already live
+       * in the answers, and a short history keeps prefill (and flm's cache) fast. */
+      g_autofree char *grounded = i == last_user && m->sources ? build_grounded_prompt (m) : NULL;
+      if (grounded)
+        tagged = g_steal_pointer (&grounded);
       json_builder_begin_object (b);
       json_builder_set_member_name (b, "role");
       json_builder_add_string_value (b, other ? "user" : m->role);
@@ -1779,14 +1922,238 @@ route_team_turn (void)
   soup_session_send_and_read_async (flm_session (), msg, G_PRIORITY_DEFAULT, A.cancel, on_routed, NULL);
 }
 
-/* Starts the reply in A.reply: routes team turns first. */
+/* ---- documents -------------------------------------------------------- */
+
 static void
-begin_reply (void)
+add_lib_by_id (GPtrArray *out, const char *id)
+{
+  RagLibrary *lib = rag_library_find (A.libraries, id);
+  if (lib && lib->docs->len > 0 && !lib->busy && !g_ptr_array_find (out, lib, NULL))
+    g_ptr_array_add (out, lib);
+}
+
+static void
+add_assistant_libs (GPtrArray *out, const char *assistant_id)
+{
+  Assistant *as = assistants_find (A.assistants, assistant_id);
+  for (guint i = 0; as && as->libs && i < as->libs->len; i++)
+    add_lib_by_id (out, as->libs->pdata[i]);
+}
+
+/* Libraries the open chat searches: the ones attached to it, plus those of
+ * its assistant (or of every member of a team). The elements are not owned. */
+static GPtrArray *
+effective_libs (void)
+{
+  GPtrArray *out = g_ptr_array_new ();
+  if (!A.conv)
+    return out;
+  for (guint i = 0; i < A.conv->libs->len; i++)
+    add_lib_by_id (out, A.conv->libs->pdata[i]);
+
+  if (A.conv_saved)
+    {
+      if (A.conv->team->len >= 2)
+        for (guint i = 0; i < A.conv->team->len; i++)
+          add_assistant_libs (out, ((TeamMember *) A.conv->team->pdata[i])->id);
+      else
+        add_assistant_libs (out, A.conv->assistant_id);
+    }
+  else if (A.team_mode)
+    for (guint i = 0; i < A.pick_team->len; i++)
+      add_assistant_libs (out, A.pick_team->pdata[i]);
+  else
+    add_assistant_libs (out, A.pick_id);
+  return out;
+}
+
+static RagIndex *
+index_for (GPtrArray *libs)
+{
+  g_autoptr (GString) key = g_string_new (NULL);
+  for (guint i = 0; i < libs->len; i++)
+    {
+      RagLibrary *lib = libs->pdata[i];
+      g_string_append_printf (key, "%s:%u:%u;", lib->id, lib->docs->len, rag_library_chunk_count (lib));
+    }
+  if (!A.rag_index || g_strcmp0 (A.rag_key, key->str) != 0)
+    {
+      drop_rag_index ();
+      A.rag_index = rag_index_new (libs);
+      A.rag_key = g_strdup (key->str);
+    }
+  return A.rag_index;
+}
+
+/* After retrieval (or without it): route a team turn, or answer. */
+static void
+continue_reply (void)
 {
   if (conv_is_team (A.reply->conv) && A.reply->member < 0)
     route_team_turn ();
   else
     start_request ();
+}
+
+typedef struct {
+  char *question;
+} ExpandCtx;
+
+/* Keywords from the model, with any reasoning block removed. */
+static char *
+parse_keywords (GBytes *body)
+{
+  g_autoptr (JsonParser) parser = json_parser_new ();
+  if (!body || !json_parser_load_from_data (parser, g_bytes_get_data (body, NULL), g_bytes_get_size (body), NULL))
+    return g_strdup ("");
+  JsonNode *root = json_parser_get_root (parser);
+  JsonObject *o = JSON_NODE_HOLDS_OBJECT (root) ? json_node_get_object (root) : NULL;
+  JsonNode *ch = o ? json_object_get_member (o, "choices") : NULL;
+  if (!ch || !JSON_NODE_HOLDS_ARRAY (ch) || json_array_get_length (json_node_get_array (ch)) == 0)
+    return g_strdup ("");
+  JsonObject *c0 = json_array_get_object_element (json_node_get_array (ch), 0);
+  JsonNode *m = c0 ? json_object_get_member (c0, "message") : NULL;
+  if (!m || !JSON_NODE_HOLDS_OBJECT (m))
+    return g_strdup ("");
+  const char *text = json_object_get_string_member_with_default (json_node_get_object (m), "content", "");
+  const char *end = strstr (text, "</think>");
+  if (end)
+    text = end + strlen ("</think>");
+  g_autofree char *kw = g_strdup (text);
+  if (strlen (kw) > 300)
+    kw[300] = '\0';
+  return g_strstrip (g_steal_pointer (&kw));
+}
+
+static void
+on_expanded (GObject *src, GAsyncResult *res, gpointer user_data)
+{
+  ExpandCtx *ctx = user_data;
+  g_autoptr (GError) error = NULL;
+  SoupMessage *msg = soup_session_get_async_result_message (SOUP_SESSION (src), res);
+  g_autoptr (GBytes) body = soup_session_send_and_read_finish (SOUP_SESSION (src), res, &error);
+  g_autofree char *question = ctx->question;
+  g_free (ctx);
+
+  if (!A.reply || A.quitting)
+    return;
+  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    {
+      finish_reply (TR ("Detenido", "Stopped"));
+      return;
+    }
+
+  /* If expansion failed the plain question is still searched. */
+  g_autofree char *keywords = body && soup_message_get_status (msg) == SOUP_STATUS_OK ? parse_keywords (body)
+                                                                                      : g_strdup ("");
+  g_autofree char *query = g_strdup_printf ("%s %s", question, keywords);
+
+  Conversation *c = A.reply->conv;
+  g_autoptr (GPtrArray) libs = effective_libs ();
+  g_autoptr (GPtrArray) hits = libs->len ? rag_search (index_for (libs), query, 4) : g_ptr_array_new ();
+
+  conversation_begin_sources (c);
+  for (guint i = 0; i < hits->len; i++)
+    {
+      RagHit *h = hits->pdata[i];
+      conversation_add_source (c, h->file, h->page, h->text);
+    }
+  store_save (c);
+
+  StoreMsg *last = c->msgs->pdata[c->msgs->len - 1];
+  reply_set_sources (A.reply, last->sources);
+  gtk_widget_set_visible (A.reply->footer, FALSE);
+  A.search_secs = (g_get_monotonic_time () - A.search_start) / (double) G_USEC_PER_SEC;
+  A.search_start = 0;
+  continue_reply ();
+}
+
+/* Asks the model for search keywords (synonyms and related terms), which
+ * measured far better than searching the bare question: 7/12 -> 12/12. */
+static void
+begin_retrieval (void)
+{
+  Conversation *c = A.reply->conv;
+  StoreMsg *last = c->msgs->pdata[c->msgs->len - 1];
+
+  A.search_start = g_get_monotonic_time ();
+  A.search_secs = 0;
+  gtk_label_set_text (GTK_LABEL (A.reply->stats), TR ("Buscando en tus documentos…", "Searching your documents…"));
+  gtk_widget_set_visible (A.reply->copy, FALSE);
+  gtk_widget_set_visible (A.reply->footer, TRUE);
+
+  /* A short follow-up ("and the second one?") only makes sense with the
+   * question before it. */
+  g_autofree char *question = g_strdup (last->content);
+  g_autofree char *asked = g_strdup (last->content);
+  if (g_utf8_strlen (last->content, -1) < 40)
+    for (guint i = c->msgs->len - 1; i-- > 0;)
+      {
+        StoreMsg *prev = c->msgs->pdata[i];
+        if (g_str_equal (prev->role, "user"))
+          {
+            g_free (asked);
+            asked = g_strdup_printf ("%s %s", prev->content, last->content);
+            break;
+          }
+      }
+  g_autofree char *user_text = g_utf8_strlen (asked, -1) > 400 ? g_utf8_substring (asked, 0, 400) : g_strdup (asked);
+
+  g_autoptr (JsonBuilder) b = json_builder_new ();
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "model");
+  json_builder_add_string_value (b, A.model);
+  json_builder_set_member_name (b, "stream");
+  json_builder_add_boolean_value (b, FALSE);
+  json_builder_set_member_name (b, "max_tokens");
+  json_builder_add_int_value (b, 60);
+  json_builder_set_member_name (b, "temperature");
+  json_builder_add_double_value (b, 0);
+  json_builder_set_member_name (b, "messages");
+  json_builder_begin_array (b);
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "role");
+  json_builder_add_string_value (b, "system");
+  json_builder_set_member_name (b, "content");
+  /* Both languages: people often ask in Spanish about English documents.
+   * Measured on a real English PDF: bare question 1/7, same-language
+   * keywords 3/7, both languages 6/7. */
+  json_builder_add_string_value (b, "You help search the user's documents. Given a question, write 10 search keywords: "
+                                    "the important words of the question plus close synonyms and related terms the "
+                                    "documents might use instead. Write them both in the language of the question "
+                                    "and in English. Reply with the keywords only, separated by spaces.");
+  json_builder_end_object (b);
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "role");
+  json_builder_add_string_value (b, "user");
+  json_builder_set_member_name (b, "content");
+  json_builder_add_string_value (b, user_text);
+  json_builder_end_object (b);
+  json_builder_end_array (b);
+  json_builder_end_object (b);
+
+  g_autoptr (JsonNode) root = json_builder_get_root (b);
+  char *body = json_to_string (root, FALSE);
+  g_autoptr (GBytes) bytes = g_bytes_new_take (body, strlen (body));
+  g_autofree char *url = flm_url ("/v1/chat/completions");
+  g_autoptr (SoupMessage) msg = TRACK (soup_message_new ("POST", url));
+  soup_message_set_request_body_from_bytes (msg, "application/json", bytes);
+
+  ExpandCtx *ctx = g_new0 (ExpandCtx, 1);
+  ctx->question = g_steal_pointer (&question);
+  soup_session_send_and_read_async (flm_session (), msg, G_PRIORITY_DEFAULT, A.cancel, on_expanded, ctx);
+}
+
+/* Starts the reply in A.reply: searches the documents, then routes team
+ * turns, then answers. */
+static void
+begin_reply (void)
+{
+  g_autoptr (GPtrArray) libs = effective_libs ();
+  if (libs->len > 0 && A.reply->member < 0)
+    begin_retrieval ();
+  else
+    continue_reply ();
 }
 
 static char *
@@ -1848,6 +2215,7 @@ send_text (const char *raw)
   g_free (A.conv->model);
   A.conv->model = g_strdup (A.model);
   A.team_answered = FALSE;
+  A.search_secs = 0;
   conversation_add (A.conv, "user", text, NULL, NULL);
   store_save (A.conv);
   conv_to_front (A.conv);
@@ -2995,6 +3363,7 @@ typedef struct {
   AdwEntryRow *name;
   AdwEntryRow *emoji;
   GtkTextView *instructions;
+  GtkListBox  *libs;
   char        *id; /* NULL when creating */
 } Editor;
 
@@ -3327,6 +3696,8 @@ update_assistant_ui (void)
   gtk_widget_set_visible (A.clear_assistant, !general);
   gtk_switch_set_active (A.team_switch, A.team_mode);
 
+  refresh_docs_ui ();
+
   gtk_list_box_remove_all (A.assistant_list);
   if (!A.team_mode)
     gtk_list_box_append (A.assistant_list, assistant_row (NULL, "✦", TR ("General", "General"),
@@ -3452,6 +3823,13 @@ on_editor_save (GtkButton *button, gpointer user_data)
 
   Assistant *a = assistants_find (A.assistants, e->id);
   gboolean created = a == NULL;
+  g_autoptr (GPtrArray) chosen = g_ptr_array_new_with_free_func (g_free);
+  for (GtkWidget *row = gtk_widget_get_first_child (GTK_WIDGET (e->libs)); row; row = gtk_widget_get_next_sibling (row))
+    {
+      GtkWidget *check = g_object_get_data (G_OBJECT (row), "check");
+      if (check && gtk_check_button_get_active (GTK_CHECK_BUTTON (check)))
+        g_ptr_array_add (chosen, g_strdup (g_object_get_data (G_OBJECT (row), "id")));
+    }
   if (a)
     {
       g_free (a->name);
@@ -3466,7 +3844,12 @@ on_editor_save (GtkButton *button, gpointer user_data)
       a = assistant_new (name, *emoji ? emoji : "✦", instructions);
       g_ptr_array_add (A.assistants, a);
     }
+  g_ptr_array_set_size (a->libs, 0);
+  for (guint i = 0; i < chosen->len; i++)
+    g_ptr_array_add (a->libs, g_strdup (chosen->pdata[i]));
   assistants_save (A.assistants);
+  drop_rag_index ();
+  refresh_docs_ui ();
 
   /* A new assistant starts a fresh chat; an edited one also applies to the
    * open chat if that chat uses it. Other chats keep their own copy. */
@@ -3597,6 +3980,42 @@ open_assistant_editor (Assistant *a)
 
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), who);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), how);
+
+  AdwPreferencesGroup *docs = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_title (docs, TR ("Documentos", "Documents"));
+  adw_preferences_group_set_description (docs, TR ("Este asistente siempre responderá usando las bibliotecas marcadas.",
+                                                   "This assistant will always answer using the ticked libraries."));
+  e->libs = GTK_LIST_BOX (gtk_list_box_new ());
+  gtk_list_box_set_selection_mode (e->libs, GTK_SELECTION_NONE);
+  gtk_widget_add_css_class (GTK_WIDGET (e->libs), "boxed-list");
+  GtkWidget *ph = dim_label (TR ("Crea una biblioteca desde el clip del chat para usarla aquí.",
+                                 "Create a library from the chat's paperclip to use it here."), "placeholder-row");
+  gtk_label_set_xalign (GTK_LABEL (ph), 0.5);
+  gtk_list_box_set_placeholder (e->libs, ph);
+  for (guint i = 0; i < A.libraries->len; i++)
+    {
+      RagLibrary *lib = A.libraries->pdata[i];
+      if (lib->chat_scoped)
+        continue;
+      GtkWidget *row = adw_action_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), lib->name);
+      adw_preferences_row_set_use_markup (ADW_PREFERENCES_ROW (row), FALSE);
+      g_autofree char *sub = library_subtitle (lib);
+      adw_action_row_set_subtitle (ADW_ACTION_ROW (row), sub);
+      GtkWidget *check = gtk_check_button_new ();
+      gboolean on = FALSE;
+      for (guint k = 0; a && a->libs && k < a->libs->len; k++)
+        on |= g_str_equal (a->libs->pdata[k], lib->id);
+      gtk_check_button_set_active (GTK_CHECK_BUTTON (check), on);
+      gtk_widget_set_valign (check, GTK_ALIGN_CENTER);
+      adw_action_row_add_prefix (ADW_ACTION_ROW (row), check);
+      adw_action_row_set_activatable_widget (ADW_ACTION_ROW (row), check);
+      g_object_set_data (G_OBJECT (row), "check", check);
+      g_object_set_data_full (G_OBJECT (row), "id", g_strdup (lib->id), g_free);
+      gtk_list_box_append (e->libs, row);
+    }
+  adw_preferences_group_add (docs, GTK_WIDGET (e->libs));
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), docs);
 
   if (a)
     {
@@ -3849,6 +4268,580 @@ on_gallery_clicked (GtkButton *button, gpointer user_data)
   (void) user_data;
   gtk_menu_button_popdown (A.assistant_button);
   open_gallery ();
+}
+
+/* ---- documents UI ------------------------------------------------------ */
+
+static void
+refresh_all_docs_ui (void)
+{
+  refresh_docs_ui ();
+  if (A.libs_dialog)
+    libs_dialog_refresh ();
+}
+
+static gboolean
+lib_is_from_assistant (const char *id)
+{
+  Assistant *as = assistants_find (A.assistants, A.conv && A.conv_saved ? A.conv->assistant_id : A.pick_id);
+  for (guint i = 0; as && as->libs && i < as->libs->len; i++)
+    if (g_str_equal (as->libs->pdata[i], id))
+      return TRUE;
+  return FALSE;
+}
+
+static void
+conv_libs_changed (void)
+{
+  if (A.conv && A.conv_saved)
+    store_save (A.conv);
+  drop_rag_index ();
+  refresh_all_docs_ui ();
+}
+
+static char *
+library_subtitle (const RagLibrary *lib)
+{
+  if (lib->busy)
+    return g_strdup (TR ("Importando…", "Importing…"));
+  guint files = lib->docs->len, passages = rag_library_chunk_count (lib);
+  g_autofree char *f = files == 1 ? g_strdup (TR ("1 archivo", "1 file"))
+                                  : g_strdup_printf (TR ("%u archivos", "%u files"), files);
+  g_autofree char *p = passages == 1 ? g_strdup (TR ("1 fragmento", "1 passage"))
+                                     : g_strdup_printf (TR ("%u fragmentos", "%u passages"), passages);
+  return g_strdup_printf ("%s · %s", f, p);
+}
+
+static void
+on_doc_row_activated (GtkListBox *box, GtkListBoxRow *row, gpointer user_data)
+{
+  (void) box;
+  (void) user_data;
+  const char *id = g_object_get_data (G_OBJECT (row), "id");
+  if (!A.conv || !id || lib_is_from_assistant (id))
+    return;
+  conversation_toggle_lib (A.conv, id);
+  conv_libs_changed ();
+}
+
+/* The popover's list: libraries the chat can use, ticked when attached. */
+static void
+refresh_docs_ui (void)
+{
+  if (!A.docs_list)
+    return;
+  gtk_list_box_remove_all (A.docs_list);
+
+  g_autoptr (GPtrArray) active = effective_libs ();
+  for (guint i = 0; A.libraries && i < A.libraries->len; i++)
+    {
+      RagLibrary *lib = A.libraries->pdata[i];
+      gboolean attached = A.conv && conversation_has_lib (A.conv, lib->id);
+      /* Another chat's loose files are not offered here. */
+      if (lib->chat_scoped && !attached)
+        continue;
+      gboolean from_assistant = lib_is_from_assistant (lib->id);
+
+      GtkWidget *row = adw_action_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), lib->name);
+      adw_preferences_row_set_use_markup (ADW_PREFERENCES_ROW (row), FALSE);
+      g_autofree char *sub = library_subtitle (lib);
+      g_autofree char *full = from_assistant ? g_strdup_printf ("%s · %s", sub, TR ("del asistente", "from the assistant"))
+                                             : g_strdup (sub);
+      adw_action_row_set_subtitle (ADW_ACTION_ROW (row), full);
+      gtk_list_box_row_set_activatable (GTK_LIST_BOX_ROW (row), !from_assistant);
+
+      GtkWidget *check = gtk_check_button_new ();
+      gtk_check_button_set_active (GTK_CHECK_BUTTON (check), attached || from_assistant);
+      gtk_widget_set_can_target (check, FALSE);
+      gtk_widget_set_sensitive (check, !from_assistant);
+      gtk_widget_set_valign (check, GTK_ALIGN_CENTER);
+      adw_action_row_add_prefix (ADW_ACTION_ROW (row), check);
+      g_object_set_data_full (G_OBJECT (row), "id", g_strdup (lib->id), g_free);
+      gtk_list_box_append (A.docs_list, row);
+    }
+
+  if (A.docs_button)
+    {
+      g_autofree char *tip = active->len ? g_strdup_printf (TR ("Documentos (%u en uso)", "Documents (%u in use)"), active->len)
+                                         : g_strdup (TR ("Documentos", "Documents"));
+      gtk_widget_set_tooltip_text (GTK_WIDGET (A.docs_button), tip);
+      if (active->len)
+        gtk_widget_add_css_class (GTK_WIDGET (A.docs_button), "has-docs");
+      else
+        gtk_widget_remove_css_class (GTK_WIDGET (A.docs_button), "has-docs");
+    }
+}
+
+/* ---- importing files ---- */
+
+typedef struct {
+  char *lib_id;
+} ImportUi;
+
+static void
+on_import_progress (double fraction, const char *file, gpointer user_data)
+{
+  (void) user_data;
+  if (A.quitting || !A.import_bar)
+    return;
+  gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (A.import_bar), fraction);
+  if (file)
+    {
+      g_autofree char *text = g_strdup_printf (TR ("Leyendo %s…", "Reading %s…"), file);
+      gtk_label_set_text (A.import_label, text);
+    }
+}
+
+static gboolean
+hide_import_bar (gpointer user_data)
+{
+  (void) user_data;
+  if (A.import_revealer && !A.quitting)
+    gtk_revealer_set_reveal_child (GTK_REVEALER (A.import_revealer), FALSE);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_import_done (guint added, char **errors, gpointer user_data)
+{
+  ImportUi *ui = user_data;
+  g_free (ui->lib_id);
+  g_free (ui);
+  if (A.quitting)
+    return;
+
+  if (added > 0)
+    toast (added == 1 ? TR ("1 archivo listo para consultar", "1 file ready to search")
+                      : TR ("%u archivos listos para consultar", "%u files ready to search"), added);
+  if (errors && errors[0])
+    toast ("%s", errors[0]); /* the first one is enough; the rest are in the library view */
+  gtk_label_set_text (A.import_label, added ? TR ("Listo", "Done") : TR ("No se pudo importar", "Import failed"));
+  gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (A.import_bar), 1.0);
+  g_timeout_add_seconds (2, hide_import_bar, NULL);
+  drop_rag_index ();
+  refresh_all_docs_ui ();
+}
+
+static void
+start_import (RagLibrary *lib, char **paths)
+{
+  if (lib->busy)
+    {
+      toast ("%s", TR ("Esa biblioteca todavía se está importando. Espera un momento.",
+                       "That library is still importing. Wait a moment."));
+      return;
+    }
+  ImportUi *ui = g_new0 (ImportUi, 1);
+  ui->lib_id = g_strdup (lib->id);
+  gtk_label_set_text (A.import_label, TR ("Preparando…", "Preparing…"));
+  gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (A.import_bar), 0);
+  gtk_revealer_set_reveal_child (GTK_REVEALER (A.import_revealer), TRUE);
+  rag_library_add_files (lib, paths, on_import_progress, on_import_done, ui);
+  refresh_all_docs_ui ();
+}
+
+/* Files dropped into (or added from) a chat go into that chat's own library. */
+static RagLibrary *
+chat_library (void)
+{
+  for (guint i = 0; A.conv && i < A.conv->libs->len; i++)
+    {
+      RagLibrary *lib = rag_library_find (A.libraries, A.conv->libs->pdata[i]);
+      if (lib && lib->chat_scoped)
+        return lib;
+    }
+  g_autoptr (GDateTime) now = g_date_time_new_now_local ();
+  g_autofree char *when = g_date_time_format (now, "%d/%m %H:%M");
+  g_autofree char *name = g_strdup_printf ("%s · %s", TR ("Archivos del chat", "Chat files"), when);
+  RagLibrary *lib = rag_library_new (name, TRUE);
+  g_ptr_array_add (A.libraries, lib);
+  conversation_toggle_lib (A.conv, lib->id);
+  if (A.conv_saved)
+    store_save (A.conv);
+  return lib;
+}
+
+static void
+import_into_chat (char **paths)
+{
+  g_autoptr (GPtrArray) ok = g_ptr_array_new ();
+  for (guint i = 0; paths[i]; i++)
+    if (rag_supported_file (paths[i]))
+      g_ptr_array_add (ok, paths[i]);
+  if (ok->len == 0)
+    {
+      toast ("%s", rag_pdf_available ()
+                     ? TR ("Formato no compatible. Usa PDF, texto o Markdown.", "Unsupported format. Use PDF, text or Markdown.")
+                     : TR ("Formato no compatible. Usa texto o Markdown.", "Unsupported format. Use text or Markdown."));
+      return;
+    }
+  g_ptr_array_add (ok, NULL);
+  start_import (chat_library (), (char **) ok->pdata);
+}
+
+static void
+on_files_chosen (GObject *src, GAsyncResult *res, gpointer user_data)
+{
+  RagLibrary *lib = user_data; /* NULL: the chat's own library */
+  g_autoptr (GListModel) files = gtk_file_dialog_open_multiple_finish (GTK_FILE_DIALOG (src), res, NULL);
+  if (!files || A.quitting)
+    return;
+
+  g_autoptr (GPtrArray) paths = g_ptr_array_new_with_free_func (g_free);
+  for (guint i = 0; i < g_list_model_get_n_items (files); i++)
+    {
+      g_autoptr (GFile) f = g_list_model_get_item (files, i);
+      char *path = g_file_get_path (f);
+      if (path)
+        g_ptr_array_add (paths, path);
+    }
+  g_ptr_array_add (paths, NULL);
+  if (lib && rag_library_find (A.libraries, lib->id) == lib)
+    start_import (lib, (char **) paths->pdata);
+  else
+    import_into_chat ((char **) paths->pdata);
+}
+
+static void
+choose_files (RagLibrary *lib)
+{
+  GtkFileDialog *dialog = gtk_file_dialog_new ();
+  gtk_file_dialog_set_title (dialog, TR ("Añadir archivos", "Add files"));
+
+  GtkFileFilter *filter = gtk_file_filter_new ();
+  gtk_file_filter_set_name (filter, rag_pdf_available () ? TR ("Documentos (PDF, texto, Markdown)", "Documents (PDF, text, Markdown)")
+                                                        : TR ("Documentos (texto, Markdown)", "Documents (text, Markdown)"));
+  static const char *patterns[] = { "txt", "md", "markdown", "rst", "org", "csv", "tsv", "json", "yaml", "yml", "toml",
+                                    "ini", "log", "c", "h", "cpp", "hpp", "py", "js", "ts", "rs", "go", "java", "sh",
+                                    "html", "xml", "tex", "pdf" };
+  for (guint i = 0; i < G_N_ELEMENTS (patterns); i++)
+    {
+      if (g_str_equal (patterns[i], "pdf") && !rag_pdf_available ())
+        continue;
+      g_autofree char *lower = g_strdup_printf ("*.%s", patterns[i]);
+      g_autofree char *upper = g_ascii_strup (lower, -1);
+      gtk_file_filter_add_pattern (filter, lower);
+      gtk_file_filter_add_pattern (filter, upper);
+    }
+  g_autoptr (GListStore) filters = g_list_store_new (GTK_TYPE_FILE_FILTER);
+  g_list_store_append (filters, filter);
+  gtk_file_dialog_set_filters (dialog, G_LIST_MODEL (filters));
+  gtk_file_dialog_set_default_filter (dialog, filter);
+  g_object_unref (filter);
+
+  gtk_file_dialog_open_multiple (dialog, A.win, NULL, on_files_chosen, lib);
+  g_object_unref (dialog);
+}
+
+static void
+on_add_files_clicked (GtkButton *button, gpointer user_data)
+{
+  (void) button;
+  (void) user_data;
+  gtk_menu_button_popdown (A.docs_button);
+  choose_files (NULL);
+}
+
+static void
+on_manage_libs_clicked (GtkButton *button, gpointer user_data)
+{
+  (void) button;
+  (void) user_data;
+  gtk_menu_button_popdown (A.docs_button);
+  open_libraries_dialog ();
+}
+
+static gboolean
+on_files_dropped (GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data)
+{
+  (void) target;
+  (void) x;
+  (void) y;
+  (void) user_data;
+  GdkFileList *list = g_value_get_boxed (value);
+  if (!list || !A.conv)
+    return FALSE;
+
+  g_autoptr (GPtrArray) paths = g_ptr_array_new_with_free_func (g_free);
+  for (GSList *l = gdk_file_list_get_files (list); l; l = l->next)
+    {
+      char *path = g_file_get_path (l->data);
+      if (path)
+        g_ptr_array_add (paths, path);
+    }
+  g_ptr_array_add (paths, NULL);
+  import_into_chat ((char **) paths->pdata);
+  return TRUE;
+}
+
+static GtkWidget *
+build_docs_button (void)
+{
+  GtkWidget *pop_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+  gtk_widget_add_css_class (pop_box, "picker");
+  GtkWidget *title = dim_label (TR ("Documentos", "Documents"), "caption-heading");
+  gtk_widget_set_margin_start (title, 8);
+  GtkWidget *hint = dim_label (TR ("Las respuestas se basarán en los archivos marcados.",
+                                   "Answers will be based on the ticked files."), "caption");
+  gtk_widget_set_margin_start (hint, 8);
+
+  A.docs_list = GTK_LIST_BOX (gtk_list_box_new ());
+  gtk_list_box_set_selection_mode (A.docs_list, GTK_SELECTION_NONE);
+  gtk_widget_add_css_class (GTK_WIDGET (A.docs_list), "boxed-list");
+  GtkWidget *ph = dim_label (TR ("Aún no hay documentos. Añade archivos o arrástralos al chat.",
+                                 "No documents yet. Add files or drop them into the chat."), "placeholder-row");
+  gtk_label_set_xalign (GTK_LABEL (ph), 0.5);
+  gtk_label_set_justify (GTK_LABEL (ph), GTK_JUSTIFY_CENTER);
+  gtk_list_box_set_placeholder (A.docs_list, ph);
+  g_signal_connect (A.docs_list, "row-activated", G_CALLBACK (on_doc_row_activated), NULL);
+  GtkWidget *sw = gtk_scrolled_window_new ();
+  gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (sw), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+  gtk_scrolled_window_set_propagate_natural_height (GTK_SCROLLED_WINDOW (sw), TRUE);
+  gtk_scrolled_window_set_max_content_height (GTK_SCROLLED_WINDOW (sw), 300);
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (sw), GTK_WIDGET (A.docs_list));
+
+  GtkWidget *add = gtk_button_new_with_label (TR ("Añadir archivos…", "Add files…"));
+  gtk_widget_add_css_class (add, "flat");
+  gtk_widget_set_hexpand (add, TRUE);
+  g_signal_connect (add, "clicked", G_CALLBACK (on_add_files_clicked), NULL);
+  GtkWidget *manage = gtk_button_new_with_label (TR ("Bibliotecas…", "Libraries…"));
+  gtk_widget_add_css_class (manage, "flat");
+  gtk_widget_set_hexpand (manage, TRUE);
+  g_signal_connect (manage, "clicked", G_CALLBACK (on_manage_libs_clicked), NULL);
+  GtkWidget *actions = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
+  gtk_box_set_homogeneous (GTK_BOX (actions), TRUE);
+  gtk_box_append (GTK_BOX (actions), add);
+  gtk_box_append (GTK_BOX (actions), manage);
+
+  gtk_box_append (GTK_BOX (pop_box), title);
+  gtk_box_append (GTK_BOX (pop_box), hint);
+  gtk_box_append (GTK_BOX (pop_box), sw);
+  gtk_box_append (GTK_BOX (pop_box), actions);
+
+  GtkWidget *popover = gtk_popover_new ();
+  gtk_widget_set_size_request (popover, 340, -1);
+  gtk_popover_set_child (GTK_POPOVER (popover), pop_box);
+
+  A.docs_button = GTK_MENU_BUTTON (gtk_menu_button_new ());
+  gtk_menu_button_set_icon_name (A.docs_button, "npu-attach-symbolic");
+  gtk_menu_button_set_popover (A.docs_button, popover);
+  gtk_widget_add_css_class (GTK_WIDGET (A.docs_button), "flat");
+  gtk_widget_add_css_class (GTK_WIDGET (A.docs_button), "circular");
+  gtk_widget_add_css_class (GTK_WIDGET (A.docs_button), "docs-button");
+  gtk_widget_set_valign (GTK_WIDGET (A.docs_button), GTK_ALIGN_END);
+  refresh_docs_ui ();
+  return GTK_WIDGET (A.docs_button);
+}
+
+/* ---- library manager ---- */
+
+static void
+on_new_library_apply (AdwEntryRow *row, gpointer user_data)
+{
+  (void) user_data;
+  g_autofree char *name = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (row))));
+  if (!*name)
+    return;
+  g_ptr_array_add (A.libraries, rag_library_new (name, FALSE));
+  gtk_editable_set_text (GTK_EDITABLE (row), "");
+  refresh_all_docs_ui ();
+}
+
+static void
+on_lib_add_files (GtkButton *button, gpointer user_data)
+{
+  (void) user_data;
+  RagLibrary *lib = rag_library_find (A.libraries, g_object_get_data (G_OBJECT (button), "id"));
+  if (lib)
+    choose_files (lib);
+}
+
+static void
+on_doc_remove (GtkButton *button, gpointer user_data)
+{
+  (void) user_data;
+  RagLibrary *lib = rag_library_find (A.libraries, g_object_get_data (G_OBJECT (button), "lib"));
+  if (!lib || lib->busy)
+    return;
+  rag_library_remove_doc (lib, GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (button), "doc")));
+  drop_rag_index ();
+  refresh_all_docs_ui ();
+}
+
+static void
+forget_library (RagLibrary *lib)
+{
+  for (guint i = 0; i < A.assistants->len; i++)
+    {
+      Assistant *as = A.assistants->pdata[i];
+      for (guint k = 0; as->libs && k < as->libs->len; k++)
+        if (g_str_equal (as->libs->pdata[k], lib->id))
+          g_ptr_array_remove_index (as->libs, k--);
+    }
+  assistants_save (A.assistants);
+  if (A.conv && conversation_has_lib (A.conv, lib->id))
+    {
+      conversation_toggle_lib (A.conv, lib->id);
+      if (A.conv_saved)
+        store_save (A.conv);
+    }
+  rag_library_delete (lib);
+  g_ptr_array_remove (A.libraries, lib);
+  drop_rag_index ();
+}
+
+static void
+on_delete_lib_response (AdwAlertDialog *dialog, const char *response, gpointer user_data)
+{
+  (void) dialog;
+  RagLibrary *lib = rag_library_find (A.libraries, user_data);
+  if (g_str_equal (response, "delete") && lib && !lib->busy)
+    {
+      forget_library (lib);
+      refresh_all_docs_ui ();
+    }
+}
+
+static void
+on_lib_delete (GtkButton *button, gpointer user_data)
+{
+  (void) user_data;
+  const char *id = g_object_get_data (G_OBJECT (button), "id");
+  RagLibrary *lib = rag_library_find (A.libraries, id);
+  if (!lib)
+    return;
+  AdwDialog *d = TRACK (adw_alert_dialog_new (NULL, NULL));
+  adw_alert_dialog_format_heading (ADW_ALERT_DIALOG (d), TR ("¿Eliminar «%s»?", "Delete “%s”?"), lib->name);
+  adw_alert_dialog_set_body (ADW_ALERT_DIALOG (d), TR ("Se borra el índice de NPU Chat. Tus archivos originales no se tocan.",
+                                                       "NPU Chat's index is deleted. Your original files are not touched."));
+  adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (d), "cancel", TR ("Cancelar", "Cancel"),
+                                  "delete", TR ("Eliminar", "Delete"), NULL);
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (d), "delete", ADW_RESPONSE_DESTRUCTIVE);
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (d), "cancel");
+  g_signal_connect_data (d, "response", G_CALLBACK (on_delete_lib_response), g_strdup (lib->id),
+                         free_closure_string, 0);
+  adw_dialog_present (d, GTK_WIDGET (A.libs_dialog ? GTK_WIDGET (A.libs_dialog) : GTK_WIDGET (A.win)));
+}
+
+static void
+on_libs_dialog_closed (AdwDialog *dialog, gpointer user_data)
+{
+  (void) dialog;
+  (void) user_data;
+  A.libs_dialog = NULL;
+}
+
+static GtkWidget *
+build_libraries_page (void)
+{
+  GtkWidget *page = adw_preferences_page_new ();
+
+  AdwPreferencesGroup *intro = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_description (intro, TR ("Agrupa tus archivos en bibliotecas y actívalas en un chat o en un asistente. "
+                                                    "Todo se queda en tu equipo.",
+                                                    "Group your files into libraries and turn them on in a chat or an assistant. "
+                                                    "Everything stays on your computer."));
+  GtkWidget *entry = adw_entry_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (entry), TR ("Nueva biblioteca", "New library"));
+  adw_entry_row_set_show_apply_button (ADW_ENTRY_ROW (entry), TRUE);
+  g_signal_connect (entry, "apply", G_CALLBACK (on_new_library_apply), NULL);
+  adw_preferences_group_add (intro, entry);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), intro);
+
+  for (int pass = 0; pass < 2; pass++)
+    {
+      gboolean chat_files = pass == 1;
+      AdwPreferencesGroup *group = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+      guint shown = 0;
+      for (guint i = 0; i < A.libraries->len; i++)
+        {
+          RagLibrary *lib = A.libraries->pdata[i];
+          if (lib->chat_scoped != chat_files)
+            continue;
+          shown++;
+
+          GtkWidget *exp = adw_expander_row_new ();
+          adw_preferences_row_set_title (ADW_PREFERENCES_ROW (exp), lib->name);
+          adw_preferences_row_set_use_markup (ADW_PREFERENCES_ROW (exp), FALSE);
+          g_autofree char *sub = library_subtitle (lib);
+          adw_expander_row_set_subtitle (ADW_EXPANDER_ROW (exp), sub);
+
+          GtkWidget *add = icon_button ("list-add-symbolic", TR ("Añadir archivos", "Add files"));
+          g_object_set_data_full (G_OBJECT (add), "id", g_strdup (lib->id), g_free);
+          gtk_widget_set_sensitive (add, !lib->busy);
+          g_signal_connect (add, "clicked", G_CALLBACK (on_lib_add_files), NULL);
+          GtkWidget *del = icon_button ("user-trash-symbolic", TR ("Eliminar biblioteca", "Delete library"));
+          g_object_set_data_full (G_OBJECT (del), "id", g_strdup (lib->id), g_free);
+          gtk_widget_set_sensitive (del, !lib->busy);
+          g_signal_connect (del, "clicked", G_CALLBACK (on_lib_delete), NULL);
+          adw_expander_row_add_suffix (ADW_EXPANDER_ROW (exp), add);
+          adw_expander_row_add_suffix (ADW_EXPANDER_ROW (exp), del);
+
+          for (guint d = 0; d < lib->docs->len; d++)
+            {
+              RagDoc *doc = lib->docs->pdata[d];
+              GtkWidget *row = adw_action_row_new ();
+              adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), doc->name);
+              adw_preferences_row_set_use_markup (ADW_PREFERENCES_ROW (row), FALSE);
+              g_autofree char *info = doc->chunks == 1
+                ? g_strdup_printf (TR ("1 fragmento · %s", "1 passage · %s"), doc->path)
+                : g_strdup_printf (TR ("%u fragmentos · %s", "%u passages · %s"), doc->chunks, doc->path);
+              adw_action_row_set_subtitle (ADW_ACTION_ROW (row), info);
+              adw_action_row_set_subtitle_lines (ADW_ACTION_ROW (row), 1);
+              GtkWidget *rm = icon_button ("user-trash-symbolic", TR ("Quitar archivo", "Remove file"));
+              g_object_set_data_full (G_OBJECT (rm), "lib", g_strdup (lib->id), g_free);
+              g_object_set_data (G_OBJECT (rm), "doc", GUINT_TO_POINTER (doc->id));
+              gtk_widget_set_sensitive (rm, !lib->busy);
+              g_signal_connect (rm, "clicked", G_CALLBACK (on_doc_remove), NULL);
+              adw_action_row_add_suffix (ADW_ACTION_ROW (row), rm);
+              adw_expander_row_add_row (ADW_EXPANDER_ROW (exp), row);
+            }
+          adw_preferences_group_add (group, exp);
+        }
+      if (shown)
+        {
+          adw_preferences_group_set_title (group, chat_files ? TR ("Archivos de chats", "Chat files")
+                                                             : TR ("Bibliotecas", "Libraries"));
+          adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), group);
+        }
+      else
+        g_object_unref (g_object_ref_sink (group));
+    }
+  return page;
+}
+
+static void
+libs_dialog_refresh (void)
+{
+  if (!A.libs_dialog)
+    return;
+  GtkWidget *tv = adw_dialog_get_child (A.libs_dialog);
+  adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (tv), build_libraries_page ());
+}
+
+static void
+open_libraries_dialog (void)
+{
+  if (A.libs_dialog)
+    return;
+  A.libs_dialog = TRACK (adw_dialog_new ());
+  adw_dialog_set_title (A.libs_dialog, TR ("Bibliotecas de documentos", "Document libraries"));
+  adw_dialog_set_content_width (A.libs_dialog, 600);
+  adw_dialog_set_content_height (A.libs_dialog, 680);
+  GtkWidget *tv = adw_toolbar_view_new ();
+  adw_toolbar_view_add_top_bar (ADW_TOOLBAR_VIEW (tv), adw_header_bar_new ());
+  adw_dialog_set_child (A.libs_dialog, tv);
+  g_signal_connect (A.libs_dialog, "closed", G_CALLBACK (on_libs_dialog_closed), NULL);
+  libs_dialog_refresh ();
+  adw_dialog_present (A.libs_dialog, GTK_WIDGET (A.win));
+}
+
+static void
+act_libraries (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void) a; (void) p; (void) d;
+  open_libraries_dialog ();
 }
 
 /* ---- UI construction -------------------------------------------------- */
@@ -4125,12 +5118,31 @@ build_composer (void)
   gtk_widget_set_valign (GTK_WIDGET (A.send), GTK_ALIGN_END);
   g_signal_connect (A.send, "clicked", G_CALLBACK (on_send_clicked), NULL);
 
+  gtk_box_append (GTK_BOX (composer), build_docs_button ());
   gtk_box_append (GTK_BOX (composer), overlay);
   gtk_box_append (GTK_BOX (composer), GTK_WIDGET (A.send));
 
+  /* Shows the progress of a file import just above the input. */
+  A.import_label = GTK_LABEL (gtk_label_new (NULL));
+  gtk_label_set_xalign (A.import_label, 0);
+  gtk_label_set_ellipsize (A.import_label, PANGO_ELLIPSIZE_MIDDLE);
+  gtk_widget_add_css_class (GTK_WIDGET (A.import_label), "caption");
+  A.import_bar = gtk_progress_bar_new ();
+  GtkWidget *import_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+  gtk_widget_add_css_class (import_box, "import-bar");
+  gtk_box_append (GTK_BOX (import_box), GTK_WIDGET (A.import_label));
+  gtk_box_append (GTK_BOX (import_box), A.import_bar);
+  A.import_revealer = gtk_revealer_new ();
+  gtk_revealer_set_transition_type (GTK_REVEALER (A.import_revealer), GTK_REVEALER_TRANSITION_TYPE_SLIDE_UP);
+  gtk_revealer_set_child (GTK_REVEALER (A.import_revealer), import_box);
+
+  GtkWidget *column = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_box_append (GTK_BOX (column), A.import_revealer);
+  gtk_box_append (GTK_BOX (column), composer);
+
   GtkWidget *clamp = adw_clamp_new ();
   adw_clamp_set_maximum_size (ADW_CLAMP (clamp), 820);
-  adw_clamp_set_child (ADW_CLAMP (clamp), composer);
+  adw_clamp_set_child (ADW_CLAMP (clamp), column);
   gtk_widget_add_css_class (clamp, "composer-area");
   return clamp;
 }
@@ -4191,6 +5203,7 @@ build_menu (void)
   GMenu *top = g_menu_new ();
   g_menu_append (top, TR ("Nueva conversación", "New chat"), "win.new-chat");
   g_menu_append (top, TR ("Galería de asistentes", "Assistant gallery"), "win.gallery");
+  g_menu_append (top, TR ("Bibliotecas de documentos", "Document libraries"), "win.libraries");
   g_menu_append (top, TR ("Administrar modelos", "Manage models"), "win.models");
   g_menu_append_section (menu, NULL, G_MENU_MODEL (top));
   GMenu *bottom = g_menu_new ();
@@ -4217,6 +5230,11 @@ build_ui (void)
 
   A.toasts = ADW_TOAST_OVERLAY (adw_toast_overlay_new ());
   adw_toast_overlay_set_child (A.toasts, GTK_WIDGET (A.split));
+
+  /* Dropping files anywhere in the window adds them to the open chat. */
+  GtkDropTarget *drop = gtk_drop_target_new (GDK_TYPE_FILE_LIST, GDK_ACTION_COPY);
+  g_signal_connect (drop, "drop", G_CALLBACK (on_files_dropped), NULL);
+  gtk_widget_add_controller (GTK_WIDGET (A.toasts), GTK_EVENT_CONTROLLER (drop));
 
   /* The breakpoint lives in a bin that is rebuilt with the rest of the UI,
    * so it never points at a stale split view. */
@@ -4304,6 +5322,7 @@ on_shutdown (GApplication *app, gpointer user_data)
   (void) app;
   (void) user_data;
   flm_shutdown ();
+  rag_shutdown ();
   power_shutdown ();
   updater_shutdown ();
   update_info_free (g_steal_pointer (&A.update));
@@ -4315,6 +5334,8 @@ on_shutdown (GApplication *app, gpointer user_data)
   A.conv = NULL;
   g_clear_pointer (&A.convs, g_ptr_array_unref);
   g_clear_pointer (&A.assistants, g_ptr_array_unref);
+  drop_rag_index ();
+  g_clear_pointer (&A.libraries, g_ptr_array_unref);
   g_clear_pointer (&A.pick_id, g_free);
   g_clear_pointer (&A.pick_team, g_ptr_array_unref);
   g_clear_pointer (&A.queue, g_array_unref);
@@ -4363,6 +5384,7 @@ on_activate (GApplication *app, gpointer user_data)
   A.pulling = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   A.convs = store_load_all ();
   A.assistants = assistants_load ();
+  A.libraries = rag_libraries_load ();
   A.pick_team = g_ptr_array_new_with_free_func (g_free);
   A.queue = g_array_new (FALSE, FALSE, sizeof (int));
   A.stick_bottom = TRUE;
@@ -4383,6 +5405,7 @@ on_activate (GApplication *app, gpointer user_data)
     { "about", act_about, NULL, NULL, NULL, { 0 } },
     { "new-assistant", act_new_assistant, NULL, NULL, NULL, { 0 } },
     { "gallery", act_gallery, NULL, NULL, NULL, { 0 } },
+    { "libraries", act_libraries, NULL, NULL, NULL, { 0 } },
     { "install-update", act_install_update, NULL, NULL, NULL, { 0 } },
     { "open-release", act_open_release, NULL, NULL, NULL, { 0 } },
     { "quit", act_quit, NULL, NULL, NULL, { 0 } },
@@ -4474,6 +5497,8 @@ selftest_tick (gpointer user_data)
         adw_dialog_force_close (editor_current->dialog);
       if (gallery.dialog)
         adw_dialog_force_close (gallery.dialog);
+      if (A.libs_dialog)
+        adw_dialog_force_close (A.libs_dialog);
       if (A.update_dialog)
         adw_dialog_force_close (A.update_dialog);
     }
@@ -4537,6 +5562,73 @@ selftest_tick (gpointer user_data)
     updater_check (on_update_checked, GINT_TO_POINTER (TRUE));
   else if (g_str_equal (s, "update"))
     act_install_update (NULL, NULL, NULL);
+  else if (g_str_has_prefix (s, "import:"))
+    {
+      g_auto (GStrv) paths = g_strsplit (s + 7, "|", -1);
+      import_into_chat (paths);
+    }
+  else if (g_str_equal (s, "waitimport"))
+    {
+      for (guint k = 0; A.libraries && k < A.libraries->len; k++)
+        if (((RagLibrary *) A.libraries->pdata[k])->busy)
+          return G_SOURCE_CONTINUE;
+    }
+  else if (g_str_has_prefix (s, "newlib:"))
+    {
+      g_ptr_array_add (A.libraries, rag_library_new (s + 7, FALSE));
+      refresh_all_docs_ui ();
+    }
+  else if (g_str_has_prefix (s, "libimport:") && A.libraries->len)
+    {
+      /* libimport:<n>:<path>|<path>... where n indexes the libraries */
+      char *colon = strchr (s + 10, ':');
+      guint n = (guint) atoi (s + 10);
+      if (colon && n < A.libraries->len)
+        {
+          g_auto (GStrv) paths = g_strsplit (colon + 1, "|", -1);
+          start_import (A.libraries->pdata[n], paths);
+        }
+    }
+  else if (g_str_has_prefix (s, "attach:") && (guint) atoi (s + 7) < A.libraries->len)
+    {
+      conversation_toggle_lib (A.conv, ((RagLibrary *) A.libraries->pdata[atoi (s + 7)])->id);
+      conv_libs_changed ();
+    }
+  else if (g_str_has_prefix (s, "assistlib:"))
+    {
+      guint ai = (guint) atoi (s + 10);
+      char *colon = strchr (s + 10, ':');
+      if (colon && ai < A.assistants->len && (guint) atoi (colon + 1) < A.libraries->len)
+        {
+          Assistant *as = A.assistants->pdata[ai];
+          g_ptr_array_add (as->libs, g_strdup (((RagLibrary *) A.libraries->pdata[atoi (colon + 1)])->id));
+          assistants_save (A.assistants);
+          drop_rag_index ();
+          refresh_all_docs_ui ();
+        }
+    }
+  else if (g_str_equal (s, "libdlg"))
+    open_libraries_dialog ();
+  else if (g_str_equal (s, "docsmenu"))
+    gtk_menu_button_popup (A.docs_button);
+  else if (g_str_equal (s, "docsmenuclose"))
+    gtk_menu_button_popdown (A.docs_button);
+  else if (g_str_has_prefix (s, "rmdoc:"))
+    {
+      guint n = (guint) atoi (s + 6);
+      if (n < A.libraries->len && ((RagLibrary *) A.libraries->pdata[n])->docs->len > 0)
+        {
+          RagLibrary *lib = A.libraries->pdata[n];
+          rag_library_remove_doc (lib, ((RagDoc *) lib->docs->pdata[0])->id);
+          drop_rag_index ();
+          refresh_all_docs_ui ();
+        }
+    }
+  else if (g_str_has_prefix (s, "dellib:") && (guint) atoi (s + 7) < A.libraries->len)
+    {
+      forget_library (A.libraries->pdata[atoi (s + 7)]);
+      refresh_all_docs_ui ();
+    }
   else if (g_str_equal (s, "gallery"))
     open_gallery ();
   else if (g_str_has_prefix (s, "gsearch:") && gallery.dialog)

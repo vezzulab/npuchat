@@ -6,9 +6,12 @@ cd "$(dirname "$0")/.."
 
 if [ ! -d build-test ]; then
   toolbox run -c npu-dev meson setup build-test -Dbuildtype=debug \
-    -Db_sanitize=address -Dc_args=-DNPU_CHAT_SELFTEST
+    -Db_sanitize=address -Dc_args=-DNPU_CHAT_SELFTEST -Dtests=true
 fi
 toolbox run -c npu-dev meson compile -C build-test
+
+# The retrieval engine on its own, under ASan/LeakSanitizer.
+toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-rag
 
 # A separate port and D-Bus session let this run next to a real NPU Chat.
 port=52690
@@ -18,6 +21,19 @@ trap '[ -n "${KEEP_LOG:-}" ] && cp "$work/asan.log" "$KEEP_LOG"; rm -rf "$work"'
 mkdir -p "$work/config/npu-chat"
 printf '[chat]\nmodel=qwen3:8b\nlanguage=es\ntheme=dark\n' > "$work/config/npu-chat/settings.ini"
 
+mkdir -p "$work/docs"
+cat > "$work/docs/manual.md" <<'DOC'
+# Manual de soporte
+
+La garantía del producto cubre defectos de fabricación durante 24 meses desde la compra. No cubre daños por agua ni golpes.
+
+Para solicitar un reembolso, envía el recibo y el producto sin usar dentro de los 30 días posteriores a la compra.
+
+El router se reinicia manteniendo presionado el botón trasero durante 10 segundos hasta que las luces parpadeen.
+DOC
+printf 'Los envios internacionales tardan entre 7 y 15 dias habiles.\n' > "$work/docs/envios.txt"
+printf '\000\001binary' > "$work/docs/roto.txt"
+
 steps="send:Hola;wait;newchat;send:Otra;wait;newchat;send:Tercera;wait;open:1;delete:0;delete:0"
 steps+=";models;sleep:3;closedlg;installed;sleep:2;closedlg;prefs;sleep:2;closedlg"
 steps+=";pick:0;send:Me siento estresado;wait;newchat;mkassistant;sleep:1;send:Plan de comidas;wait"
@@ -26,6 +42,10 @@ steps+=";newchat;team:0,1;send:Quiero una rutina y un plan de comidas;wait;wait"
 steps+=";send:PASSTEST algo mas;wait;wait;send:TAGTEST otra vez;wait;wait"
 steps+=";send:Estratega, ¿cómo me organizo?;wait;toggle:2;send:¿Y para estudiar?;wait"
 steps+=";clearassistant;galleryremove:chef;galleryremove:linux;newchat"
+steps+=";newchat;import:$work/docs/manual.md|$work/docs/roto.txt;waitimport"
+steps+=";send:¿Cuánto dura la garantía?;wait;send:NOMATCH pregunta sin relacion;wait"
+steps+=";newlib:Envios;libimport:1:$work/docs/envios.txt;waitimport;attach:1;libdlg;sleep:1;rmdoc:1;dellib:1;closedlg"
+steps+=";assistlib:0:0;newchat;pick:0;send:Pregunta con asistente;wait;pick:-1;newchat"
 steps+=";lang:en;theme:light;sleep:1;send:English;wait;close"
 
 set +e
@@ -77,6 +97,17 @@ if grep -hq '"content" : "\[[^]]*\]:' "$work"/data/npu-chat/chats/*.json; then
   echo "FAIL: a speaker tag was kept in a reply" >&2; exit 1
 fi
 grep -lq 'Respuesta con etiqueta propia' "$work"/data/npu-chat/chats/*.json || { echo "FAIL: tagged reply missing" >&2; exit 1; }
+
+# Documents: the question was searched, the passage reached the model and
+# the answer cites it; an unmatched question is recorded as searched-with-no-hits.
+doc_chat=$(grep -l '"manual.md"' "$work"/data/npu-chat/chats/*.json | head -1 || true)
+[ -n "$doc_chat" ] || { echo "FAIL: no chat with document sources saved" >&2; exit 1; }
+grep -q '"libs"' "$doc_chat" || { echo "FAIL: the chat did not keep its library" >&2; exit 1; }
+grep -q 'Según tus documentos \[1\]' "$doc_chat" || { echo "FAIL: the answer did not use the sources" >&2; exit 1; }
+grep -q 'No encontré eso en tus documentos' "$doc_chat" || { echo "FAIL: the no-match question was not handled" >&2; exit 1; }
+if grep -q 'roto.txt' "$work"/data/npu-chat/libraries/*/meta.json; then
+  echo "FAIL: a binary file was indexed" >&2; exit 1
+fi
 
 # 2) Plain memory leaks. GTK, GLib and fontconfig keep some one-time
 # allocations until exit; a leak counts as ours when our code made the

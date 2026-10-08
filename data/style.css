@@ -354,3 +354,45 @@ image.warning {
 .clear-assistant:hover {
   opacity: 1;
 }
+
+/* ---- documents ---- */
+
+.docs-button {
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  opacity: 0.7;
+}
+
+.docs-button:hover {
+  opacity: 1;
+}
+
+.docs-button.has-docs {
+  opacity: 1;
+  color: @accent_color;
+}
+
+.import-bar {
+  padding: 8px 18px 10px 18px;
+  opacity: 0.85;
+}
+
+.import-bar progressbar {
+  min-height: 3px;
+}
+
+.sources {
+  margin-left: 34px;
+  font-size: 0.9em;
+}
+
+.sources .source-ref {
+  font-weight: 600;
+  font-size: 0.92em;
+}
+
+.sources .source-text {
+  opacity: 0.65;
+  font-size: 0.92em;
+}

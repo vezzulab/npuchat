@@ -6,7 +6,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   build-essential meson ninja-build pkg-config ca-certificates curl file \
-  libgtk-4-dev libadwaita-1-dev libsoup-3.0-dev libjson-glib-dev \
+  libgtk-4-dev libadwaita-1-dev libsoup-3.0-dev libjson-glib-dev libpoppler-glib-dev \
   libglib2.0-bin libgdk-pixbuf2.0-bin librsvg2-common glib-networking >/dev/null
 
 tools=/tmp/tools

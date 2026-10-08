@@ -16,6 +16,7 @@ assistant_new (const char *name, const char *emoji, const char *instructions)
   a->name = g_strdup (name);
   a->emoji = g_strdup (emoji);
   a->instructions = g_strdup (instructions);
+  a->libs = g_ptr_array_new_with_free_func (g_free);
   return a;
 }
 
@@ -29,6 +30,8 @@ assistant_free (Assistant *a)
   g_free (a->emoji);
   g_free (a->instructions);
   g_free (a->template_key);
+  if (a->libs)
+    g_ptr_array_unref (a->libs);
   g_free (a);
 }
 
@@ -107,6 +110,14 @@ assistants_load (void)
       a->emoji = g_strdup (str_member (o, "emoji") ? str_member (o, "emoji") : "✦");
       a->instructions = g_strdup (str_member (o, "instructions") ? str_member (o, "instructions") : "");
       a->template_key = g_strdup (str_member (o, "template"));
+      a->libs = g_ptr_array_new_with_free_func (g_free);
+      JsonNode *ln = json_object_get_member (o, "libs");
+      for (guint k = 0; ln && JSON_NODE_HOLDS_ARRAY (ln) && k < json_array_get_length (json_node_get_array (ln)); k++)
+        {
+          const char *lid = json_array_get_string_element (json_node_get_array (ln), k);
+          if (lid)
+            g_ptr_array_add (a->libs, g_strdup (lid));
+        }
       /* Lists saved before the gallery existed: recognise unchanged examples. */
       for (guint t = 0; !a->template_key && t < assistant_templates_count; t++)
         {
@@ -137,6 +148,14 @@ assistants_save (GPtrArray *list)
       json_builder_add_string_value (b, a->emoji);
       json_builder_set_member_name (b, "instructions");
       json_builder_add_string_value (b, a->instructions);
+      if (a->libs && a->libs->len)
+        {
+          json_builder_set_member_name (b, "libs");
+          json_builder_begin_array (b);
+          for (guint k = 0; k < a->libs->len; k++)
+            json_builder_add_string_value (b, a->libs->pdata[k]);
+          json_builder_end_array (b);
+        }
       if (a->template_key)
         {
           json_builder_set_member_name (b, "template");

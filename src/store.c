@@ -13,7 +13,18 @@ store_msg_free (gpointer p)
   g_free (m->stats);
   g_free (m->author);
   g_free (m->author_emoji);
+  if (m->sources)
+    g_ptr_array_unref (m->sources);
   g_free (m);
+}
+
+static void
+store_source_free (gpointer p)
+{
+  StoreSource *s = p;
+  g_free (s->file);
+  g_free (s->text);
+  g_free (s);
 }
 
 TeamMember *
@@ -49,6 +60,7 @@ conversation_new (void)
   c->updated = g_date_time_to_unix (now);
   c->msgs = g_ptr_array_new_with_free_func (store_msg_free);
   c->team = g_ptr_array_new_with_free_func (team_member_free);
+  c->libs = g_ptr_array_new_with_free_func (g_free);
   c->loaded = TRUE;
   return c;
 }
@@ -66,6 +78,7 @@ conversation_free (Conversation *c)
   g_free (c->assistant_emoji);
   g_free (c->system);
   g_ptr_array_unref (c->team);
+  g_ptr_array_unref (c->libs);
   g_ptr_array_unref (c->msgs);
   g_free (c);
 }
@@ -81,6 +94,53 @@ conversation_add (Conversation *c, const char *role, const char *content,
   m->stats = stats && *stats ? g_strdup (stats) : NULL;
   g_ptr_array_add (c->msgs, m);
   c->updated = g_get_real_time () / G_USEC_PER_SEC;
+}
+
+void
+conversation_begin_sources (Conversation *c)
+{
+  if (c->msgs->len == 0)
+    return;
+  StoreMsg *m = c->msgs->pdata[c->msgs->len - 1];
+  if (m->sources)
+    g_ptr_array_unref (m->sources);
+  m->sources = g_ptr_array_new_with_free_func (store_source_free);
+}
+
+void
+conversation_add_source (Conversation *c, const char *file, int page, const char *text)
+{
+  if (c->msgs->len == 0)
+    return;
+  StoreMsg *m = c->msgs->pdata[c->msgs->len - 1];
+  if (!m->sources)
+    conversation_begin_sources (c);
+  StoreSource *s = g_new0 (StoreSource, 1);
+  s->file = g_strdup (file);
+  s->page = page;
+  s->text = g_strdup (text);
+  g_ptr_array_add (m->sources, s);
+}
+
+gboolean
+conversation_has_lib (const Conversation *c, const char *id)
+{
+  for (guint i = 0; i < c->libs->len; i++)
+    if (g_str_equal (c->libs->pdata[i], id))
+      return TRUE;
+  return FALSE;
+}
+
+void
+conversation_toggle_lib (Conversation *c, const char *id)
+{
+  for (guint i = 0; i < c->libs->len; i++)
+    if (g_str_equal (c->libs->pdata[i], id))
+      {
+        g_ptr_array_remove_index (c->libs, i);
+        return;
+      }
+  g_ptr_array_add (c->libs, g_strdup (id));
 }
 
 void
@@ -140,6 +200,14 @@ load_file (const char *path, gboolean with_messages)
   c->updated = json_object_get_int_member_with_default (o, "updated", 0);
   c->msgs = g_ptr_array_new_with_free_func (store_msg_free);
   c->team = g_ptr_array_new_with_free_func (team_member_free);
+  c->libs = g_ptr_array_new_with_free_func (g_free);
+  JsonNode *libs = json_object_get_member (o, "libs");
+  for (guint i = 0; libs && JSON_NODE_HOLDS_ARRAY (libs) && i < json_array_get_length (json_node_get_array (libs)); i++)
+    {
+      const char *id = json_array_get_string_element (json_node_get_array (libs), i);
+      if (id)
+        g_ptr_array_add (c->libs, g_strdup (id));
+    }
   JsonNode *team = json_object_get_member (o, "team");
   for (guint i = 0; team && JSON_NODE_HOLDS_ARRAY (team) && i < json_array_get_length (json_node_get_array (team)); i++)
     {
@@ -164,6 +232,22 @@ load_file (const char *path, gboolean with_messages)
       sm->content = g_strdup (str_member (m, "content"));
       sm->think = g_strdup (str_member (m, "think"));
       sm->stats = g_strdup (str_member (m, "stats"));
+      JsonNode *src = json_object_get_member (m, "sources");
+      if (src && JSON_NODE_HOLDS_ARRAY (src))
+        {
+          sm->sources = g_ptr_array_new_with_free_func (store_source_free);
+          for (guint k = 0; k < json_array_get_length (json_node_get_array (src)); k++)
+            {
+              JsonObject *so = json_array_get_object_element (json_node_get_array (src), k);
+              if (!so)
+                continue;
+              StoreSource *s = g_new0 (StoreSource, 1);
+              s->file = g_strdup (str_member (so, "f"));
+              s->page = (int) json_object_get_int_member_with_default (so, "p", 0);
+              s->text = g_strdup (str_member (so, "t"));
+              g_ptr_array_add (sm->sources, s);
+            }
+        }
       sm->author = g_strdup (str_member (m, "author"));
       sm->author_emoji = g_strdup (str_member (m, "author_emoji"));
       g_ptr_array_add (c->msgs, sm);
@@ -250,6 +334,14 @@ store_save (Conversation *c)
       json_builder_set_member_name (b, "system");
       json_builder_add_string_value (b, c->system);
     }
+  if (c->libs->len)
+    {
+      json_builder_set_member_name (b, "libs");
+      json_builder_begin_array (b);
+      for (guint i = 0; i < c->libs->len; i++)
+        json_builder_add_string_value (b, c->libs->pdata[i]);
+      json_builder_end_array (b);
+    }
   if (c->team->len)
     {
       json_builder_set_member_name (b, "team");
@@ -291,6 +383,24 @@ store_save (Conversation *c)
         {
           json_builder_set_member_name (b, "stats");
           json_builder_add_string_value (b, m->stats);
+        }
+      if (m->sources)
+        {
+          json_builder_set_member_name (b, "sources");
+          json_builder_begin_array (b);
+          for (guint k = 0; k < m->sources->len; k++)
+            {
+              StoreSource *s = m->sources->pdata[k];
+              json_builder_begin_object (b);
+              json_builder_set_member_name (b, "f");
+              json_builder_add_string_value (b, s->file ? s->file : "");
+              json_builder_set_member_name (b, "p");
+              json_builder_add_int_value (b, s->page);
+              json_builder_set_member_name (b, "t");
+              json_builder_add_string_value (b, s->text ? s->text : "");
+              json_builder_end_object (b);
+            }
+          json_builder_end_array (b);
         }
       if (m->author)
         {
