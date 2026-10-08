@@ -10,6 +10,16 @@
 
 **NPU Chat** is a lightweight desktop app for chatting with local AI models on the NPU of AMD Ryzen AI laptops. It uses [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) under the hood. No cloud, no browser, no clutter.
 
+## Why NPU Chat?
+
+Most local AI apps on Linux (Ollama, llama.cpp, LM Studio) run models on the CPU or GPU. Ryzen AI laptops also have an **NPU**, a chip built for AI, which usually sits idle. NPU Chat puts it to work:
+
+- **Your CPU and GPU stay free:** the model runs on the NPU, so your machine stays responsive while it writes.
+- **Easy on the battery:** the NPU is designed for low-power AI. In our test the laptop drew about the same power while generating as it does at idle.
+- **Native and simple:** a small GTK app. No browser tabs, Docker or web-server stack.
+
+<sub>Measured on a Ryzen AI 5 430 on battery with `qwen3.5:9b` in power-saver mode, generating 400 tokens at 11.7 tok/s. CPU use was 6 % (3.5 % at idle) and GPU use 1 %. The whole laptop drew ~8.4 W, versus 8.6 W at idle.</sub>
+
 ## Features
 
 - **100% local:** runs on the NPU, works offline.
