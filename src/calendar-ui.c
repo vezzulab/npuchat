@@ -577,6 +577,31 @@ alert_choices (void)
   return gtk_string_list_new (items);
 }
 
+/* "15 minutes before", "1 day 15 h before", "9 h after the start" */
+static char *
+alert_label (int minutes)
+{
+  if (minutes == -1)
+    return g_strdup (TR ("Ninguno", "None"));
+  if (minutes == 0)
+    return g_strdup (TR ("A la hora del evento", "At time of event"));
+  int m = minutes < 0 ? -minutes : minutes;
+  int weeks = m / 10080, days = (m % 10080) / 1440, hours = (m % 1440) / 60, mins = m % 60;
+  GString *parts = g_string_new (NULL);
+  if (weeks)
+    g_string_append_printf (parts, "%d %s", weeks, weeks == 1 ? TR ("semana", "week") : TR ("semanas", "weeks"));
+  if (days)
+    g_string_append_printf (parts, "%s%d %s", parts->len ? " " : "", days, days == 1 ? TR ("día", "day") : TR ("días", "days"));
+  if (hours)
+    g_string_append_printf (parts, "%s%d %s", parts->len ? " " : "", hours, hours == 1 && !english () ? "hora" : english () ? (hours == 1 ? "hour" : "hours") : "horas");
+  if (mins)
+    g_string_append_printf (parts, "%s%d min", parts->len ? " " : "", mins);
+  char *label = minutes > 0 ? g_strdup_printf (TR ("%s antes", "%s before"), parts->str)
+                            : g_strdup_printf (TR ("%s después del inicio", "%s after the start"), parts->str);
+  g_string_free (parts, TRUE);
+  return label;
+}
+
 static guint
 alert_index (int minutes)
 {
@@ -625,6 +650,8 @@ typedef struct {
   GtkWidget *repeat, *interval_row, *weekday_row, *monthly_row, *ends_row, *until_row, *count_row;
   GtkWidget *weekday[7];
   GtkWidget *alert1, *alert2, *cal_combo;
+  GArray    *alert_values;   /* minutes for each choice: the usual ones, plus any the event already has */
+  GArray    *extra_alerts;   /* alerts beyond the two rows, kept as they are */
   GPtrArray *own;
 } Editor;
 
@@ -639,6 +666,8 @@ editor_free (AdwDialog *dialog, gpointer data)
     last_editor = NULL;
   g_free (e->id);
   g_ptr_array_unref (e->own);
+  g_array_free (e->alert_values, TRUE);
+  g_array_free (e->extra_alerts, TRUE);
   g_free (e);
 }
 
@@ -774,15 +803,17 @@ on_editor_save (GtkButton *button, gpointer data)
         ev->count = (int) adw_spin_row_get_value (ADW_SPIN_ROW (e->count_row));
     }
 
-  int minutes[2];
-  guint n = 0;
+  g_autoptr (GArray) chosen = g_array_new (FALSE, FALSE, sizeof (int));
   for (int k = 0; k < 2; k++)
     {
-      int m = alert_minutes[adw_combo_row_get_selected (ADW_COMBO_ROW (k ? e->alert2 : e->alert1))];
-      if (m >= 0)
-        minutes[n++] = m;
+      guint sel = adw_combo_row_get_selected (ADW_COMBO_ROW (k ? e->alert2 : e->alert1));
+      int m = sel < e->alert_values->len ? g_array_index (e->alert_values, int, sel) : -1;
+      if (m != -1)
+        g_array_append_val (chosen, m);
     }
-  calendar_event_set_alerts (ev, minutes, n);
+  /* alerts past the second one are not shown, and not lost */
+  g_array_append_vals (chosen, e->extra_alerts->data, e->extra_alerts->len);
+  calendar_event_set_alerts (ev, (const int *) chosen->data, chosen->len);
   guint ci = adw_combo_row_get_selected (ADW_COMBO_ROW (e->cal_combo));
   g_free (ev->calendar);
   ev->calendar = g_strdup (((CalCalendar *) e->own->pdata[MIN (ci, e->own->len - 1)])->id);
@@ -1021,16 +1052,42 @@ open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 en
   adw_preferences_group_add (rep, e->count_row);
   adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), rep);
 
-  /* alerts */
+  /* alerts: the usual choices, plus whatever this event already has (iCloud's "15 hours before" for
+   * all-day events, for one), so that saving never changes an alert it does not offer */
+  e->alert_values = g_array_new (FALSE, FALSE, sizeof (int));
+  e->extra_alerts = g_array_new (FALSE, FALSE, sizeof (int));
+  for (guint i = 0; i < G_N_ELEMENTS (alert_minutes); i++)
+    g_array_append_val (e->alert_values, alert_minutes[i]);
+  for (guint i = 0; existing && i < calendar_event_alert_count (existing); i++)
+    {
+      int m = calendar_event_alert (existing, i);
+      gboolean known = FALSE;
+      for (guint k = 0; k < e->alert_values->len; k++)
+        known |= g_array_index (e->alert_values, int, k) == m;
+      if (!known)
+        g_array_append_val (e->alert_values, m);
+      if (i >= 2)
+        g_array_append_val (e->extra_alerts, m);
+    }
   AdwPreferencesGroup *alerts = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
   for (int k = 0; k < 2; k++)
     {
       GtkWidget *row = adw_combo_row_new ();
       adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), k ? TR ("Segundo aviso", "Second alert") : TR ("Aviso", "Alert"));
-      g_autoptr (GtkStringList) choices = alert_choices ();
+      g_autoptr (GtkStringList) choices = gtk_string_list_new (NULL);
+      for (guint i = 0; i < e->alert_values->len; i++)
+        {
+          g_autofree char *label = alert_label (g_array_index (e->alert_values, int, i));
+          gtk_string_list_append (choices, label);
+        }
       adw_combo_row_set_model (ADW_COMBO_ROW (row), G_LIST_MODEL (choices));
-      int minutes = existing ? calendar_event_alert (existing, (guint) k) : (k ? -1 : calendar_settings ()->default_alert);
-      adw_combo_row_set_selected (ADW_COMBO_ROW (row), alert_index (minutes));
+      int minutes = existing ? (k < (int) calendar_event_alert_count (existing) ? calendar_event_alert (existing, (guint) k) : -1)
+                             : (k ? -1 : calendar_settings ()->default_alert);
+      guint sel = 0;
+      for (guint i = 0; i < e->alert_values->len; i++)
+        if (g_array_index (e->alert_values, int, i) == minutes)
+          sel = i;
+      adw_combo_row_set_selected (ADW_COMBO_ROW (row), sel);
       adw_preferences_group_add (alerts, row);
       if (k)
         e->alert2 = row;
@@ -3607,6 +3664,32 @@ selftest_step (gpointer data)
     g_array_free (later, TRUE);
   }
 
+  /* saving an event must not change alerts the editor has no menu entry for: iCloud's "15 hours before"
+   * on all-day events, "9 hours after the start", and more than two alerts */
+  {
+    CalEvent *odd = calendar_event_new ("Odd alerts", today + 30 * 3600, today + 31 * 3600, FALSE);
+    int values[] = { 900, 2340, 30, -540 };
+    calendar_event_set_alerts (odd, values, 4);
+    g_autofree char *odd_id = g_strdup (calendar_add (cal, odd));
+    const CalEvent *shown = calendar_find (cal, odd_id);
+    open_editor (shown, 0, 0, 0);
+    CHECK (last_editor != NULL, "the editor opens for an event with unusual alerts");
+    if (last_editor)
+      {
+        /* the two rows show the first two alerts by name, not as "None" */
+        guint sel = adw_combo_row_get_selected (ADW_COMBO_ROW (last_editor->alert1));
+        CHECK (sel < last_editor->alert_values->len && g_array_index (last_editor->alert_values, int, sel) == 900, "the first alert is shown as itself");
+        sel = adw_combo_row_get_selected (ADW_COMBO_ROW (last_editor->alert2));
+        CHECK (sel < last_editor->alert_values->len && g_array_index (last_editor->alert_values, int, sel) == 2340, "and the second");
+        on_editor_save (NULL, last_editor);
+      }
+    const CalEvent *kept = calendar_find (cal, odd_id);
+    CHECK (kept && calendar_event_alert_count (kept) == 4 && calendar_event_alert (kept, 0) == 900 && calendar_event_alert (kept, 1) == 2340 &&
+           calendar_event_alert (kept, 2) == 30 && calendar_event_alert (kept, 3) == -540, "all four alerts survive a save untouched");
+    g_autofree char *l1 = alert_label (900), *l2 = alert_label (-540), *l3 = alert_label (2340);
+    CHECK (strstr (l1, "15") != NULL && strstr (l2, "9") != NULL && strstr (l3, "15") != NULL, "unusual alerts get readable names");
+  }
+
   g_print (ok ? "SELFTEST PASS\n" : "SELFTEST FAILED\n");
   *result = ok;
   return G_SOURCE_REMOVE;
@@ -3654,5 +3737,21 @@ calendar_ui_debug_print (const char *directory)
     {
       g_autofree char *path = g_strdup_printf ("%s/%s.pdf", directory, names[v]);
       calendar_print (NULL, (PrintView) v, U.anchor, path);
+    }
+}
+
+/* for tests: switches views and months many times, to see whether memory grows */
+void
+calendar_ui_stress (int rounds)
+{
+  for (int i = 0; i < rounds && U.view; i++)
+    {
+      for (int m = 0; m < 4; m++)
+        {
+          gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[m]), TRUE);
+          on_step (NULL, GINT_TO_POINTER (i % 2 ? 1 : -1));
+          for (int k = 0; k < 4; k++)
+            g_main_context_iteration (NULL, FALSE);
+        }
     }
 }

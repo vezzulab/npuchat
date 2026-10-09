@@ -44,6 +44,7 @@ calendar_settings (void)
   settings->default_alert = get_int (kf, "default_alert", -1, -1, 10080);
   settings->background = get_bool (kf, "background", FALSE);
   settings->autostart = get_bool (kf, "autostart", FALSE);
+  settings->background_asked = get_bool (kf, "background_asked", FALSE);
   g_autofree char *cal = g_key_file_get_string (kf, "calendar", "default_calendar", NULL);
   settings->default_calendar = cal && *cal ? g_strdup (cal) : NULL;
   g_autofree char *theme = g_key_file_get_string (kf, "calendar", "theme", NULL);
@@ -65,6 +66,7 @@ calendar_settings_save (void)
   g_key_file_set_integer (kf, "calendar", "default_alert", s->default_alert);
   g_key_file_set_boolean (kf, "calendar", "background", s->background);
   g_key_file_set_boolean (kf, "calendar", "autostart", s->autostart);
+  g_key_file_set_boolean (kf, "calendar", "background_asked", s->background_asked);
   g_key_file_set_string (kf, "calendar", "default_calendar", s->default_calendar ? s->default_calendar : "");
   g_key_file_set_string (kf, "calendar", "theme", s->theme);
   g_autofree char *p = path ();

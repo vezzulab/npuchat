@@ -162,14 +162,15 @@ calendar_event_set_alerts (CalEvent *ev, const int *minutes, guint n)
 {
   g_array_set_size (ev->alerts, 0);
   for (guint i = 0; i < n; i++)
-    if (minutes[i] >= 0)
+    if (minutes[i] != -1)            /* -1 means "none"; other negatives are after the start */
       g_array_append_val (ev->alerts, minutes[i]);
 }
 
 void
 calendar_event_add_alert (CalEvent *ev, int minutes)
 {
-  if (minutes >= 0)
+  /* minutes before the start; negative ones are after it ("9 hours after midnight"). -1 means none. */
+  if (minutes != -1)
     g_array_append_val (ev->alerts, minutes);
 }
 

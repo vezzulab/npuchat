@@ -319,18 +319,29 @@ add_exdates (CalEvent *ev, const Prop *p, gboolean all_day)
     }
 }
 
+/* An alarm: "-PT15M" is 15 minutes before the start, "PT9H" is 9 hours after it (what Apple uses
+ * for all-day events), and a fixed date and time is kept until the event's start is known. */
 static void
-add_alarm_trigger (CalEvent *ev, const Prop *p)
+add_alarm_trigger (CalEvent *ev, const Prop *p, GArray *absolute)
 {
   g_autofree char *related = param (p->params, "RELATED");
+  g_autofree char *kind = param (p->params, "VALUE");
   gint64 secs;
   if (related && g_ascii_strcasecmp (related, "END") == 0)
     return;
-  /* "-PT15M" is 15 minutes before; absolute triggers are not supported */
-  if (parse_duration (p->value, &secs) && secs <= 0 && -secs <= 4 * 7 * 86400)
-    calendar_event_add_alert (ev, (int) (-secs / 60));
-  else if (parse_duration (p->value, &secs) && secs == 0)
-    calendar_event_add_alert (ev, 0);
+  if (kind && g_ascii_strcasecmp (kind, "DATE-TIME") == 0)
+    {
+      gint64 t;
+      if (parse_date_value (p->value, NULL, &t, NULL))
+        g_array_append_val (absolute, t);
+      return;
+    }
+  if (!parse_duration (p->value, &secs) || secs > 4 * 7 * 86400 || -secs > 4 * 7 * 86400)
+    return;
+  int minutes = (int) (-secs / 60);       /* before the start is positive */
+  if (minutes == -1)
+    minutes = -2;                         /* -1 is the "none" marker */
+  calendar_event_add_alert (ev, minutes);
 }
 
 static Item *
@@ -345,6 +356,7 @@ read_item (GPtrArray *lines, guint *i, gboolean todo)
   gboolean in_alarm = FALSE;
   const char *end_marker = todo ? "END:VTODO" : "END:VEVENT";
   gint64 end_t = 0;
+  g_autoptr (GArray) absolute_alerts = g_array_new (FALSE, FALSE, sizeof (gint64));
 
   for ((*i)++; *i < lines->len; (*i)++)
     {
@@ -367,7 +379,7 @@ read_item (GPtrArray *lines, guint *i, gboolean todo)
       if (in_alarm)
         {
           if (g_str_equal (p.name, "TRIGGER"))
-            add_alarm_trigger (ev, &p);
+            add_alarm_trigger (ev, &p, absolute_alerts);
         }
       else if (g_str_equal (p.name, "SUMMARY"))
         {
@@ -442,6 +454,14 @@ read_item (GPtrArray *lines, guint *i, gboolean todo)
           parse_date_value (p.value, tzid, &item->recurrence_id, NULL);
         }
       prop_clear (&p);
+    }
+
+  /* an alarm at a fixed moment becomes "so many minutes before", unless the event repeats */
+  for (guint k = 0; have_start && ev->repeat == CAL_REPEAT_NONE && k < absolute_alerts->len; k++)
+    {
+      gint64 before = (ev->start - g_array_index (absolute_alerts, gint64, k)) / 60;
+      if (before > -4 * 7 * 1440 && before < 4 * 7 * 1440)
+        calendar_event_add_alert (ev, (int) (before == -1 ? -2 : before));
     }
 
   if (!have_start && have_due)
@@ -723,7 +743,7 @@ put_event (GString *out, const CalEvent *e, const char *stamp, gboolean server, 
       put_line (out, "BEGIN:VALARM");
       put_line (out, "ACTION:DISPLAY");
       put_prop_text (out, "DESCRIPTION", e->title && *e->title ? e->title : "Reminder");
-      g_autofree char *trigger = g_strdup_printf ("TRIGGER:-PT%dM", m);
+      g_autofree char *trigger = m >= 0 ? g_strdup_printf ("TRIGGER:-PT%dM", m) : g_strdup_printf ("TRIGGER:PT%dM", -m);
       put_line (out, trigger);
       put_line (out, "END:VALARM");
     }

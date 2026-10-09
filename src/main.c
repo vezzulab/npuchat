@@ -6005,6 +6005,7 @@ on_activate (GApplication *app, gpointer user_data)
     }
 
   settings_load ();
+  calendar_alerts_set_icon ("io.github.vezzulab.NpuChat");
   calendar_alerts_start (G_APPLICATION (app));
   calendar_subscriptions_start (calendar_ui_refresh);
   caldav_sync_start (calendar_ui_refresh);

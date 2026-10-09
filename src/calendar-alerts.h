@@ -8,6 +8,8 @@
  * Each notification offers "Snooze", which brings it back later, and opens the
  * app when clicked. */
 
+/* The icon shown in notifications: a theme icon name. Defaults to the calendar's own. */
+void calendar_alerts_set_icon (const char *icon_name);
 void calendar_alerts_start (GApplication *app);
 void calendar_alerts_reschedule (void);
 void calendar_alerts_stop (void);

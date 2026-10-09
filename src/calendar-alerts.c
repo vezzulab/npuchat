@@ -12,6 +12,7 @@ typedef struct {
 } Snooze;
 
 static GApplication *app;
+static char *icon_name;
 static guint timer;
 static gint64 last_fire;   /* alerts at or before this moment were already handled */
 static GArray *snoozes;    /* Snooze, the ones waiting to come back */
@@ -43,6 +44,8 @@ notify (const CalEvent *ev, gint64 start)
   g_autoptr (GNotification) n = g_notification_new (ev->title);
   g_notification_set_body (n, body);
   g_notification_set_priority (n, G_NOTIFICATION_PRIORITY_HIGH);
+  g_autoptr (GIcon) icon = g_themed_icon_new (icon_name ? icon_name : "io.github.vezzulab.Calendar");
+  g_notification_set_icon (n, icon);
   g_notification_set_default_action (n, "app.calendar-open");
   g_notification_add_button_with_target (n, TR ("Posponer", "Snooze"), "app.calendar-snooze", "(sx)", ev->id, start);
   g_autofree char *id = g_strdup_printf ("%s-%" G_GINT64_FORMAT, ev->id, start);
@@ -145,6 +148,13 @@ on_open (GSimpleAction *action, GVariant *param, gpointer data)
 }
 
 void
+calendar_alerts_set_icon (const char *name)
+{
+  g_free (icon_name);
+  icon_name = g_strdup (name);
+}
+
+void
 calendar_alerts_start (GApplication *application)
 {
   app = application;
@@ -172,6 +182,7 @@ calendar_alerts_stop (void)
     g_source_remove (timer);
   timer = 0;
   app = NULL;
+  g_clear_pointer (&icon_name, g_free);
   if (snoozes)
     g_array_free (snoozes, TRUE);
   snoozes = NULL;

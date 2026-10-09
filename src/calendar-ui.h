@@ -29,3 +29,6 @@ void calendar_ui_set_background_handler (void (*handler) (gboolean background, g
 
 /* for tests: writes day.pdf, week.pdf, month.pdf and year.pdf into the directory */
 void calendar_ui_debug_print (const char *directory);
+
+/* for tests: many view and month changes in a row */
+void calendar_ui_stress (int rounds);

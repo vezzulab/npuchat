@@ -50,7 +50,7 @@ typedef struct {
   char     *notes;
   char     *location;
   char     *url;           /* a link kept with the event */
-  GArray   *alerts;        /* int: minutes before the start; empty for none */
+  GArray   *alerts;        /* int: minutes before the start (negative: after it); empty for none */
   gint64    start;         /* unix seconds; an all-day event starts at local midnight */
   gint64    end;           /* exclusive; always after start; may be days later */
   gboolean  all_day;

@@ -15,6 +15,7 @@ test_settings (void)
   g_assert_cmpint (s->day_start, ==, 8);
   g_assert_cmpint (s->day_end, ==, 18);
   g_assert_false (s->week_numbers);
+  g_assert_false (s->background_asked);
   g_assert_cmpint (s->default_alert, ==, -1);
   g_assert_cmpstr (s->theme, ==, "system");
   g_assert_null (s->default_calendar);
@@ -26,6 +27,7 @@ test_settings (void)
   s->week_numbers = TRUE;
   s->default_alert = 15;
   s->background = TRUE;
+  s->background_asked = TRUE;
   s->default_calendar = g_strdup ("abc");
   g_strlcpy (s->theme, "dark", sizeof s->theme);
   calendar_settings_save ();
@@ -39,6 +41,7 @@ test_settings (void)
   g_assert_true (s->week_numbers);
   g_assert_cmpint (s->default_alert, ==, 15);
   g_assert_true (s->background);
+  g_assert_true (s->background_asked);
   g_assert_cmpstr (s->default_calendar, ==, "abc");
   g_assert_cmpstr (s->theme, ==, "dark");
 

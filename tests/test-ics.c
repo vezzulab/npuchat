@@ -257,6 +257,57 @@ test_server_resource (void)
 }
 
 static void
+test_alarm_forms (void)
+{
+  /* the kinds of alarm iCloud sends, on timed and all-day events */
+  const char *text =
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"
+    /* all-day: "15 hours before midnight" is 9 in the morning the day before */
+    "BEGIN:VEVENT\r\nUID:a\r\nDTSTART;VALUE=DATE:20261020\r\nDTEND;VALUE=DATE:20261021\r\nSUMMARY:Birthday\r\n"
+    "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15H\r\nEND:VALARM\r\nEND:VEVENT\r\n"
+    /* all-day: "9 hours after midnight" is 9 in the morning that day */
+    "BEGIN:VEVENT\r\nUID:b\r\nDTSTART;VALUE=DATE:20261021\r\nDTEND;VALUE=DATE:20261022\r\nSUMMARY:Holiday\r\n"
+    "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:PT9H\r\nEND:VALARM\r\nEND:VEVENT\r\n"
+    /* a day and fifteen hours before */
+    "BEGIN:VEVENT\r\nUID:c\r\nDTSTART;VALUE=DATE:20261022\r\nDTEND;VALUE=DATE:20261023\r\nSUMMARY:Trip\r\n"
+    "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-P1DT15H\r\nEND:VALARM\r\nEND:VEVENT\r\n"
+    /* a fixed moment: 30 minutes before the start */
+    "BEGIN:VEVENT\r\nUID:d\r\nDTSTART:20261023T150000Z\r\nDTEND:20261023T160000Z\r\nSUMMARY:Call\r\n"
+    "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;VALUE=DATE-TIME:20261023T143000Z\r\nEND:VALARM\r\nEND:VEVENT\r\n"
+    /* two alarms, one of them exactly at the start */
+    "BEGIN:VEVENT\r\nUID:e\r\nDTSTART:20261024T150000Z\r\nDTEND:20261024T160000Z\r\nSUMMARY:Two\r\n"
+    "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT0S\r\nEND:VALARM\r\n"
+    "BEGIN:VALARM\r\nACTION:AUDIO\r\nTRIGGER:-PT1D\r\nEND:VALARM\r\nEND:VEVENT\r\n"
+    /* an alarm from the end of the event, which we do not support: ignored, not misread */
+    "BEGIN:VEVENT\r\nUID:f\r\nDTSTART:20261025T150000Z\r\nDTEND:20261025T160000Z\r\nSUMMARY:End\r\n"
+    "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER;RELATED=END:-PT5M\r\nEND:VALARM\r\nEND:VEVENT\r\n"
+    "END:VCALENDAR\r\n";
+  g_autoptr (GPtrArray) ev = calendar_ics_parse (text);
+  g_assert_cmpuint (ev->len, ==, 6);
+  const CalEvent *a = by_title (ev, "Birthday"), *b = by_title (ev, "Holiday"), *c = by_title (ev, "Trip");
+  const CalEvent *d = by_title (ev, "Call"), *two = by_title (ev, "Two"), *end = by_title (ev, "End");
+  g_assert_cmpuint (calendar_event_alert_count (a), ==, 1);
+  g_assert_cmpint (calendar_event_alert (a, 0), ==, 15 * 60);
+  g_assert_cmpuint (calendar_event_alert_count (b), ==, 1);
+  g_assert_cmpint (calendar_event_alert (b, 0), ==, -9 * 60);            /* after the start */
+  g_assert_cmpint (calendar_event_alert (c, 0), ==, 24 * 60 + 15 * 60);
+  g_assert_cmpuint (calendar_event_alert_count (d), ==, 1);
+  g_assert_cmpint (calendar_event_alert (d, 0), ==, 30);
+  g_assert_cmpuint (calendar_event_alert_count (two), ==, 2);
+  g_assert_cmpint (calendar_event_alert (two, 0), ==, 0);
+  g_assert_cmpint (calendar_event_alert (two, 1), ==, 1440);
+  g_assert_cmpuint (calendar_event_alert_count (end), ==, 0);
+
+  /* and they are written back the same way, including the ones after the start */
+  g_autoptr (GPtrArray) one = g_ptr_array_new_with_free_func ((GDestroyNotify) calendar_event_free);
+  g_ptr_array_add (one, calendar_event_copy (b));
+  g_autofree char *out = calendar_ics_export_events (one);
+  g_assert_nonnull (strstr (out, "TRIGGER:PT540M"));
+  g_autoptr (GPtrArray) back = calendar_ics_parse (out);
+  g_assert_cmpint (calendar_event_alert (back->pdata[0], 0), ==, -9 * 60);
+}
+
+static void
 test_hostile (void)
 {
   /* none of these may crash, hang or leak; most produce nothing */
@@ -295,6 +346,7 @@ main (int argc, char **argv)
   g_test_add_func ("/ics/parse", test_parse);
   g_test_add_func ("/ics/roundtrip", test_roundtrip);
   g_test_add_func ("/ics/server-resource", test_server_resource);
+  g_test_add_func ("/ics/alarm-forms", test_alarm_forms);
   g_test_add_func ("/ics/hostile", test_hostile);
   return g_test_run ();
 }

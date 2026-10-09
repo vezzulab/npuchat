@@ -14,6 +14,7 @@ typedef struct {
   char      theme[16];       /* "system", "light" or "dark" (the standalone app) */
   gboolean  background;      /* keep running for alerts after the window closes */
   gboolean  autostart;       /* start in the background when you log in */
+  gboolean  background_asked;/* the question about keeping alerts on was already put to the user */
 } CalSettings;
 
 CalSettings *calendar_settings (void);
