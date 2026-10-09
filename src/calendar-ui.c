@@ -2079,9 +2079,9 @@ rebuild_calendars (void)
       if (c->account)
         {
           const CalAccount *acc = caldav_account_find (c->account);
-          GtkWidget *cloud = gtk_label_new (acc ? acc->name : "");
+          GtkWidget *cloud = gtk_image_new_from_icon_name ("weather-overcast-symbolic");
+          gtk_widget_set_tooltip_text (cloud, acc ? acc->name : "");
           gtk_widget_add_css_class (cloud, "dim-label");
-          gtk_widget_add_css_class (cloud, "caption");
           gtk_box_append (GTK_BOX (row), cloud);
         }
       GtkWidget *more = gtk_menu_button_new ();
@@ -3231,10 +3231,12 @@ GtkWidget *
 calendar_ui_view_new (void)
 {
   calendar_alerts_set_external_change_handler (calendar_ui_refresh);
-  U.mode = VIEW_WEEK;
+  U.mode = VIEW_MONTH;
   const char *want = g_getenv ("CALENDAR_VIEW");
   if (want && g_str_equal (want, "month"))
     U.mode = VIEW_MONTH;
+  else if (want && g_str_equal (want, "week"))
+    U.mode = VIEW_WEEK;
   else if (want && g_str_equal (want, "day"))
     U.mode = VIEW_DAY;
   else if (want && g_str_equal (want, "year"))
@@ -3721,6 +3723,14 @@ calendar_ui_debug_open (const char *what)
           adw_combo_row_set_selected (ADW_COMBO_ROW (last_editor->repeat), CAL_REPEAT_WEEKLY);
           adw_combo_row_set_selected (ADW_COMBO_ROW (last_editor->ends_row), 2);
         }
+    }
+  else if (g_str_equal (what, "menu-time"))
+    menu_for_time (U.view, 200, 200, g_get_real_time () / G_USEC_PER_SEC, TRUE, TRUE);
+  else if (g_str_equal (what, "menu-event"))
+    {
+      GPtrArray *all = calendar_all_events (calendar_default ());
+      if (all->len)
+        menu_for_event (U.view, 200, 200, ((const CalEvent *) all->pdata[0])->id, ((const CalEvent *) all->pdata[0])->start);
     }
   else if (g_str_equal (what, "settings"))
     open_settings ();

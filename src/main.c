@@ -6087,7 +6087,7 @@ show_calendar_window (GApplication *app)
   calendar_win = GTK_WINDOW (adw_application_window_new (GTK_APPLICATION (app)));
   gtk_window_set_title (calendar_win, TR ("Calendario", "Calendar"));
   gtk_window_set_icon_name (calendar_win, "io.github.vezzulab.NpuChat.Calendar");
-  gtk_window_set_default_size (calendar_win, 1200, 800);
+  gtk_window_set_default_size (calendar_win, 1400, 900);
   adw_application_window_set_content (ADW_APPLICATION_WINDOW (calendar_win), calendar_ui_view_new ());
   g_signal_connect (calendar_win, "destroy", G_CALLBACK (on_calendar_win_destroy), NULL);
   gtk_window_present (calendar_win);
