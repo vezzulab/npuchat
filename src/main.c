@@ -16,6 +16,7 @@
 #include "skills.h"
 #include "copilotkey.h"
 #include "calendar.h"
+#include "calendar-alerts.h"
 #include "calendar-ui.h"
 #include "store.h"
 #include "templates.h"
@@ -1910,6 +1911,11 @@ on_skill_done (char *result, gboolean ok, gpointer data)
     }
 
   ToolStep *st = A.reply->steps->pdata[index];
+  if (ok && g_str_equal (st->name, "calendar_add"))
+    {
+      calendar_ui_refresh ();
+      calendar_alerts_reschedule ();
+    }
   st->result = (g_utf8_strlen (text, -1) > 1500) ? g_utf8_substring (text, 0, 1500) : g_strdup (text);
   st->ok = ok;
   st->done = TRUE;
@@ -5940,6 +5946,7 @@ on_shutdown (GApplication *app, gpointer user_data)
   (void) app;
   (void) user_data;
   flm_shutdown ();
+  calendar_alerts_stop ();
   calendar_default_free ();
   rag_shutdown ();
   power_shutdown ();
@@ -5992,6 +5999,7 @@ on_activate (GApplication *app, gpointer user_data)
     }
 
   settings_load ();
+  calendar_alerts_start (G_APPLICATION (app));
   i18n_set (A.lang);
   apply_theme ();
 

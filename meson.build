@@ -27,7 +27,7 @@ resources = gnome.compile_resources('resources',
 executable('npu-chat',
   'src/main.c', 'src/flm.c', 'src/markdown.c', 'src/i18n.c',
   'src/sysinfo.c', 'src/catalog.c', 'src/store.c', 'src/power.c',
-  'src/assistants.c', 'src/templates.c', 'src/updater.c', 'src/rag.c', 'src/net.c', 'src/skills.c', 'src/copilotkey.c', 'src/calendar.c', 'src/calendar-ui.c',
+  'src/assistants.c', 'src/templates.c', 'src/updater.c', 'src/rag.c', 'src/net.c', 'src/skills.c', 'src/copilotkey.c', 'src/calendar.c', 'src/calendar-ui.c', 'src/calendar-grid.c', 'src/calendar-quick.c', 'src/calendar-alerts.c',
   resources,
   dependencies: deps,
   install: true)
@@ -44,7 +44,10 @@ if get_option('tests')
   executable('test-calendar',
     'tests/test-calendar.c', 'src/calendar.c',
     dependencies: deps)
+  executable('test-quick',
+    'tests/test-quick.c', 'src/calendar-quick.c', 'src/calendar.c',
+    dependencies: deps)
   executable('test-skills',
-    'tests/test-skills.c', 'src/skills.c', 'src/net.c', 'src/sysinfo.c', 'src/i18n.c',
+    'tests/test-skills.c', 'src/skills.c', 'src/net.c', 'src/sysinfo.c', 'src/i18n.c', 'src/calendar.c', 'src/calendar-quick.c',
     dependencies: deps)
 endif

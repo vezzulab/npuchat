@@ -42,3 +42,5 @@ char    *skill_datetime (void);
 char    *skill_now_note (void);
 /* The standing instruction that makes the model reach for the enabled skills. */
 char    *skills_instructions (gboolean (*enabled) (const char *id, gpointer data), gpointer data);
+char    *skill_calendar_agenda (const char *when);
+char    *skill_calendar_add (const char *text, gboolean *ok);

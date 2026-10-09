@@ -15,6 +15,7 @@ toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-rag
 # The calculator and the other local skills.
 toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-skills
 toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-calendar
+toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-quick
 
 # A separate port and D-Bus session let this run next to a real NPU Chat.
 port=52690

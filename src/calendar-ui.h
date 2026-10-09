@@ -13,3 +13,6 @@ void calendar_ui_refresh (void);
  * when that widget is destroyed. */
 GtkWidget *calendar_ui_view_new (void);
 void       calendar_ui_forget (void);
+
+/* Drives the week grid with simulated drags and checks the results; prints PASS or FAIL. */
+gboolean calendar_ui_selftest (void);

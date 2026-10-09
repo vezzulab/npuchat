@@ -3,9 +3,11 @@
  * Built with -Dtests=true and run by tests/run-selftest.sh. */
 
 #include <glib.h>
+#include <glib/gstdio.h>
 #include <string.h>
 
 #include "../src/i18n.h"
+#include "../src/calendar.h"
 #include "../src/skills.h"
 
 #ifdef NPU_CHAT_SELFTEST
@@ -205,7 +207,7 @@ test_tool_definitions (void)
       json_builder_end_object (b);
       g_autoptr (JsonNode) root = json_builder_get_root (b);
       JsonArray *tools = json_object_get_array_member (json_node_get_object (root), "tools");
-      CHECK (json_array_get_length (tools) == (pass ? 1u : 3u), "tool count (pass %d): %u", pass, json_array_get_length (tools));
+      CHECK (json_array_get_length (tools) == (pass ? 1u : 5u), "tool count (pass %d): %u", pass, json_array_get_length (tools));
       for (guint i = 0; i < json_array_get_length (tools); i++)
         {
           JsonObject *fn = json_object_get_object_member (json_array_get_object_element (tools, i), "function");
@@ -215,13 +217,56 @@ test_tool_definitions (void)
     }
 }
 
+static void
+test_calendar (void)
+{
+  i18n_set ("en");
+  CHECK (skill_find ("calendar_add") == skill_find ("calendar_agenda") && skill_find ("calendar_add") != NULL,
+         "both calendar tools belong to the calendar skill");
+  g_autofree char *empty = skill_calendar_agenda ("today");
+  CHECK (strstr (empty, "No events"), "an empty calendar says so: %s", empty);
+
+  gboolean ok;
+  g_autofree char *added = skill_calendar_add ("dentist tomorrow 3pm", &ok);
+  CHECK (ok && strstr (added, "Added:") && strstr (added, "dentist") == NULL && strstr (added, "Dentist") && strstr (added, "15:00"),
+         "adding in the user's words works: %s", added);
+  g_autofree char *tomorrow = skill_calendar_agenda ("tomorrow");
+  CHECK (strstr (tomorrow, "Dentist") && strstr (tomorrow, "15:00–16:00"), "it shows up tomorrow: %s", tomorrow);
+  g_autofree char *today = skill_calendar_agenda ("today");
+  CHECK (strstr (today, "No events"), "and not today: %s", today);
+  g_autofree char *week = skill_calendar_agenda ("this week");
+  CHECK (strstr (week, "Dentist"), "and in the week: %s", week);
+  g_autofree char *odd = skill_calendar_agenda ("whenever");
+  CHECK (g_str_has_prefix (odd, "Error"), "an unknown period is an error the model can read: %s", odd);
+
+  g_autofree char *noname = skill_calendar_add ("tomorrow 3pm", &ok);
+  CHECK (!ok && g_str_has_prefix (noname, "Error"), "an event without a name is refused: %s", noname);
+  g_autofree char *junk = skill_calendar_add ("", &ok);
+  CHECK (!ok && g_str_has_prefix (junk, "Error"), "empty input is refused: %s", junk);
+
+  i18n_set ("es");
+  g_autofree char *es = skill_calendar_add ("cena con Ana viernes 8pm", &ok);
+  CHECK (ok && strstr (es, "Apuntado:") && strstr (es, "Cena con Ana") && strstr (es, "20:00"), "Spanish works: %s", es);
+  i18n_set ("en");
+}
+
 int
 main (void)
 {
+  /* the calendar lives under the user data directory; keep the test out of the real one */
+  g_autofree char *tmp = g_dir_make_tmp ("skills-XXXXXX", NULL);
+  g_setenv ("XDG_DATA_HOME", tmp, TRUE);
+  test_calendar ();
+  calendar_default_free ();
   test_calculator ();
   test_readers ();
   test_tool_definitions ();
   test_instructions ();
+  g_autofree char *file = g_build_filename (tmp, "npu-chat", "calendar.json", NULL);
+  g_autofree char *dir = g_build_filename (tmp, "npu-chat", NULL);
+  g_remove (file);
+  g_rmdir (dir);
+  g_rmdir (tmp);
   g_print (failures ? "test-skills: %d failure(s)\n" : "test-skills: all checks passed\n", failures);
   return failures ? 1 : 0;
 }

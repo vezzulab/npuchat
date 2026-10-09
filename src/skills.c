@@ -7,6 +7,8 @@
 #include <string.h>
 #include <sys/statvfs.h>
 
+#include "calendar-quick.h"
+#include "calendar.h"
 #include "i18n.h"
 #include "net.h"
 #include "sysinfo.h"
@@ -20,6 +22,10 @@ static const Skill skills[] = {
     "Sabe qué día y qué hora es.", "Knows today's date and the time.", FALSE, TRUE },
   { "system_status", FALSE, "Estado del equipo", "Laptop status",
     "Consulta la batería, la memoria, el disco y la NPU.", "Checks battery, memory, disk and NPU.", FALSE, TRUE },
+  { "calendar", FALSE, "Calendario", "Calendar",
+    "Mira tu agenda y apunta eventos cuando se lo pides («apunta dentista mañana 3pm»). Lee y escribe solo en tu calendario local.",
+    "Looks at your agenda and adds events when you ask (“add dentist tomorrow 3pm”). Reads and writes only your local calendar.",
+    FALSE, TRUE },
   { "wikipedia", FALSE, "Wikipedia", "Wikipedia",
     "Busca datos en Wikipedia; pídelo con «busca en Wikipedia…». Envía el tema a wikipedia.org.",
     "Looks facts up on Wikipedia; ask with “look it up on Wikipedia…”. Sends the topic to wikipedia.org.",
@@ -36,6 +42,9 @@ skills_list (guint *count)
 const Skill *
 skill_find (const char *id)
 {
+  /* the calendar offers two tools, calendar_agenda and calendar_add */
+  if (id && g_str_has_prefix (id, "calendar_"))
+    id = "calendar";
   for (guint i = 0; id && i < G_N_ELEMENTS (skills); i++)
     if (g_str_equal (skills[i].id, id))
       return &skills[i];
@@ -105,6 +114,17 @@ skills_build_tools (JsonBuilder *b, gboolean (*enabled) (const char *id, gpointe
         add_function (b, id,
                       "Get the status of the user's laptop: battery level and charging state, memory, free disk "
                       "space, load and the NPU. Use it when the user asks about their computer.", NULL, NULL);
+      else if (g_str_equal (id, "calendar"))
+        {
+          add_function (b, "calendar_agenda",
+                        "List the events in the user's calendar. Use it for any question about their schedule, "
+                        "agenda, appointments or free time.",
+                        "when", "today, tomorrow, week, next week, or a date like 2026-10-09");
+          add_function (b, "calendar_add",
+                        "Add an event to the user's calendar. Pass the event exactly as the user said it, with its "
+                        "day and time, for example: dentist tomorrow 3pm. Do not work out dates yourself.",
+                        "event", "The event in the user's own words, for example: dinner with Ana thursday 7pm");
+        }
       else if (g_str_equal (id, "wikipedia"))
         add_function (b, id,
                       "Look up a topic on Wikipedia and return its summary. Use it for facts about people, places, "
@@ -446,6 +466,10 @@ skills_instructions (gboolean (*enabled) (const char *id, gpointer data), gpoint
   if (enabled ("system_status", data))
     g_string_append (s, " Call system_status for questions about this computer; battery and memory change, "
                         "so never reuse an earlier value.");
+  if (enabled ("calendar", data))
+    g_string_append (s, " You MUST call calendar_agenda for any question about the user's schedule, and calendar_add "
+                        "when they ask you to schedule, add or remember an appointment or event. Pass their words as "
+                        "they said them.");
   if (enabled ("wikipedia", data))
     g_string_append (s, " You MUST call wikipedia whenever the user asks about a specific person, place, organization "
                         "or event, or says 'search' or 'look up'. Never answer those from memory.");
@@ -469,6 +493,111 @@ skill_datetime (void)
                        g_date_time_get_day_of_month (now), g_date_time_get_year (now), clock, tz, iso)
     : g_strdup_printf ("%s %d de %s de %d, %s (UTC%s). Fecha ISO: %s", days_es[dow],
                        g_date_time_get_day_of_month (now), months_es[month], g_date_time_get_year (now), clock, tz, iso);
+}
+
+/* ---- calendar ----------------------------------------------------------- */
+
+static char *
+calendar_line (const CalOccurrence *o)
+{
+  g_autoptr (GDateTime) d = g_date_time_new_from_unix_local (o->start);
+  int dow = g_date_time_get_day_of_week (d) - 1, month = g_date_time_get_month (d) - 1;
+  g_autofree char *when = NULL;
+  if (o->event->all_day)
+    when = g_strdup (TR ("todo el día", "all day"));
+  else
+    {
+      g_autoptr (GDateTime) e = g_date_time_new_from_unix_local (o->end);
+      g_autofree char *a = g_date_time_format (d, "%H:%M");
+      g_autofree char *b = g_date_time_format (e, "%H:%M");
+      when = g_strdup_printf ("%s–%s", a, b);
+    }
+  const CalCalendar *c = calendar_calendar_find (calendar_default (), o->event->calendar);
+  return g_strdup_printf ("- %s %d %s, %s: %s (%s)%s%s", i18n_lang () == LANG_EN ? days_en[dow] : days_es[dow],
+                          g_date_time_get_day_of_month (d), i18n_lang () == LANG_EN ? months_en[month] : months_es[month],
+                          when, o->event->title, c->name, *o->event->location ? " @ " : "", o->event->location);
+}
+
+char *
+skill_calendar_agenda (const char *when)
+{
+  g_autofree char *trimmed = g_strstrip (g_strdup (when ? when : ""));
+  g_autofree char *w = g_ascii_strdown (trimmed, -1);
+  g_autofree char *ascii = g_str_to_ascii (w, NULL);
+  gint64 today = calendar_day_start (g_get_real_time () / G_USEC_PER_SEC);
+  gint64 from = today, to;
+  gint64 t;
+  gboolean date_only;
+  if (!*ascii || g_strstr_len (ascii, -1, "today") || g_strstr_len (ascii, -1, "hoy"))
+    to = calendar_day_next (today);
+  else if (g_strstr_len (ascii, -1, "tomorrow") || g_strstr_len (ascii, -1, "manana"))
+    {
+      from = calendar_day_next (today);
+      to = calendar_day_next (from);
+    }
+  else if (g_strstr_len (ascii, -1, "next week") || g_strstr_len (ascii, -1, "proxima semana"))
+    {
+      g_autoptr (GDateTime) d = g_date_time_new_from_unix_local (today);
+      g_autoptr (GDateTime) a = g_date_time_add_days (d, 7);
+      g_autoptr (GDateTime) b = g_date_time_add_days (d, 14);
+      from = g_date_time_to_unix (a);
+      to = g_date_time_to_unix (b);
+    }
+  else if (g_strstr_len (ascii, -1, "week") || g_strstr_len (ascii, -1, "semana"))
+    {
+      g_autoptr (GDateTime) d = g_date_time_new_from_unix_local (today);
+      g_autoptr (GDateTime) b = g_date_time_add_days (d, 7);
+      to = g_date_time_to_unix (b);
+    }
+  else if (calendar_parse_time (ascii, &t, &date_only))
+    {
+      from = calendar_day_start (t);
+      to = calendar_day_next (from);
+    }
+  else
+    return g_strdup ("Error: say today, tomorrow, week, next week, or a date like 2026-10-09.");
+
+  GArray *occ = calendar_occurrences (calendar_default (), from, to);
+  GString *out = g_string_new (NULL);
+  guint n = 0;
+  for (guint i = 0; i < occ->len && out->len < 1300; i++)
+    {
+      const CalOccurrence *o = &g_array_index (occ, CalOccurrence, i);
+      if (!calendar_calendar_find (calendar_default (), o->event->calendar)->visible)
+        continue;
+      g_autofree char *line = calendar_line (o);
+      g_string_append_printf (out, "%s\n", line);
+      n++;
+    }
+  g_array_free (occ, TRUE);
+  if (!n)
+    {
+      g_string_free (out, TRUE);
+      return g_strdup (TR ("No hay eventos en ese período.", "No events in that period."));
+    }
+  return g_string_free (out, FALSE);
+}
+
+char *
+skill_calendar_add (const char *text, gboolean *ok)
+{
+  CalQuick q;
+  *ok = FALSE;
+  if (!text || !calendar_quick_parse (text, g_get_real_time () / G_USEC_PER_SEC, i18n_lang () == LANG_EN, &q))
+    return g_strdup ("Error: describe the event, for example: dentist tomorrow 3pm.");
+  if (!*q.title)
+    {
+      calendar_quick_clear (&q);
+      return g_strdup ("Error: the event needs a name, for example: dentist tomorrow 3pm.");
+    }
+  CalEvent *ev = calendar_event_new (q.title, q.start, q.end, q.all_day);
+  ev->repeat = q.repeat;
+  CalOccurrence o = { ev, q.start, q.end };
+  g_autofree char *line = calendar_line (&o);
+  calendar_add (calendar_default (), ev);
+  calendar_quick_clear (&q);
+  *ok = TRUE;
+  return g_strdup_printf ("%s %s", TR ("Apuntado:", "Added:"), line + 2);
 }
 
 /* ---- laptop status ------------------------------------------------------ */
@@ -752,6 +881,17 @@ skill_run (const char *id, const char *arguments_json, GCancellable *cancel, Ski
     done (skill_datetime (), TRUE, data);
   else if (g_str_equal (id, "system_status"))
     done (skill_system_status (), TRUE, data);
+  else if (g_str_equal (id, "calendar_agenda"))
+    {
+      char *r = skill_calendar_agenda (args ? json_object_get_string_member_with_default (args, "when", "today") : "today");
+      done (r, !g_str_has_prefix (r, "Error"), data);
+    }
+  else if (g_str_equal (id, "calendar_add"))
+    {
+      gboolean added;
+      char *r = skill_calendar_add (args ? json_object_get_string_member_with_default (args, "event", NULL) : NULL, &added);
+      done (r, added, data);
+    }
   else if (g_str_equal (id, "wikipedia"))
     run_wikipedia (args ? json_object_get_string_member_with_default (args, "topic", NULL) : NULL, cancel, done, data);
   else
