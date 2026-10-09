@@ -16,3 +16,6 @@ void       calendar_ui_forget (void);
 
 /* Drives the week grid with simulated drags and checks the results; prints PASS or FAIL. */
 gboolean calendar_ui_selftest (void);
+
+/* Call before the first view: the app has its own window, so it keeps its own appearance setting. */
+void calendar_ui_set_standalone (gboolean on);

@@ -11,9 +11,9 @@
 #include "selftest.h"
 
 #define CHIPS_PER_DAY 3
-#define GUTTER_PX 54
+#define GUTTER_PX 58
 
-typedef enum { VIEW_DAY, VIEW_WEEK, VIEW_MONTH } View;
+typedef enum { VIEW_DAY, VIEW_WEEK, VIEW_MONTH, VIEW_YEAR } View;
 
 static struct {
   AdwDialog *dialog;     /* only when shown as a dialog */
@@ -22,24 +22,79 @@ static struct {
   gint64     anchor;     /* local midnight of the day everything is centred on */
 
   GtkWidget *title;
-  GtkWidget *toggle[3];
+  GtkWidget *toggle[4];
   GtkWidget *stack;
   /* month */
-  GtkWidget *month_weekdays, *month_grid;
+  GtkWidget *month_weekdays, *month_grid, *year_grid;
   /* week and day */
   GtkWidget *week_head, *week_allday, *time_grid, *scroller;
   /* sidebar */
-  GtkWidget *mini_title, *mini_grid, *cal_list;
+  GtkWidget *mini_title, *mini_box, *cal_list, *sidebar, *new_button;
   /* quick entry and search */
   GtkWidget *quick, *quick_preview;
   GtkWidget *search, *search_list, *search_empty;
   gboolean   scrolled;
 } U;
 
+static gboolean standalone;   /* its own window, so it carries its own settings */
+static char *editor_title_hint;  /* a title typed in quick entry, for the full editor */
+
 static void free_data (gpointer data, GClosure *closure) { (void) closure; g_free (data); }
 
 static void refresh_all (void);
 static void open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 end);
+
+/* ---- appearance: system, light or dark (the standalone app keeps its own) -- */
+
+static char *
+settings_path (void)
+{
+  return g_build_filename (g_get_user_config_dir (), "calendar", "settings.ini", NULL);
+}
+
+static const char *
+saved_theme (void)
+{
+  static char value[16];
+  g_autoptr (GKeyFile) kf = g_key_file_new ();
+  g_autofree char *path = settings_path ();
+  g_autofree char *v = NULL;
+  if (g_key_file_load_from_file (kf, path, G_KEY_FILE_NONE, NULL))
+    v = g_key_file_get_string (kf, "calendar", "theme", NULL);
+  g_strlcpy (value, v ? v : "system", sizeof value);
+  return value;
+}
+
+static void
+apply_theme (const char *theme)
+{
+  AdwStyleManager *sm = adw_style_manager_get_default ();
+  adw_style_manager_set_color_scheme (sm, g_str_equal (theme, "light") ? ADW_COLOR_SCHEME_FORCE_LIGHT
+                                          : g_str_equal (theme, "dark") ? ADW_COLOR_SCHEME_FORCE_DARK
+                                                                         : ADW_COLOR_SCHEME_DEFAULT);
+}
+
+static void
+on_theme_toggled (GtkToggleButton *b, gpointer data)
+{
+  if (!gtk_toggle_button_get_active (b))
+    return;
+  const char *theme = data;
+  apply_theme (theme);
+  g_autoptr (GKeyFile) kf = g_key_file_new ();
+  g_autofree char *path = settings_path ();
+  g_key_file_load_from_file (kf, path, G_KEY_FILE_NONE, NULL);
+  g_key_file_set_string (kf, "calendar", "theme", theme);
+  g_autofree char *dir = g_path_get_dirname (path);
+  g_mkdir_with_parents (dir, 0700);
+  g_key_file_save_to_file (kf, path, NULL);
+}
+
+void
+calendar_ui_set_standalone (gboolean on)
+{
+  standalone = on;
+}
 
 /* ---- names and dates ---------------------------------------------------- */
 
@@ -626,6 +681,9 @@ open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 en
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->title), TR ("Título", "Title"));
   if (existing)
     gtk_editable_set_text (GTK_EDITABLE (e->title), existing->title);
+  else if (editor_title_hint)
+    gtk_editable_set_text (GTK_EDITABLE (e->title), editor_title_hint);
+  g_clear_pointer (&editor_title_hint, g_free);
   adw_preferences_group_add (main, e->title);
 
   e->location = adw_entry_row_new ();
@@ -834,16 +892,23 @@ rebuild_month (void)
         gtk_widget_add_css_class (cell, "other");
       if (day == U.anchor)
         gtk_widget_add_css_class (cell, "selected");
+      if (i % 7 == 6)
+        gtk_widget_add_css_class (cell, "last-col");
+      if (i >= 35)
+        gtk_widget_add_css_class (cell, "last-row");
       gtk_widget_set_hexpand (cell, TRUE);
       gtk_widget_set_vexpand (cell, TRUE);
       gtk_widget_set_overflow (cell, GTK_OVERFLOW_HIDDEN);
 
-      g_autofree char *num = g_strdup_printf ("%d", g_date_time_get_day_of_month (d));
+      /* "1 oct" on the first of a month, like the system calendars */
+      g_autofree char *num = g_date_time_get_day_of_month (d) == 1
+        ? g_strdup_printf ("%d %s", 1, (english () ? months_short_en : months_short_es)[g_date_time_get_month (d) - 1])
+        : g_strdup_printf ("%d", g_date_time_get_day_of_month (d));
       GtkWidget *number = gtk_label_new (num);
       gtk_widget_add_css_class (number, "cal-num");
       if (day == today)
         gtk_widget_add_css_class (number, "today");
-      gtk_widget_set_halign (number, GTK_ALIGN_START);
+      gtk_widget_set_halign (number, GTK_ALIGN_END);
       gtk_box_append (GTK_BOX (cell), number);
 
       guint shown = 0, total = 0;
@@ -861,7 +926,7 @@ rebuild_month (void)
         }
       if (total > shown)
         {
-          g_autofree char *more = g_strdup_printf (TR ("+%u más", "+%u more"), total - shown);
+          g_autofree char *more = g_strdup_printf (TR ("%u más…", "%u more…"), total - shown);
           GtkWidget *l = gtk_label_new (more);
           gtk_widget_add_css_class (l, "cal-more");
           gtk_widget_set_halign (l, GTK_ALIGN_START);
@@ -882,6 +947,8 @@ rebuild_month (void)
       GtkWidget *l = gtk_label_new (english () ? days_en[dow] : days_es[dow]);
       gtk_widget_add_css_class (l, "cal-weekday");
       gtk_widget_set_hexpand (l, TRUE);
+      gtk_widget_set_halign (l, GTK_ALIGN_END);
+      gtk_widget_set_margin_end (l, 8);
       gtk_box_append (GTK_BOX (U.month_weekdays), l);
     }
 }
@@ -1040,23 +1107,22 @@ on_mini_day (GtkButton *b, gpointer data)
   (void) data;
   gint64 *day = g_object_get_data (G_OBJECT (b), "day");
   U.anchor = *day;
+  if (U.mode == VIEW_YEAR)
+    {
+      /* picking a day in the year goes to that day */
+      U.mode = VIEW_DAY;
+      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_DAY]), TRUE);
+      return;
+    }
   refresh_all ();
 }
-
-static void
-rebuild_mini (void)
+/* A small month of day buttons. highlight marks the day or week that is on screen. */
+static GtkWidget *
+month_widget (gint64 m0, gboolean highlight)
 {
-  GtkWidget *kid;
-  while ((kid = gtk_widget_get_first_child (U.mini_grid)))
-    gtk_grid_remove (GTK_GRID (U.mini_grid), kid);
-
-  gint64 m0 = month_start (U.anchor);
+  GtkWidget *grid = gtk_grid_new ();
+  gtk_grid_set_column_homogeneous (GTK_GRID (grid), TRUE);
   g_autoptr (GDateTime) first = local_dt (m0);
-  g_autofree char *title = g_strdup_printf ("%s %d", (english () ? months_en : months_es)[g_date_time_get_month (first) - 1],
-                                            g_date_time_get_year (first));
-  title[0] = (char) g_ascii_toupper (title[0]);
-  gtk_label_set_text (GTK_LABEL (U.mini_title), title);
-
   for (int i = 0; i < 7; i++)
     {
       int dow = (week_start () + i) % 7;
@@ -1064,33 +1130,91 @@ rebuild_mini (void)
       letter[0] = (char) g_ascii_toupper (letter[0]);
       GtkWidget *l = gtk_label_new (letter);
       gtk_widget_add_css_class (l, "cal-weekday");
-      gtk_grid_attach (GTK_GRID (U.mini_grid), l, i, 0, 1, 1);
+      gtk_grid_attach (GTK_GRID (grid), l, i, 0, 1, 1);
     }
   int offset = (g_date_time_get_day_of_week (first) - 1 - week_start () + 7) % 7;
   gint64 start = shift_days (m0, -offset);
   gint64 today = calendar_day_start (now_unix ());
   gint64 sel_first = U.mode == VIEW_WEEK ? week_first (U.anchor) : U.anchor;
   gint64 sel_end = U.mode == VIEW_WEEK ? shift_days (sel_first, 7) : U.mode == VIEW_DAY ? calendar_day_next (U.anchor) : 0;
-  for (int i = 0; i < 42; i++)
+  int weeks = 6;
+  for (int i = 0; i < weeks * 7; i++)
     {
       gint64 day = shift_days (start, i);
       g_autoptr (GDateTime) d = local_dt (day);
+      gboolean in_month = g_date_time_get_month (d) == g_date_time_get_month (first);
+      if (!in_month)
+        {
+          /* days of the neighbouring months stay blank, so every month has the same shape */
+          gtk_grid_attach (GTK_GRID (grid), gtk_label_new (""), i % 7, 1 + i / 7, 1, 1);
+          continue;
+        }
       g_autofree char *num = g_strdup_printf ("%d", g_date_time_get_day_of_month (d));
       GtkWidget *b = gtk_button_new_with_label (num);
       gtk_widget_add_css_class (b, "flat");
       gtk_widget_add_css_class (b, "mini-day");
-      if (g_date_time_get_month (d) != g_date_time_get_month (first))
-        gtk_widget_add_css_class (b, "other");
       if (day == today)
         gtk_widget_add_css_class (b, "today");
-      if (sel_end && day >= sel_first && day < sel_end)
+      if (highlight && sel_end && day >= sel_first && day < sel_end)
         gtk_widget_add_css_class (b, "selected");
       g_object_set_data_full (G_OBJECT (b), "day", g_memdup2 (&day, sizeof day), g_free);
       g_signal_connect (b, "clicked", G_CALLBACK (on_mini_day), NULL);
-      gtk_grid_attach (GTK_GRID (U.mini_grid), b, i % 7, 1 + i / 7, 1, 1);
+      gtk_grid_attach (GTK_GRID (grid), b, i % 7, 1 + i / 7, 1, 1);
+    }
+  return grid;
+}
+
+static void
+on_year_month_clicked (GtkButton *b, gpointer data)
+{
+  (void) data;
+  gint64 *m0 = g_object_get_data (G_OBJECT (b), "month");
+  U.anchor = *m0;
+  U.mode = VIEW_MONTH;
+  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_MONTH]), TRUE);
+}
+
+static void
+rebuild_year (void)
+{
+  GtkWidget *kid;
+  while ((kid = gtk_widget_get_first_child (U.year_grid)))
+    gtk_grid_remove (GTK_GRID (U.year_grid), kid);
+  g_autoptr (GDateTime) a = local_dt (U.anchor);
+  int year = g_date_time_get_year (a);
+  gint64 this_month = month_start (now_unix ());
+  for (int m = 1; m <= 12; m++)
+    {
+      g_autoptr (GDateTime) d = g_date_time_new_local (year, m, 1, 0, 0, 0);
+      gint64 m0 = g_date_time_to_unix (d);
+      GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+      gtk_widget_add_css_class (box, "year-month");
+      GtkWidget *title = gtk_button_new_with_label ((english () ? months_en : months_es)[m - 1]);
+      gtk_widget_add_css_class (title, "flat");
+      gtk_widget_add_css_class (title, "year-title");
+      if (m0 == this_month)
+        gtk_widget_add_css_class (title, "current");
+      gtk_widget_set_halign (title, GTK_ALIGN_START);
+      g_object_set_data_full (G_OBJECT (title), "month", g_memdup2 (&m0, sizeof m0), g_free);
+      g_signal_connect (title, "clicked", G_CALLBACK (on_year_month_clicked), NULL);
+      gtk_box_append (GTK_BOX (box), title);
+      gtk_box_append (GTK_BOX (box), month_widget (m0, FALSE));
+      gtk_grid_attach (GTK_GRID (U.year_grid), box, (m - 1) % 3, (m - 1) / 3, 1, 1);
     }
 }
 
+static void
+rebuild_mini (void)
+{
+  clear_box (U.mini_box);
+  gint64 m0 = month_start (U.anchor);
+  g_autoptr (GDateTime) first = local_dt (m0);
+  g_autofree char *title = g_strdup_printf ("%s %d", (english () ? months_en : months_es)[g_date_time_get_month (first) - 1],
+                                            g_date_time_get_year (first));
+  title[0] = (char) g_ascii_toupper (title[0]);
+  gtk_label_set_text (GTK_LABEL (U.mini_title), title);
+  gtk_box_append (GTK_BOX (U.mini_box), month_widget (m0, TRUE));
+}
 static void
 on_mini_prev (GtkButton *b, gpointer d)
 {
@@ -1316,30 +1440,30 @@ title_text (void)
 {
   g_autoptr (GDateTime) d = local_dt (U.anchor);
   int month = g_date_time_get_month (d), year = g_date_time_get_year (d);
-  if (U.mode == VIEW_MONTH)
+  if (U.mode == VIEW_YEAR)
+    return g_strdup_printf ("<b>%d</b>", year);
+  if (U.mode == VIEW_MONTH || U.mode == VIEW_WEEK)
     {
-      char *s = g_strdup_printf ("%s %d", (english () ? months_en : months_es)[month - 1], year);
-      s[0] = (char) g_ascii_toupper (s[0]);
-      return s;
+      g_autofree char *m = g_strdup ((english () ? months_en : months_es)[month - 1]);
+      m[0] = (char) g_ascii_toupper (m[0]);
+      if (U.mode == VIEW_WEEK)
+        {
+          gint64 a = week_first (U.anchor), b = shift_days (a, 6);
+          g_autoptr (GDateTime) da = local_dt (a);
+          g_autoptr (GDateTime) db = local_dt (b);
+          if (g_date_time_get_month (da) != g_date_time_get_month (db))
+            {
+              const char **ms = english () ? months_short_en : months_short_es;
+              return g_strdup_printf ("<b>%s – %s</b> %d", ms[g_date_time_get_month (da) - 1], ms[g_date_time_get_month (db) - 1],
+                                      g_date_time_get_year (db));
+            }
+        }
+      return g_strdup_printf ("<b>%s</b> %d", m, year);
     }
-  if (U.mode == VIEW_DAY)
-    {
-      g_autofree char *day = format_day (U.anchor);
-      char *s = g_strdup_printf ("%s %d", day, year);
-      s[0] = (char) g_ascii_toupper (s[0]);
-      return s;
-    }
-  gint64 a = week_first (U.anchor), b = shift_days (a, 6);
-  g_autoptr (GDateTime) da = local_dt (a);
-  g_autoptr (GDateTime) db = local_dt (b);
-  const char **ms = english () ? months_short_en : months_short_es;
-  if (g_date_time_get_month (da) == g_date_time_get_month (db))
-    return g_strdup_printf ("%d – %d %s %d", g_date_time_get_day_of_month (da), g_date_time_get_day_of_month (db),
-                            ms[g_date_time_get_month (db) - 1], g_date_time_get_year (db));
-  return g_strdup_printf ("%d %s – %d %s %d", g_date_time_get_day_of_month (da), ms[g_date_time_get_month (da) - 1],
-                          g_date_time_get_day_of_month (db), ms[g_date_time_get_month (db) - 1], g_date_time_get_year (db));
+  g_autofree char *day = format_day (U.anchor);
+  day[0] = (char) g_ascii_toupper (day[0]);
+  return g_strdup_printf ("<b>%s</b> %d", day, year);
 }
-
 static void
 refresh_all (void)
 {
@@ -1347,10 +1471,15 @@ refresh_all (void)
   if (!U.view)
     return;
   g_autofree char *t = title_text ();
-  gtk_label_set_text (GTK_LABEL (U.title), t);
+  gtk_label_set_markup (GTK_LABEL (U.title), t);
   rebuild_mini ();
   rebuild_calendars ();
-  if (U.mode == VIEW_MONTH)
+  if (U.mode == VIEW_YEAR)
+    {
+      gtk_stack_set_visible_child_name (GTK_STACK (U.stack), "year");
+      rebuild_year ();
+    }
+  else if (U.mode == VIEW_MONTH)
     {
       gtk_stack_set_visible_child_name (GTK_STACK (U.stack), "month");
       rebuild_month ();
@@ -1373,7 +1502,9 @@ on_step (GtkButton *b, gpointer data)
 {
   (void) b;
   int dir = GPOINTER_TO_INT (data);
-  U.anchor = U.mode == VIEW_MONTH ? shift_months (month_start (U.anchor), dir) : shift_days (U.anchor, dir * (U.mode == VIEW_WEEK ? 7 : 1));
+  U.anchor = U.mode == VIEW_YEAR ? shift_months (U.anchor, 12 * dir)
+           : U.mode == VIEW_MONTH ? shift_months (month_start (U.anchor), dir)
+           : shift_days (U.anchor, dir * (U.mode == VIEW_WEEK ? 7 : 1));
   refresh_all ();
 }
 
@@ -1393,13 +1524,6 @@ on_mode_toggled (GtkToggleButton *b, gpointer data)
     return;
   U.mode = (View) GPOINTER_TO_INT (data);
   refresh_all ();
-}
-
-static void
-on_new_event (GtkButton *b, gpointer d)
-{
-  (void) b; (void) d;
-  open_editor (NULL, 0, 0, 0);
 }
 
 /* ---- quick entry -------------------------------------------------------- */
@@ -1454,9 +1578,32 @@ on_quick_activate (GtkEntry *entry, gpointer data)
   U.anchor = calendar_day_start (q.start);
   calendar_quick_clear (&q);
   gtk_editable_set_text (GTK_EDITABLE (entry), "");
+  gtk_menu_button_popdown (GTK_MENU_BUTTON (U.new_button));
   refresh_all ();
 }
 
+/* "More options": the full editor, with whatever was typed so far */
+static void
+on_quick_more (GtkButton *b, gpointer data)
+{
+  (void) b; (void) data;
+  const char *text = gtk_editable_get_text (GTK_EDITABLE (U.quick));
+  CalQuick q;
+  gint64 start = 0, end = 0;
+  if (*text && calendar_quick_parse (text, now_unix (), quick_month_first (), &q))
+    {
+      g_free (editor_title_hint);
+      editor_title_hint = *q.title ? g_strdup (q.title) : NULL;
+      start = q.all_day ? 0 : q.start;
+      end = q.end;
+      if (q.all_day)
+        U.anchor = calendar_day_start (q.start);
+      calendar_quick_clear (&q);
+    }
+  gtk_editable_set_text (GTK_EDITABLE (U.quick), "");
+  gtk_menu_button_popdown (GTK_MENU_BUTTON (U.new_button));
+  open_editor (NULL, 0, start, end);
+}
 /* ---- window ------------------------------------------------------------- */
 
 static void
@@ -1492,18 +1639,34 @@ mode_button (const char *label, View v, GtkToggleButton *group)
 static GtkWidget *
 build_sidebar (void)
 {
-  GtkWidget *side = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
-  gtk_widget_set_size_request (side, 232, -1);
-  gtk_widget_set_hexpand (side, FALSE); /* its labels ask to expand; the calendar should get the room */
+  GtkWidget *side = gtk_box_new (GTK_ORIENTATION_VERTICAL, 10);
+  gtk_widget_set_size_request (side, 236, -1);
+  gtk_widget_set_hexpand (side, FALSE);
   gtk_widget_add_css_class (side, "cal-sidebar");
   gtk_widget_set_margin_start (side, 14);
   gtk_widget_set_margin_end (side, 10);
-  gtk_widget_set_margin_top (side, 8);
-  gtk_widget_set_margin_bottom (side, 14);
+  gtk_widget_set_margin_top (side, 6);
+  gtk_widget_set_margin_bottom (side, 12);
+
+  GtkWidget *cal_head = gtk_label_new (TR ("Calendarios", "Calendars"));
+  gtk_widget_add_css_class (cal_head, "cal-section");
+  gtk_label_set_xalign (GTK_LABEL (cal_head), 0);
+  gtk_box_append (GTK_BOX (side), cal_head);
+  U.cal_list = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_box_append (GTK_BOX (side), U.cal_list);
+  GtkWidget *add = gtk_button_new_with_label (TR ("Nuevo calendario", "New calendar"));
+  gtk_widget_add_css_class (add, "flat");
+  gtk_widget_set_halign (add, GTK_ALIGN_START);
+  g_signal_connect (add, "clicked", G_CALLBACK (on_new_calendar), NULL);
+  gtk_box_append (GTK_BOX (side), add);
+
+  GtkWidget *spacer = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_widget_set_vexpand (spacer, TRUE);
+  gtk_box_append (GTK_BOX (side), spacer);
 
   GtkWidget *mini_head = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
   U.mini_title = gtk_label_new ("");
-  gtk_widget_add_css_class (U.mini_title, "heading");
+  gtk_widget_add_css_class (U.mini_title, "cal-section");
   gtk_label_set_xalign (GTK_LABEL (U.mini_title), 0);
   gtk_widget_set_hexpand (U.mini_title, TRUE);
   gtk_box_append (GTK_BOX (mini_head), U.mini_title);
@@ -1516,23 +1679,8 @@ build_sidebar (void)
   gtk_box_append (GTK_BOX (mini_head), prev);
   gtk_box_append (GTK_BOX (mini_head), next);
   gtk_box_append (GTK_BOX (side), mini_head);
-
-  U.mini_grid = gtk_grid_new ();
-  gtk_grid_set_column_homogeneous (GTK_GRID (U.mini_grid), TRUE);
-  gtk_box_append (GTK_BOX (side), U.mini_grid);
-
-  GtkWidget *cal_head = gtk_label_new (TR ("Calendarios", "Calendars"));
-  gtk_widget_add_css_class (cal_head, "heading");
-  gtk_label_set_xalign (GTK_LABEL (cal_head), 0);
-  gtk_widget_set_margin_top (cal_head, 10);
-  gtk_box_append (GTK_BOX (side), cal_head);
-  U.cal_list = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
-  gtk_box_append (GTK_BOX (side), U.cal_list);
-  GtkWidget *add = gtk_button_new_with_label (TR ("Nuevo calendario", "New calendar"));
-  gtk_widget_add_css_class (add, "flat");
-  gtk_widget_set_halign (add, GTK_ALIGN_START);
-  g_signal_connect (add, "clicked", G_CALLBACK (on_new_calendar), NULL);
-  gtk_box_append (GTK_BOX (side), add);
+  U.mini_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_box_append (GTK_BOX (side), U.mini_box);
   return side;
 }
 
@@ -1544,17 +1692,63 @@ on_key (GtkEventControllerKey *c, guint keyval, guint keycode, GdkModifierType s
     return FALSE;
   switch (keyval)
     {
-    case GDK_KEY_n:     open_editor (NULL, 0, 0, 0); return TRUE;
+    case GDK_KEY_n:     gtk_menu_button_popup (GTK_MENU_BUTTON (U.new_button)); return TRUE;
     case GDK_KEY_f:     gtk_widget_grab_focus (U.search); return TRUE;
     case GDK_KEY_t:     on_today (NULL, NULL); return TRUE;
     case GDK_KEY_l:     gtk_widget_grab_focus (U.quick); return TRUE;
     case GDK_KEY_1:     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_DAY]), TRUE); return TRUE;
     case GDK_KEY_2:     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_WEEK]), TRUE); return TRUE;
     case GDK_KEY_3:     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_MONTH]), TRUE); return TRUE;
+    case GDK_KEY_4:     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_YEAR]), TRUE); return TRUE;
     case GDK_KEY_Left:  on_step (NULL, GINT_TO_POINTER (-1)); return TRUE;
     case GDK_KEY_Right: on_step (NULL, GINT_TO_POINTER (1)); return TRUE;
     default:            return FALSE;
     }
+}
+
+static void
+on_sidebar_toggled (GtkToggleButton *b, gpointer data)
+{
+  (void) data;
+  gtk_revealer_set_reveal_child (GTK_REVEALER (U.sidebar), gtk_toggle_button_get_active (b));
+}
+
+static GtkWidget *
+theme_menu (void)
+{
+  GtkWidget *btn = gtk_menu_button_new ();
+  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (btn), "open-menu-symbolic");
+  GtkWidget *pop = gtk_popover_new ();
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
+  gtk_widget_set_margin_start (box, 8);
+  gtk_widget_set_margin_end (box, 8);
+  gtk_widget_set_margin_top (box, 8);
+  gtk_widget_set_margin_bottom (box, 8);
+  GtkWidget *label = gtk_label_new (TR ("Apariencia", "Appearance"));
+  gtk_widget_add_css_class (label, "cal-section");
+  gtk_label_set_xalign (GTK_LABEL (label), 0);
+  gtk_box_append (GTK_BOX (box), label);
+  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_add_css_class (row, "linked");
+  const char *saved = saved_theme ();
+  static const char *ids[] = { "system", "light", "dark" };
+  GtkWidget *first = NULL;
+  for (int i = 0; i < 3; i++)
+    {
+      const char *names[] = { TR ("Sistema", "System"), TR ("Claro", "Light"), TR ("Oscuro", "Dark") };
+      GtkWidget *t = gtk_toggle_button_new_with_label (names[i]);
+      if (first)
+        gtk_toggle_button_set_group (GTK_TOGGLE_BUTTON (t), GTK_TOGGLE_BUTTON (first));
+      else
+        first = t;
+      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (t), g_str_equal (saved, ids[i]));
+      g_signal_connect (t, "toggled", G_CALLBACK (on_theme_toggled), (gpointer) ids[i]);
+      gtk_box_append (GTK_BOX (row), t);
+    }
+  gtk_box_append (GTK_BOX (box), row);
+  gtk_popover_set_child (GTK_POPOVER (pop), box);
+  gtk_menu_button_set_popover (GTK_MENU_BUTTON (btn), pop);
+  return btn;
 }
 
 GtkWidget *
@@ -1566,75 +1760,107 @@ calendar_ui_view_new (void)
     U.mode = VIEW_MONTH;
   else if (want && g_str_equal (want, "day"))
     U.mode = VIEW_DAY;
+  else if (want && g_str_equal (want, "year"))
+    U.mode = VIEW_YEAR;
   U.anchor = calendar_day_start (now_unix ());
   U.scrolled = FALSE;
-  const char *theme = g_getenv ("CALENDAR_THEME");
-  if (theme)
-    adw_style_manager_set_color_scheme (adw_style_manager_get_default (),
-                                        g_str_equal (theme, "light") ? ADW_COLOR_SCHEME_FORCE_LIGHT : ADW_COLOR_SCHEME_FORCE_DARK);
+  if (standalone)
+    {
+      const char *theme = g_getenv ("CALENDAR_THEME");
+      apply_theme (theme ? theme : saved_theme ());
+    }
 
+  /* ---- toolbar: sidebar, new event, the four views, search ---- */
   GtkWidget *header = adw_header_bar_new ();
-  GtkWidget *nav = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_widget_add_css_class (nav, "linked");
-  GtkWidget *prev = gtk_button_new_from_icon_name ("go-previous-symbolic");
-  GtkWidget *next = gtk_button_new_from_icon_name ("go-next-symbolic");
-  gtk_widget_set_tooltip_text (prev, TR ("Anterior", "Previous"));
-  gtk_widget_set_tooltip_text (next, TR ("Siguiente", "Next"));
-  g_signal_connect (prev, "clicked", G_CALLBACK (on_step), GINT_TO_POINTER (-1));
-  g_signal_connect (next, "clicked", G_CALLBACK (on_step), GINT_TO_POINTER (1));
-  gtk_box_append (GTK_BOX (nav), prev);
-  gtk_box_append (GTK_BOX (nav), next);
-  adw_header_bar_pack_start (ADW_HEADER_BAR (header), nav);
-  GtkWidget *today = gtk_button_new_with_label (TR ("Hoy", "Today"));
-  g_signal_connect (today, "clicked", G_CALLBACK (on_today), NULL);
-  adw_header_bar_pack_start (ADW_HEADER_BAR (header), today);
+  GtkWidget *side_toggle = gtk_toggle_button_new ();
+  gtk_button_set_icon_name (GTK_BUTTON (side_toggle), "sidebar-show-symbolic");
+  gtk_widget_set_tooltip_text (side_toggle, TR ("Barra lateral", "Sidebar"));
+  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (side_toggle), TRUE);
+  g_signal_connect (side_toggle, "toggled", G_CALLBACK (on_sidebar_toggled), NULL);
+  adw_header_bar_pack_start (ADW_HEADER_BAR (header), side_toggle);
 
-  U.title = gtk_label_new ("");
-  gtk_widget_add_css_class (U.title, "title-3");
-  adw_header_bar_set_title_widget (ADW_HEADER_BAR (header), U.title);
+  U.new_button = gtk_menu_button_new ();
+  gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (U.new_button), "list-add-symbolic");
+  gtk_widget_set_tooltip_text (U.new_button, TR ("Nuevo evento (Ctrl+N)", "New event (Ctrl+N)"));
+  U.quick = gtk_entry_new ();
+  gtk_widget_set_size_request (U.quick, 340, -1);
+  gtk_entry_set_placeholder_text (GTK_ENTRY (U.quick),
+                                  TR ("Cena con Ana jueves 7pm", "Dinner with Ana thursday 7pm"));
+  g_signal_connect (U.quick, "changed", G_CALLBACK (on_quick_changed), NULL);
+  g_signal_connect (U.quick, "activate", G_CALLBACK (on_quick_activate), NULL);
+  U.quick_preview = gtk_label_new ("");
+  gtk_widget_add_css_class (U.quick_preview, "cal-preview");
+  gtk_label_set_xalign (GTK_LABEL (U.quick_preview), 0);
+  gtk_label_set_wrap (GTK_LABEL (U.quick_preview), TRUE);
+  GtkWidget *more = gtk_button_new_with_label (TR ("Más opciones…", "More options…"));
+  gtk_widget_add_css_class (more, "flat");
+  gtk_widget_set_halign (more, GTK_ALIGN_END);
+  g_signal_connect (more, "clicked", G_CALLBACK (on_quick_more), NULL);
+  GtkWidget *quick_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+  gtk_widget_set_margin_start (quick_box, 8);
+  gtk_widget_set_margin_end (quick_box, 8);
+  gtk_widget_set_margin_top (quick_box, 8);
+  gtk_widget_set_margin_bottom (quick_box, 4);
+  GtkWidget *hint = gtk_label_new (TR ("Escribe el evento y pulsa Enter", "Type the event and press Enter"));
+  gtk_widget_add_css_class (hint, "cal-section");
+  gtk_label_set_xalign (GTK_LABEL (hint), 0);
+  gtk_box_append (GTK_BOX (quick_box), hint);
+  gtk_box_append (GTK_BOX (quick_box), U.quick);
+  gtk_box_append (GTK_BOX (quick_box), U.quick_preview);
+  gtk_box_append (GTK_BOX (quick_box), more);
+  GtkWidget *quick_pop = gtk_popover_new ();
+  gtk_popover_set_child (GTK_POPOVER (quick_pop), quick_box);
+  gtk_menu_button_set_popover (GTK_MENU_BUTTON (U.new_button), quick_pop);
+  adw_header_bar_pack_start (ADW_HEADER_BAR (header), U.new_button);
 
   GtkWidget *modes = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
   gtk_widget_add_css_class (modes, "linked");
   U.toggle[VIEW_DAY] = mode_button (TR ("Día", "Day"), VIEW_DAY, NULL);
   U.toggle[VIEW_WEEK] = mode_button (TR ("Semana", "Week"), VIEW_WEEK, GTK_TOGGLE_BUTTON (U.toggle[VIEW_DAY]));
   U.toggle[VIEW_MONTH] = mode_button (TR ("Mes", "Month"), VIEW_MONTH, GTK_TOGGLE_BUTTON (U.toggle[VIEW_DAY]));
+  U.toggle[VIEW_YEAR] = mode_button (TR ("Año", "Year"), VIEW_YEAR, GTK_TOGGLE_BUTTON (U.toggle[VIEW_DAY]));
   gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[U.mode]), TRUE);
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < 4; i++)
     gtk_box_append (GTK_BOX (modes), U.toggle[i]);
-  adw_header_bar_pack_end (ADW_HEADER_BAR (header), modes);
+  adw_header_bar_set_title_widget (ADW_HEADER_BAR (header), modes);
+
+  if (standalone)
+    adw_header_bar_pack_end (ADW_HEADER_BAR (header), theme_menu ());
   U.search = gtk_search_entry_new ();
-  gtk_widget_set_size_request (U.search, 180, -1);
-  gtk_search_entry_set_placeholder_text (GTK_SEARCH_ENTRY (U.search), TR ("Buscar eventos", "Search events"));
+  gtk_widget_set_size_request (U.search, 170, -1);
+  gtk_search_entry_set_placeholder_text (GTK_SEARCH_ENTRY (U.search), TR ("Buscar", "Search"));
   g_signal_connect (U.search, "search-changed", G_CALLBACK (on_search_changed), NULL);
   adw_header_bar_pack_end (ADW_HEADER_BAR (header), U.search);
-  GtkWidget *plus = gtk_button_new_from_icon_name ("list-add-symbolic");
-  gtk_widget_set_tooltip_text (plus, TR ("Nuevo evento", "New event"));
-  g_signal_connect (plus, "clicked", G_CALLBACK (on_new_event), NULL);
-  adw_header_bar_pack_end (ADW_HEADER_BAR (header), plus);
 
-  /* quick entry */
-  U.quick = gtk_entry_new ();
-  gtk_entry_set_placeholder_text (GTK_ENTRY (U.quick),
-                                  TR ("Escribe un evento: «cena con Ana jueves 7pm»", "Type an event: “dinner with Ana thursday 7pm”"));
-  gtk_entry_set_icon_from_icon_name (GTK_ENTRY (U.quick), GTK_ENTRY_ICON_PRIMARY, "list-add-symbolic");
-  gtk_widget_add_css_class (U.quick, "cal-quick");
-  g_signal_connect (U.quick, "changed", G_CALLBACK (on_quick_changed), NULL);
-  g_signal_connect (U.quick, "activate", G_CALLBACK (on_quick_activate), NULL);
-  U.quick_preview = gtk_label_new ("");
-  gtk_widget_add_css_class (U.quick_preview, "cal-preview");
-  gtk_label_set_xalign (GTK_LABEL (U.quick_preview), 0);
-  gtk_widget_set_visible (U.quick_preview, FALSE);
-  GtkWidget *quick_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
-  gtk_widget_set_margin_start (quick_box, 12);
-  gtk_widget_set_margin_end (quick_box, 16);
-  gtk_widget_set_margin_top (quick_box, 8);
-  gtk_widget_set_margin_bottom (quick_box, 8);
-  gtk_box_append (GTK_BOX (quick_box), U.quick);
-  gtk_box_append (GTK_BOX (quick_box), U.quick_preview);
+  /* ---- the big title and the arrows, above the calendar ---- */
+  U.title = gtk_label_new ("");
+  gtk_widget_add_css_class (U.title, "cal-title");
+  gtk_label_set_xalign (GTK_LABEL (U.title), 0);
+  gtk_widget_set_hexpand (U.title, TRUE);
+  GtkWidget *nav = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_widget_add_css_class (nav, "linked");
+  GtkWidget *prev = gtk_button_new_from_icon_name ("go-previous-symbolic");
+  GtkWidget *today = gtk_button_new_with_label (TR ("Hoy", "Today"));
+  GtkWidget *next = gtk_button_new_from_icon_name ("go-next-symbolic");
+  gtk_widget_set_tooltip_text (prev, TR ("Anterior (Ctrl+←)", "Previous (Ctrl+←)"));
+  gtk_widget_set_tooltip_text (next, TR ("Siguiente (Ctrl+→)", "Next (Ctrl+→)"));
+  g_signal_connect (prev, "clicked", G_CALLBACK (on_step), GINT_TO_POINTER (-1));
+  g_signal_connect (next, "clicked", G_CALLBACK (on_step), GINT_TO_POINTER (1));
+  g_signal_connect (today, "clicked", G_CALLBACK (on_today), NULL);
+  gtk_box_append (GTK_BOX (nav), prev);
+  gtk_box_append (GTK_BOX (nav), today);
+  gtk_box_append (GTK_BOX (nav), next);
+  GtkWidget *top_row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 12);
+  gtk_widget_set_margin_start (top_row, 20);
+  gtk_widget_set_margin_end (top_row, 16);
+  gtk_widget_set_margin_top (top_row, 4);
+  gtk_widget_set_margin_bottom (top_row, 10);
+  gtk_box_append (GTK_BOX (top_row), U.title);
+  gtk_box_append (GTK_BOX (top_row), nav);
 
-  /* month page */
-  GtkWidget *month = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
-  gtk_widget_set_margin_start (month, 12);
+  /* ---- month page: a flat grid with hairlines ---- */
+  GtkWidget *month = gtk_box_new (GTK_ORIENTATION_VERTICAL, 4);
+  gtk_widget_set_margin_start (month, 16);
   gtk_widget_set_margin_end (month, 16);
   gtk_widget_set_margin_bottom (month, 16);
   U.month_weekdays = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
@@ -1643,12 +1869,23 @@ calendar_ui_view_new (void)
   U.month_grid = gtk_grid_new ();
   gtk_grid_set_row_homogeneous (GTK_GRID (U.month_grid), TRUE);
   gtk_grid_set_column_homogeneous (GTK_GRID (U.month_grid), TRUE);
-  gtk_grid_set_row_spacing (GTK_GRID (U.month_grid), 4);
-  gtk_grid_set_column_spacing (GTK_GRID (U.month_grid), 4);
+  gtk_widget_add_css_class (U.month_grid, "cal-month");
   gtk_widget_set_vexpand (U.month_grid, TRUE);
   gtk_box_append (GTK_BOX (month), U.month_grid);
 
-  /* week and day page */
+  /* ---- year page ---- */
+  U.year_grid = gtk_grid_new ();
+  gtk_grid_set_column_homogeneous (GTK_GRID (U.year_grid), TRUE);
+  gtk_grid_set_row_homogeneous (GTK_GRID (U.year_grid), TRUE);
+  gtk_grid_set_column_spacing (GTK_GRID (U.year_grid), 24);
+  gtk_grid_set_row_spacing (GTK_GRID (U.year_grid), 16);
+  gtk_widget_set_margin_start (U.year_grid, 20);
+  gtk_widget_set_margin_end (U.year_grid, 20);
+  gtk_widget_set_margin_bottom (U.year_grid, 16);
+  GtkWidget *year_scroll = gtk_scrolled_window_new ();
+  gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (year_scroll), U.year_grid);
+
+  /* ---- week and day page ---- */
   CalGridCallbacks cb = { on_grid_picked, on_grid_open, on_grid_create, on_grid_moved };
   U.time_grid = cal_grid_new (&cb, NULL);
   U.scroller = gtk_scrolled_window_new ();
@@ -1664,14 +1901,15 @@ calendar_ui_view_new (void)
   gtk_box_append (GTK_BOX (week), U.week_allday);
   gtk_box_append (GTK_BOX (week), U.scroller);
 
+  /* ---- search results ---- */
   U.search_list = gtk_list_box_new ();
   gtk_list_box_set_selection_mode (GTK_LIST_BOX (U.search_list), GTK_SELECTION_NONE);
   gtk_widget_add_css_class (U.search_list, "boxed-list");
   U.search_empty = gtk_label_new (TR ("Sin resultados.", "No results."));
   gtk_widget_add_css_class (U.search_empty, "dim-label");
   GtkWidget *results = gtk_box_new (GTK_ORIENTATION_VERTICAL, 12);
-  gtk_widget_set_margin_start (results, 12);
-  gtk_widget_set_margin_end (results, 16);
+  gtk_widget_set_margin_start (results, 20);
+  gtk_widget_set_margin_end (results, 20);
   gtk_widget_set_margin_bottom (results, 16);
   gtk_box_append (GTK_BOX (results), U.search_list);
   gtk_box_append (GTK_BOX (results), U.search_empty);
@@ -1682,17 +1920,25 @@ calendar_ui_view_new (void)
   gtk_stack_add_named (GTK_STACK (U.stack), results_scroll, "search");
   gtk_stack_add_named (GTK_STACK (U.stack), week, "week");
   gtk_stack_add_named (GTK_STACK (U.stack), month, "month");
+  gtk_stack_add_named (GTK_STACK (U.stack), year_scroll, "year");
   gtk_widget_set_hexpand (U.stack, TRUE);
   gtk_widget_set_vexpand (U.stack, TRUE);
 
   GtkWidget *main_col = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
   gtk_widget_set_hexpand (main_col, TRUE);
-  gtk_box_append (GTK_BOX (main_col), quick_box);
+  gtk_box_append (GTK_BOX (main_col), top_row);
   gtk_box_append (GTK_BOX (main_col), U.stack);
 
+  U.sidebar = gtk_revealer_new ();
+  gtk_revealer_set_transition_type (GTK_REVEALER (U.sidebar), GTK_REVEALER_TRANSITION_TYPE_SLIDE_RIGHT);
+  gtk_revealer_set_reveal_child (GTK_REVEALER (U.sidebar), TRUE);
+  GtkWidget *side_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_box_append (GTK_BOX (side_box), build_sidebar ());
+  gtk_box_append (GTK_BOX (side_box), gtk_separator_new (GTK_ORIENTATION_VERTICAL));
+  gtk_revealer_set_child (GTK_REVEALER (U.sidebar), side_box);
+
   GtkWidget *body = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_box_append (GTK_BOX (body), build_sidebar ());
-  gtk_box_append (GTK_BOX (body), gtk_separator_new (GTK_ORIENTATION_VERTICAL));
+  gtk_box_append (GTK_BOX (body), U.sidebar);
   gtk_box_append (GTK_BOX (body), main_col);
 
   GtkWidget *tv = adw_toolbar_view_new ();

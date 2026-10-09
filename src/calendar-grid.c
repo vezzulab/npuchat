@@ -7,7 +7,7 @@
 #include "i18n.h"
 
 #define HOUR_H 56.0
-#define GUTTER 54.0
+#define GUTTER 58.0
 #define SNAP_MIN 15
 #define EDGE 7.0           /* the bottom strip of an event that resizes it */
 #define MIN_DRAG 4.0       /* pixels before a press becomes a drag */
@@ -118,19 +118,47 @@ rounded (cairo_t *cr, double x, double y, double w, double h, double r)
   cairo_close_path (cr);
 }
 
-static void
-set_hex (cairo_t *cr, const char *hex, double alpha)
+/* Is the surface dark? Decided from the text colour, which is light on dark surfaces. */
+static gboolean
+is_dark (const GdkRGBA *fg)
+{
+  return 0.299 * fg->red + 0.587 * fg->green + 0.114 * fg->blue > 0.5;
+}
+
+/* the surface behind the grid, so an event can hide the hour lines under it */
+static GdkRGBA
+surface_color (GtkWidget *w)
+{
+  GdkRGBA c = { 1, 1, 1, 1 };
+  G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+  if (!gtk_style_context_lookup_color (gtk_widget_get_style_context (w), "view_bg_color", &c))
+    c = (GdkRGBA) { 1, 1, 1, 1 };
+  G_GNUC_END_IGNORE_DEPRECATIONS
+  return c;
+}
+
+/* The event's colour pushed toward black (light themes) or white (dark ones) for text. */
+static GdkRGBA
+text_tint (const char *hex, gboolean dark)
 {
   GdkRGBA c;
   gdk_rgba_parse (&c, hex);
-  cairo_set_source_rgba (cr, c.red, c.green, c.blue, alpha);
+  double t = dark ? 0.62 : 0.5;
+  double target = dark ? 1.0 : 0.0;
+  c.red = c.red + (target - c.red) * t;
+  c.green = c.green + (target - c.green) * t;
+  c.blue = c.blue + (target - c.blue) * t;
+  c.alpha = 1;
+  return c;
 }
 
+
 static void
-draw_text (cairo_t *cr, GtkWidget *w, const char *text, double x, double y, double width, double height, gboolean bold,
-           double size_pt, const GdkRGBA *color)
+draw_text_aligned (cairo_t *cr, GtkWidget *w, const char *text, double x, double y, double width, double height,
+                   gboolean bold, double size_pt, const GdkRGBA *color, PangoAlignment align)
 {
   PangoLayout *l = gtk_widget_create_pango_layout (w, text);
+  pango_layout_set_alignment (l, align);
   PangoFontDescription *fd = pango_font_description_new ();
   pango_font_description_set_size (fd, (gint) (size_pt * PANGO_SCALE));
   pango_font_description_set_weight (fd, bold ? PANGO_WEIGHT_SEMIBOLD : PANGO_WEIGHT_NORMAL);
@@ -143,6 +171,13 @@ draw_text (cairo_t *cr, GtkWidget *w, const char *text, double x, double y, doub
   pango_cairo_show_layout (cr, l);
   pango_font_description_free (fd);
   g_object_unref (l);
+}
+
+static void
+draw_text (cairo_t *cr, GtkWidget *w, const char *text, double x, double y, double width, double height, gboolean bold,
+           double size_pt, const GdkRGBA *color)
+{
+  draw_text_aligned (cr, w, text, x, y, width, height, bold, size_pt, color, PANGO_ALIGN_LEFT);
 }
 
 static char *
@@ -255,26 +290,34 @@ draw_block (Grid *g, cairo_t *cr, const Block *b, const CalEvent *ev, gint64 s, 
 {
   const char *hex = calendar_color_hex (b->color);
   gboolean selected = !ghost && g->selected && g_str_equal (g->selected, b->id);
-  rounded (cr, b->x, b->y, b->w, b->h, 6);
-  set_hex (cr, hex, selected ? 0.95 : ghost ? 0.55 : 0.22);
-  cairo_fill_preserve (cr);
+  gboolean dark = is_dark (fg);
+  GdkRGBA surface = surface_color (g->area);
+  GdkRGBA accent;
+  gdk_rgba_parse (&accent, hex);
+
+  /* a solid base first, so the hour lines do not show through the tint */
+  rounded (cr, b->x, b->y, b->w, b->h, 5);
+  if (!ghost)
+    {
+      cairo_set_source_rgba (cr, surface.red, surface.green, surface.blue, 1);
+      cairo_fill_preserve (cr);
+    }
+  double tint = selected ? 1.0 : ghost ? 0.6 : (dark ? 0.34 : 0.2);
+  cairo_set_source_rgba (cr, accent.red, accent.green, accent.blue, tint);
+  cairo_fill (cr);
   if (!selected)
     {
-      set_hex (cr, hex, 0.55);
-      cairo_set_line_width (cr, 1);
-      cairo_stroke (cr);
+      /* the thin bar on the left edge, in the full colour */
       cairo_save (cr);
-      rounded (cr, b->x, b->y, b->w, b->h, 6);
+      rounded (cr, b->x, b->y, b->w, b->h, 5);
       cairo_clip (cr);
-      set_hex (cr, hex, 1);
-      cairo_rectangle (cr, b->x, b->y, 3.5, b->h);
+      cairo_set_source_rgba (cr, accent.red, accent.green, accent.blue, 1);
+      cairo_rectangle (cr, b->x, b->y, 3, b->h);
       cairo_fill (cr);
       cairo_restore (cr);
     }
-  else
-    cairo_new_path (cr);
 
-  GdkRGBA text = selected ? (GdkRGBA) { 1, 1, 1, 1 } : *fg;
+  GdkRGBA text = selected ? (GdkRGBA) { 1, 1, 1, 1 } : text_tint (hex, dark);
   cairo_save (cr);
   cairo_rectangle (cr, b->x, b->y, b->w, b->h);
   cairo_clip (cr);
@@ -283,7 +326,7 @@ draw_block (Grid *g, cairo_t *cr, const Block *b, const CalEvent *ev, gint64 s, 
     {
       g_autofree char *span = span_label (s, e);
       GdkRGBA dim = text;
-      dim.alpha = 0.75;
+      dim.alpha = 0.8;
       draw_text (cr, g->area, span, b->x + 8, b->y + 19, b->w - 12, 14, FALSE, 8.5, &dim);
     }
   cairo_restore (cr);
@@ -306,7 +349,7 @@ draw_cb (GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data
       gint64 day = day_at (g, i);
       if (now >= day && now < calendar_day_next (day))
         {
-          cairo_set_source_rgba (cr, fg.red, fg.green, fg.blue, 0.045);
+          cairo_set_source_rgba (cr, 1, 0.23, 0.19, is_dark (&fg) ? 0.07 : 0.05);
           cairo_rectangle (cr, GUTTER + i * cw, 0, cw, height);
           cairo_fill (cr);
         }
@@ -317,22 +360,22 @@ draw_cb (GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data
   for (int h = 0; h < 24; h++)
     {
       double y = floor (h * HOUR_H) + 0.5;
-      cairo_set_source_rgba (cr, fg.red, fg.green, fg.blue, h == 0 ? 0 : 0.12);
-      cairo_move_to (cr, GUTTER - 6, y);
+      cairo_set_source_rgba (cr, fg.red, fg.green, fg.blue, h == 0 ? 0 : 0.11);
+      cairo_move_to (cr, GUTTER, y);
       cairo_line_to (cr, width, y);
       cairo_stroke (cr);
       if (h > 0)
         {
           g_autofree char *l = hour_label (h);
           GdkRGBA dim = fg;
-          dim.alpha = 0.55;
-          draw_text (cr, g->area, l, 0, y - 8, GUTTER - 12, 16, FALSE, 8.5, &dim);
+          dim.alpha = 0.5;
+          draw_text_aligned (cr, g->area, l, 0, y - 8, GUTTER - 10, 16, FALSE, 8.5, &dim, PANGO_ALIGN_RIGHT);
         }
     }
   /* day separators */
   for (int i = 0; i <= g->ndays; i++)
     {
-      cairo_set_source_rgba (cr, fg.red, fg.green, fg.blue, 0.1);
+      cairo_set_source_rgba (cr, fg.red, fg.green, fg.blue, 0.08);
       cairo_move_to (cr, floor (GUTTER + i * cw) + 0.5, 0);
       cairo_line_to (cr, floor (GUTTER + i * cw) + 0.5, height);
       cairo_stroke (cr);
@@ -402,13 +445,19 @@ draw_cb (GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data
       if (now >= day && now < calendar_day_next (day))
         {
           double y = minutes_to_y (minutes_in_day (now));
-          cairo_set_source_rgba (cr, 0.88, 0.11, 0.14, 1);
+          cairo_set_source_rgba (cr, 1, 0.23, 0.19, 1);
           cairo_set_line_width (cr, 1.5);
-          cairo_move_to (cr, GUTTER + i * cw - 4, y);
+          cairo_move_to (cr, GUTTER, y);
           cairo_line_to (cr, GUTTER + (i + 1) * cw, y);
           cairo_stroke (cr);
-          cairo_arc (cr, GUTTER + i * cw, y, 4, 0, 2 * G_PI);
+          /* the time in a red pill over the hour labels, like the system calendars */
+          g_autoptr (GDateTime) nd = g_date_time_new_from_unix_local (now);
+          g_autofree char *clock = g_date_time_format (nd, "%H:%M");
+          rounded (cr, 4, y - 9, GUTTER - 10, 18, 9);
+          cairo_set_source_rgba (cr, 1, 0.23, 0.19, 1);
           cairo_fill (cr);
+          GdkRGBA white = { 1, 1, 1, 1 };
+          draw_text_aligned (cr, g->area, clock, 4, y - 7.5, GUTTER - 10, 16, TRUE, 8.5, &white, PANGO_ALIGN_CENTER);
         }
     }
 }
