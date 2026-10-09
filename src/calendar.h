@@ -32,11 +32,19 @@ typedef struct {
   char     *url;           /* NULL for the user's own calendars */
   int       refresh_hours; /* how often to fetch it again */
   gint64    fetched;       /* unix time of the last successful fetch */
+  /* a calendar kept in step with a CalDAV server (iCloud, Nextcloud…) */
+  char     *account;       /* id of the account, NULL when purely local */
+  char     *href;          /* the calendar's address on the server */
+  char     *sync_state;    /* the server's tag for what we last saw (CTag) */
 } CalCalendar;
 
 typedef struct {
   char     *id;
-  char     *uid;           /* the iCalendar UID when it came from outside, else NULL */
+  char     *uid;           /* the iCalendar UID; every event gets one when added */
+  char     *href;          /* where it lives on the CalDAV server, NULL if it was never uploaded */
+  char     *etag;          /* the server's tag for the version we have */
+  gboolean  dirty;         /* changed here since the last sync */
+  gint64    recurrence_id; /* for a changed single showing of a repeating event: which one (else 0) */
   char     *calendar;      /* id of its CalCalendar */
   char     *title;
   char     *notes;
@@ -81,6 +89,8 @@ guint     calendar_event_alert_count (const CalEvent *ev);
 
 /* ---- calendars ---- */
 const char *calendar_color_hex (guint color);
+/* The index of our colour closest to "#RRGGBB", for calendars that come with their own. */
+guint calendar_color_nearest (const char *hex);
 GPtrArray  *calendar_calendars (Calendar *cal);              /* CalCalendar*, never empty */
 CalCalendar *calendar_calendar_find (Calendar *cal, const char *id);  /* falls back to the first */
 const char *calendar_calendar_add (Calendar *cal, const char *name, guint color);
@@ -91,6 +101,32 @@ void        calendar_calendar_changed (Calendar *cal);       /* after editing a 
 gboolean    calendar_calendar_remove (Calendar *cal, const char *id);
 /* Swaps all the events of a calendar for these (takes ownership of the array's events). */
 void        calendar_replace_events (Calendar *cal, const char *calendar_id, GPtrArray *events);
+/* ---- keeping a calendar in step with a CalDAV server ---- */
+typedef struct {
+  char *calendar;  /* local calendar id */
+  char *href;
+  char *etag;
+} CalPendingDelete;
+
+/* A local calendar linked to a server calendar. */
+const char *calendar_linked_add (Calendar *cal, const char *name, guint color, const char *account, const char *href);
+/* Called after every save; the sync uses it to push changes soon. */
+void calendar_set_change_hook (void (*hook) (void));
+/* Events of a calendar that changed here (const CalEvent*). Free the array with g_ptr_array_unref. */
+GPtrArray *calendar_dirty_events (Calendar *cal, const char *calendar_id);
+/* All events that belong to one resource: the series and its changed showings. */
+GPtrArray *calendar_events_with_uid (Calendar *cal, const char *calendar_id, const char *uid);
+/* After an upload: the event now lives at href with this tag, and is clean. */
+void calendar_mark_synced (Calendar *cal, const char *calendar_id, const char *uid, const char *href, const char *etag);
+/* From the server: these events (all with the same href and tag) replace what we have at that href. */
+void calendar_replace_resource (Calendar *cal, const char *calendar_id, const char *href, GPtrArray *events);
+/* The server no longer has this resource. */
+void calendar_remove_resource (Calendar *cal, const char *calendar_id, const char *href);
+const GPtrArray *calendar_pending_deletes (Calendar *cal);           /* CalPendingDelete* */
+void calendar_clear_pending_delete (Calendar *cal, const char *href);
+/* Every calendar linked to an account, and a way to drop an account's calendars. */
+void calendar_unlink_account (Calendar *cal, const char *account, gboolean delete_events);
+
 /* The first calendar that accepts new events (not a subscription). */
 const CalCalendar *calendar_default_target (Calendar *cal);
 

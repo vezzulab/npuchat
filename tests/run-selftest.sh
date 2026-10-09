@@ -16,7 +16,7 @@ toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-rag
 toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-skills
 toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-calendar
 toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 ./build-test/test-quick
-for t in settings ics alerts subscribe tools; do toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 timeout 180 ./build-test/test-$t; done
+for t in settings ics alerts subscribe tools caldav; do toolbox run -c npu-dev env ASAN_OPTIONS=detect_leaks=1 timeout 180 ./build-test/test-$t; done
 
 # A separate port and D-Bus session let this run next to a real NPU Chat.
 port=52690

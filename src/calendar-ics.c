@@ -293,6 +293,17 @@ apply_rrule (CalEvent *ev, const char *rule)
 }
 
 static void
+add_exception_once (CalEvent *ev, gint64 t)
+{
+  if (!ev->exceptions)
+    ev->exceptions = g_array_new (FALSE, FALSE, sizeof (gint64));
+  for (guint i = 0; i < ev->exceptions->len; i++)
+    if (g_array_index (ev->exceptions, gint64, i) == t)
+      return;
+  g_array_append_val (ev->exceptions, t);
+}
+
+static void
 add_exdates (CalEvent *ev, const Prop *p, gboolean all_day)
 {
   g_autofree char *tzid = param (p->params, "TZID");
@@ -303,10 +314,8 @@ add_exdates (CalEvent *ev, const Prop *p, gboolean all_day)
       gboolean date_only;
       if (!parse_date_value (values[i], tzid, &t, &date_only))
         continue;
-      if (!ev->exceptions)
-        ev->exceptions = g_array_new (FALSE, FALSE, sizeof (gint64));
       (void) all_day;
-      g_array_append_val (ev->exceptions, t);
+      add_exception_once (ev, t);
     }
 }
 
@@ -419,6 +428,10 @@ read_item (GPtrArray *lines, guint *i, gboolean todo)
         }
       else if (g_str_equal (p.name, "DURATION"))
         parse_duration (p.value, &duration);
+      else if (g_str_equal (p.name, "X-CALENDAR-REMINDER"))
+        ev->reminder = g_ascii_strcasecmp (p.value, "TRUE") == 0;
+      else if (g_str_equal (p.name, "X-CALENDAR-DONE"))
+        ev->done = g_ascii_strcasecmp (p.value, "TRUE") == 0;
       else if (g_str_equal (p.name, "RRULE"))
         apply_rrule (ev, p.value);
       else if (g_str_equal (p.name, "EXDATE"))
@@ -443,7 +456,7 @@ read_item (GPtrArray *lines, guint *i, gboolean todo)
       g_free (item);
       return NULL;
     }
-  if (todo)
+  if (todo || ev->reminder)
     ev->end = ev->all_day ? calendar_day_next (ev->start) : ev->start + 900;
   else if (item->has_end && end_t > ev->start)
     ev->end = end_t;
@@ -512,9 +525,7 @@ calendar_ics_parse (const char *text)
           if (master != it && !master->recurrence_id && master->uid && g_str_equal (master->uid, it->uid) &&
               master->ev->repeat != CAL_REPEAT_NONE)
             {
-              if (!master->ev->exceptions)
-                master->ev->exceptions = g_array_new (FALSE, FALSE, sizeof (gint64));
-              g_array_append_val (master->ev->exceptions, it->recurrence_id);
+              add_exception_once (master->ev, it->recurrence_id);
               break;
             }
         }
@@ -522,6 +533,7 @@ calendar_ics_parse (const char *text)
   for (guint i = 0; i < items->len; i++)
     {
       Item *it = items->pdata[i];
+      it->ev->recurrence_id = it->recurrence_id;
       g_ptr_array_add (events, it->ev);
       it->ev = NULL;
     }
@@ -584,6 +596,13 @@ format_day_value (gint64 t)
   return g_date_time_format (d, "%Y%m%d");
 }
 
+static char *
+format_floating (gint64 t)
+{
+  g_autoptr (GDateTime) d = g_date_time_new_from_unix_local (t);
+  return g_date_time_format (d, "%Y%m%dT%H%M%S");
+}
+
 static void
 put_prop_text (GString *out, const char *name, const char *value)
 {
@@ -594,22 +613,31 @@ put_prop_text (GString *out, const char *name, const char *value)
   put_line (out, line);
 }
 
+/* server: reminders as marked events. floating: times without a zone, for series. */
 static void
-put_event (GString *out, const CalEvent *e, const char *stamp)
+put_event (GString *out, const CalEvent *e, const char *stamp, gboolean server, gboolean floating)
 {
-  const char *kind = e->reminder ? "VTODO" : "VEVENT";
+  gboolean as_todo = e->reminder && !server;
+  const char *kind = as_todo ? "VTODO" : "VEVENT";
   g_autofree char *begin = g_strdup_printf ("BEGIN:%s", kind);
   put_line (out, begin);
   g_autofree char *uid = g_strdup_printf ("UID:%s", e->uid ? e->uid : e->id);
   put_line (out, uid);
   g_autofree char *dtstamp = g_strdup_printf ("DTSTAMP:%s", stamp);
   put_line (out, dtstamp);
+#define WHEN(t) (floating ? format_floating (t) : format_utc (t))
+  if (e->recurrence_id)
+    {
+      g_autofree char *r = e->all_day ? format_day_value (e->recurrence_id) : WHEN (e->recurrence_id);
+      g_autofree char *line = g_strdup_printf (e->all_day ? "RECURRENCE-ID;VALUE=DATE:%s" : "RECURRENCE-ID:%s", r);
+      put_line (out, line);
+    }
   if (e->all_day)
     {
       g_autofree char *a = format_day_value (e->start);
       g_autofree char *line = g_strdup_printf ("DTSTART;VALUE=DATE:%s", a);
       put_line (out, line);
-      if (!e->reminder)
+      if (!as_todo)
         {
           g_autofree char *b = format_day_value (e->end);
           g_autofree char *line2 = g_strdup_printf ("DTEND;VALUE=DATE:%s", b);
@@ -618,12 +646,12 @@ put_event (GString *out, const CalEvent *e, const char *stamp)
     }
   else
     {
-      g_autofree char *a = format_utc (e->start);
+      g_autofree char *a = WHEN (e->start);
       g_autofree char *line = g_strdup_printf ("DTSTART:%s", a);
       put_line (out, line);
-      if (!e->reminder)
+      if (!as_todo)
         {
-          g_autofree char *b = format_utc (e->end);
+          g_autofree char *b = WHEN (e->end);
           g_autofree char *line2 = g_strdup_printf ("DTEND:%s", b);
           put_line (out, line2);
         }
@@ -636,7 +664,13 @@ put_event (GString *out, const CalEvent *e, const char *stamp)
       g_autofree char *line = g_strdup_printf ("URL:%s", e->url);
       put_line (out, line);
     }
-  if (e->reminder && e->done && e->repeat == CAL_REPEAT_NONE)
+  if (e->reminder && server)
+    {
+      put_line (out, "X-CALENDAR-REMINDER:TRUE");
+      if (e->done && e->repeat == CAL_REPEAT_NONE)
+        put_line (out, "X-CALENDAR-DONE:TRUE");
+    }
+  if (as_todo && e->done && e->repeat == CAL_REPEAT_NONE)
     put_line (out, "STATUS:COMPLETED");
 
   if (e->repeat != CAL_REPEAT_NONE)
@@ -677,8 +711,8 @@ put_event (GString *out, const CalEvent *e, const char *stamp)
       g_string_free (r, TRUE);
       for (guint i = 0; e->exceptions && i < e->exceptions->len; i++)
         {
-          g_autofree char *x = e->all_day ? format_day_value (g_array_index (e->exceptions, gint64, i))
-                                          : format_utc (g_array_index (e->exceptions, gint64, i));
+          gint64 t = g_array_index (e->exceptions, gint64, i);
+          g_autofree char *x = e->all_day ? format_day_value (t) : WHEN (t);
           g_autofree char *line = g_strdup_printf (e->all_day ? "EXDATE;VALUE=DATE:%s" : "EXDATE:%s", x);
           put_line (out, line);
         }
@@ -693,8 +727,43 @@ put_event (GString *out, const CalEvent *e, const char *stamp)
       put_line (out, trigger);
       put_line (out, "END:VALARM");
     }
+#undef WHEN
   g_autofree char *end = g_strdup_printf ("END:%s", kind);
   put_line (out, end);
+}
+
+/* the events of a resource are written together: a series and its changed showings */
+static void
+put_group (GString *out, const GPtrArray *group, const char *stamp, gboolean server)
+{
+  gboolean floating = FALSE;
+  for (guint i = 0; i < group->len; i++)
+    {
+      const CalEvent *e = group->pdata[i];
+      floating |= e->repeat != CAL_REPEAT_NONE && !e->all_day;
+    }
+  /* the series first, then its changed showings */
+  for (guint pass = 0; pass < 2; pass++)
+    for (guint i = 0; i < group->len; i++)
+      {
+        const CalEvent *e = group->pdata[i];
+        if ((pass == 0) == (e->recurrence_id == 0))
+          put_event (out, e, stamp, server, floating);
+      }
+}
+
+char *
+calendar_ics_export_events (const GPtrArray *events)
+{
+  GString *out = g_string_new (NULL);
+  put_line (out, "BEGIN:VCALENDAR");
+  put_line (out, "VERSION:2.0");
+  put_line (out, "PRODID:-//vezzulab//Calendar//EN");
+  put_line (out, "CALSCALE:GREGORIAN");
+  g_autofree char *stamp = format_utc (g_get_real_time () / G_USEC_PER_SEC);
+  put_group (out, events, stamp, TRUE);
+  put_line (out, "END:VCALENDAR");
+  return g_string_free (out, FALSE);
 }
 
 char *
@@ -707,13 +776,26 @@ calendar_ics_export (Calendar *cal, const char *calendar_id)
   put_line (out, "CALSCALE:GREGORIAN");
   g_autofree char *stamp = format_utc (g_get_real_time () / G_USEC_PER_SEC);
   const GPtrArray *events = calendar_all_events (cal);
+  /* events that share a UID are one series and its changed showings: write them together */
+  g_autoptr (GHashTable) groups = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, (GDestroyNotify) g_ptr_array_unref);
+  g_autoptr (GPtrArray) order = g_ptr_array_new ();
   for (guint i = 0; i < events->len; i++)
     {
       const CalEvent *e = events->pdata[i];
       if (calendar_id && !g_str_equal (e->calendar, calendar_id))
         continue;
-      put_event (out, e, stamp);
+      const char *key = e->uid ? e->uid : e->id;
+      GPtrArray *g = g_hash_table_lookup (groups, key);
+      if (!g)
+        {
+          g = g_ptr_array_new ();
+          g_hash_table_insert (groups, (gpointer) key, g);
+          g_ptr_array_add (order, (gpointer) key);
+        }
+      g_ptr_array_add (g, (gpointer) e);
     }
+  for (guint i = 0; i < order->len; i++)
+    put_group (out, g_hash_table_lookup (groups, order->pdata[i]), stamp, FALSE);
   put_line (out, "END:VCALENDAR");
   return g_string_free (out, FALSE);
 }

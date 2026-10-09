@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include "calendar-alerts.h"
+#include "calendar-accounts.h"
+#include "calendar-caldav.h"
 #include "calendar-grid.h"
 #include "calendar-ics.h"
 #include "calendar-print.h"
@@ -1685,7 +1687,9 @@ calendar_settings_popover (const CalCalendar *c)
     }
   if (calendar_calendars (calendar_default ())->len > 1)
     {
-      GtkWidget *del = gtk_button_new_with_label (c->url ? TR ("Dejar de seguir", "Unsubscribe") : TR ("Borrar calendario", "Delete calendar"));
+      GtkWidget *del = gtk_button_new_with_label (c->url ? TR ("Dejar de seguir", "Unsubscribe")
+                                                          : c->account ? TR ("Dejar de sincronizar y borrar aquí", "Stop syncing and delete here")
+                                                                       : TR ("Borrar calendario", "Delete calendar"));
       gtk_widget_add_css_class (del, "destructive-action");
       g_signal_connect_data (del, "clicked", G_CALLBACK (on_cal_remove), g_strdup (c->id), free_data, 0);
       gtk_box_append (GTK_BOX (box), del);
@@ -1723,6 +1727,14 @@ rebuild_calendars (void)
       gtk_label_set_ellipsize (GTK_LABEL (name), PANGO_ELLIPSIZE_END);
       gtk_widget_set_hexpand (name, TRUE);
       gtk_box_append (GTK_BOX (row), name);
+      if (c->account)
+        {
+          const CalAccount *acc = caldav_account_find (c->account);
+          GtkWidget *cloud = gtk_label_new (acc ? acc->name : "");
+          gtk_widget_add_css_class (cloud, "dim-label");
+          gtk_widget_add_css_class (cloud, "caption");
+          gtk_box_append (GTK_BOX (row), cloud);
+        }
       GtkWidget *more = gtk_menu_button_new ();
       gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (more), "view-more-symbolic");
       gtk_widget_add_css_class (more, "flat");
@@ -2813,6 +2825,8 @@ act_goto (GSimpleAction *a, GVariant *p, gpointer d)
   open_goto ();
 }
 
+static void act_accounts (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; calendar_accounts_open (U.view); }
+static void act_sync (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; caldav_sync_now (NULL, NULL); }
 static void act_import (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; open_import (); }
 static void act_export (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; open_export (); }
 static void act_subscribe (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; open_subscribe (); }
@@ -2844,6 +2858,8 @@ main_menu (void)
   g_menu_append (nav, TR ("Ir a la fecha…", "Go to date…"), "cal.goto");
   g_menu_append_section (menu, NULL, G_MENU_MODEL (nav));
   GMenu *data = g_menu_new ();
+  g_menu_append (data, TR ("Cuentas (iPhone, iCloud)…", "Accounts (iPhone, iCloud)…"), "cal.accounts");
+  g_menu_append (data, TR ("Sincronizar ahora", "Sync now"), "cal.sync");
   g_menu_append (data, TR ("Importar un archivo .ics…", "Import an .ics file…"), "cal.import");
   g_menu_append (data, TR ("Exportar…", "Export…"), "cal.export");
   g_menu_append (data, TR ("Suscribirse a un calendario…", "Subscribe to a calendar…"), "cal.subscribe");
@@ -3069,6 +3085,8 @@ calendar_ui_view_new (void)
   GActionEntry entries[] = {
     { "settings", act_settings, NULL, NULL, NULL, { 0 } },
     { "goto", act_goto, NULL, NULL, NULL, { 0 } },
+    { "accounts", act_accounts, NULL, NULL, NULL, { 0 } },
+    { "sync", act_sync, NULL, NULL, NULL, { 0 } },
     { "import", act_import, NULL, NULL, NULL, { 0 } },
     { "export", act_export, NULL, NULL, NULL, { 0 } },
     { "subscribe", act_subscribe, NULL, NULL, NULL, { 0 } },
@@ -3270,6 +3288,8 @@ calendar_ui_debug_open (const char *what)
     open_settings ();
   else if (g_str_equal (what, "goto"))
     open_goto ();
+  else if (g_str_equal (what, "accounts"))
+    calendar_accounts_open (U.view);
 }
 
 /* for tests: one PDF per view, without a dialog */

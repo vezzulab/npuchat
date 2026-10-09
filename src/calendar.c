@@ -11,7 +11,10 @@ struct _Calendar {
   GPtrArray *events;     /* CalEvent*, in insertion order */
   GPtrArray *calendars;  /* CalCalendar* */
   GPtrArray *trash;      /* CalEvent*, the most recent deletion last */
+  GPtrArray *pending;    /* CalPendingDelete*: deletions the server has not heard of yet */
 };
+
+static void (*change_hook) (void);
 
 static const char *color_hex[CAL_N_COLORS] = { "#3584e4", "#2ec27e", "#ff7800", "#9141ac",
                                                "#e01b24", "#1c9c9c", "#c64600", "#865e3c" };
@@ -22,13 +25,48 @@ calendar_color_hex (guint color)
   return color_hex[color % CAL_N_COLORS];
 }
 
+guint
+calendar_color_nearest (const char *hex)
+{
+  unsigned r = 0, g = 0, b = 0;
+  if (!hex || sscanf (hex, "#%2x%2x%2x", &r, &g, &b) != 3)
+    return 0;
+  guint best = 0;
+  double best_d = 1e18;
+  for (guint i = 0; i < CAL_N_COLORS; i++)
+    {
+      unsigned pr, pg, pb;
+      sscanf (color_hex[i], "#%2x%2x%2x", &pr, &pg, &pb);
+      double d = (double) ((int) r - (int) pr) * ((int) r - (int) pr) + (double) ((int) g - (int) pg) * ((int) g - (int) pg) +
+                 (double) ((int) b - (int) pb) * ((int) b - (int) pb);
+      if (d < best_d)
+        {
+          best_d = d;
+          best = i;
+        }
+    }
+  return best;
+}
+
 static void
 calendar_free_one (CalCalendar *c)
 {
   g_free (c->id);
   g_free (c->name);
   g_free (c->url);
+  g_free (c->account);
+  g_free (c->href);
+  g_free (c->sync_state);
   g_free (c);
+}
+
+static void
+pending_free (CalPendingDelete *p)
+{
+  g_free (p->calendar);
+  g_free (p->href);
+  g_free (p->etag);
+  g_free (p);
 }
 
 /* ---- days --------------------------------------------------------------- */
@@ -74,6 +112,8 @@ calendar_event_free (CalEvent *ev)
     return;
   g_free (ev->id);
   g_free (ev->uid);
+  g_free (ev->href);
+  g_free (ev->etag);
   g_free (ev->calendar);
   g_free (ev->title);
   g_free (ev->notes);
@@ -104,6 +144,8 @@ calendar_event_copy (const CalEvent *ev)
   CalEvent *c = g_memdup2 (ev, sizeof *ev);
   c->id = g_strdup (ev->id);
   c->uid = g_strdup (ev->uid);
+  c->href = g_strdup (ev->href);
+  c->etag = g_strdup (ev->etag);
   c->calendar = g_strdup (ev->calendar);
   c->title = g_strdup (ev->title);
   c->notes = g_strdup (ev->notes);
@@ -190,6 +232,10 @@ write_event (JsonBuilder *b, const CalEvent *e)
 #define BOOL(k, v) json_builder_set_member_name (b, k); json_builder_add_boolean_value (b, v)
   STR ("id", e->id);
   STR ("uid", e->uid);
+  STR ("href", e->href);
+  STR ("etag", e->etag);
+  BOOL ("dirty", e->dirty);
+  INT ("recurrence_id", e->recurrence_id);
   STR ("calendar", e->calendar);
   STR ("title", e->title);
   STR ("notes", e->notes);
@@ -242,6 +288,12 @@ read_event (JsonObject *o)
 #undef TEXT
   const char *uid = json_object_get_string_member_with_default (o, "uid", "");
   e->uid = *uid ? g_strdup (uid) : NULL;
+  const char *href = json_object_get_string_member_with_default (o, "href", "");
+  e->href = *href ? g_strdup (href) : NULL;
+  const char *etag = json_object_get_string_member_with_default (o, "etag", "");
+  e->etag = *etag ? g_strdup (etag) : NULL;
+  e->dirty = json_object_get_boolean_member_with_default (o, "dirty", FALSE);
+  e->recurrence_id = json_object_get_int_member_with_default (o, "recurrence_id", 0);
   const char *cid = json_object_get_string_member_with_default (o, "calendar", "");
   e->calendar = *cid ? g_strdup (cid) : NULL;
   e->reminder = json_object_get_boolean_member_with_default (o, "reminder", FALSE);
@@ -299,6 +351,12 @@ save (Calendar *cal)
       json_builder_add_int_value (b, c->refresh_hours);
       json_builder_set_member_name (b, "fetched");
       json_builder_add_int_value (b, c->fetched);
+      json_builder_set_member_name (b, "account");
+      json_builder_add_string_value (b, c->account ? c->account : "");
+      json_builder_set_member_name (b, "href");
+      json_builder_add_string_value (b, c->href ? c->href : "");
+      json_builder_set_member_name (b, "sync_state");
+      json_builder_add_string_value (b, c->sync_state ? c->sync_state : "");
       json_builder_end_object (b);
     }
   json_builder_end_array (b);
@@ -306,6 +364,21 @@ save (Calendar *cal)
   json_builder_begin_array (b);
   for (guint i = 0; i < cal->events->len; i++)
     write_event (b, cal->events->pdata[i]);
+  json_builder_end_array (b);
+  json_builder_set_member_name (b, "pending_deletes");
+  json_builder_begin_array (b);
+  for (guint i = 0; i < cal->pending->len; i++)
+    {
+      const CalPendingDelete *p = cal->pending->pdata[i];
+      json_builder_begin_object (b);
+      json_builder_set_member_name (b, "calendar");
+      json_builder_add_string_value (b, p->calendar);
+      json_builder_set_member_name (b, "href");
+      json_builder_add_string_value (b, p->href);
+      json_builder_set_member_name (b, "etag");
+      json_builder_add_string_value (b, p->etag ? p->etag : "");
+      json_builder_end_object (b);
+    }
   json_builder_end_array (b);
   json_builder_set_member_name (b, "trash");
   json_builder_begin_array (b);
@@ -325,6 +398,8 @@ save (Calendar *cal)
   g_autoptr (GError) error = NULL;
   if (!g_file_set_contents (cal->path, text, -1, &error))
     g_warning ("calendar: could not save %s: %s", cal->path, error->message);
+  if (change_hook)
+    change_hook ();
 }
 
 static void
@@ -358,6 +433,12 @@ load (Calendar *cal)
       c->url = *url ? g_strdup (url) : NULL;
       c->refresh_hours = (int) json_object_get_int_member_with_default (o, "refresh_hours", 0);
       c->fetched = json_object_get_int_member_with_default (o, "fetched", 0);
+      const char *account = json_object_get_string_member_with_default (o, "account", "");
+      c->account = *account ? g_strdup (account) : NULL;
+      const char *chref = json_object_get_string_member_with_default (o, "href", "");
+      c->href = *chref ? g_strdup (chref) : NULL;
+      const char *state = json_object_get_string_member_with_default (o, "sync_state", "");
+      c->sync_state = *state ? g_strdup (state) : NULL;
       g_ptr_array_add (cal->calendars, c);
     }
   JsonArray *list = json_object_get_array_member (top, "events");
@@ -367,6 +448,20 @@ load (Calendar *cal)
       CalEvent *e = JSON_NODE_HOLDS_OBJECT (n) ? read_event (json_node_get_object (n)) : NULL;
       if (e)
         g_ptr_array_add (cal->events, e);
+    }
+  JsonArray *pend = json_object_get_array_member (top, "pending_deletes");
+  for (guint i = 0; pend && i < json_array_get_length (pend); i++)
+    {
+      JsonNode *n = json_array_get_element (pend, i);
+      if (!JSON_NODE_HOLDS_OBJECT (n))
+        continue;
+      JsonObject *o = json_node_get_object (n);
+      CalPendingDelete *p = g_new0 (CalPendingDelete, 1);
+      p->calendar = g_strdup (json_object_get_string_member_with_default (o, "calendar", ""));
+      p->href = g_strdup (json_object_get_string_member_with_default (o, "href", ""));
+      const char *et = json_object_get_string_member_with_default (o, "etag", "");
+      p->etag = *et ? g_strdup (et) : NULL;
+      g_ptr_array_add (cal->pending, p);
     }
   JsonArray *trash = json_object_get_array_member (top, "trash");
   for (guint i = 0; trash && i < json_array_get_length (trash); i++)
@@ -387,6 +482,49 @@ find_calendar_exact (Calendar *cal, const char *id)
   return NULL;
 }
 
+static gboolean
+linked (Calendar *cal, const char *calendar_id)
+{
+  CalCalendar *c = find_calendar_exact (cal, calendar_id);
+  return c && c->account != NULL;
+}
+
+/* a change to an event of a synced calendar has to reach the server */
+static void
+touch (Calendar *cal, CalEvent *ev)
+{
+  if (ev && linked (cal, ev->calendar))
+    ev->dirty = TRUE;
+}
+
+static CalEvent *
+master_of (Calendar *cal, const CalEvent *override)
+{
+  for (guint i = 0; override->uid && i < cal->events->len; i++)
+    {
+      CalEvent *e = cal->events->pdata[i];
+      if (e != override && !e->recurrence_id && e->uid && g_str_equal (e->uid, override->uid) &&
+          g_str_equal (e->calendar, override->calendar))
+        return e;
+    }
+  return NULL;
+}
+
+static void
+add_pending_delete (Calendar *cal, const CalEvent *ev)
+{
+  if (!ev->href || !linked (cal, ev->calendar))
+    return;
+  for (guint i = 0; i < cal->pending->len; i++)
+    if (g_str_equal (((CalPendingDelete *) cal->pending->pdata[i])->href, ev->href))
+      return;
+  CalPendingDelete *p = g_new0 (CalPendingDelete, 1);
+  p->calendar = g_strdup (ev->calendar);
+  p->href = g_strdup (ev->href);
+  p->etag = g_strdup (ev->etag);
+  g_ptr_array_add (cal->pending, p);
+}
+
 Calendar *
 calendar_new (const char *path)
 {
@@ -395,6 +533,7 @@ calendar_new (const char *path)
   cal->events = g_ptr_array_new_with_free_func ((GDestroyNotify) calendar_event_free);
   cal->calendars = g_ptr_array_new_with_free_func ((GDestroyNotify) calendar_free_one);
   cal->trash = g_ptr_array_new_with_free_func ((GDestroyNotify) calendar_event_free);
+  cal->pending = g_ptr_array_new_with_free_func ((GDestroyNotify) pending_free);
   if (path)
     load (cal);
   if (cal->calendars->len == 0 || !calendar_default_target (cal))
@@ -427,6 +566,7 @@ calendar_free (Calendar *cal)
   g_ptr_array_unref (cal->events);
   g_ptr_array_unref (cal->calendars);
   g_ptr_array_unref (cal->trash);
+  g_ptr_array_unref (cal->pending);
   g_free (cal->path);
   g_free (cal);
 }
@@ -534,6 +674,185 @@ calendar_replace_events (Calendar *cal, const char *calendar_id, GPtrArray *even
   save (cal);
 }
 
+
+/* ---- keeping a calendar in step with a CalDAV server --------------------- */
+
+void
+calendar_set_change_hook (void (*hook) (void))
+{
+  change_hook = hook;
+}
+
+const char *
+calendar_linked_add (Calendar *cal, const char *name, guint color, const char *account, const char *href)
+{
+  const char *id = calendar_calendar_add (cal, name, color);
+  CalCalendar *c = find_calendar_exact (cal, id);
+  c->account = g_strdup (account);
+  c->href = g_strdup (href);
+  save (cal);
+  return c->id;
+}
+
+GPtrArray *
+calendar_dirty_events (Calendar *cal, const char *calendar_id)
+{
+  GPtrArray *out = g_ptr_array_new ();
+  for (guint i = 0; i < cal->events->len; i++)
+    {
+      CalEvent *e = cal->events->pdata[i];
+      if (e->dirty && g_str_equal (e->calendar, calendar_id))
+        g_ptr_array_add (out, e);
+    }
+  return out;
+}
+
+GPtrArray *
+calendar_events_with_uid (Calendar *cal, const char *calendar_id, const char *uid)
+{
+  GPtrArray *out = g_ptr_array_new ();
+  for (guint i = 0; uid && i < cal->events->len; i++)
+    {
+      CalEvent *e = cal->events->pdata[i];
+      if (e->uid && g_str_equal (e->uid, uid) && g_str_equal (e->calendar, calendar_id))
+        g_ptr_array_add (out, e);
+    }
+  return out;
+}
+
+void
+calendar_mark_synced (Calendar *cal, const char *calendar_id, const char *uid, const char *href, const char *etag)
+{
+  for (guint i = 0; uid && i < cal->events->len; i++)
+    {
+      CalEvent *e = cal->events->pdata[i];
+      if (e->uid && g_str_equal (e->uid, uid) && g_str_equal (e->calendar, calendar_id))
+        {
+          g_free (e->href);
+          e->href = g_strdup (href);
+          g_free (e->etag);
+          e->etag = etag && *etag ? g_strdup (etag) : NULL;
+          e->dirty = FALSE;
+        }
+    }
+  /* saving here would trigger another push; the file is written with the next change */
+  void (*hook) (void) = change_hook;
+  change_hook = NULL;
+  save (cal);
+  change_hook = hook;
+}
+
+void
+calendar_replace_resource (Calendar *cal, const char *calendar_id, const char *href, GPtrArray *events)
+{
+  for (guint i = cal->events->len; i > 0; i--)
+    {
+      CalEvent *e = cal->events->pdata[i - 1];
+      if (e->href && g_str_equal (e->href, href) && g_str_equal (e->calendar, calendar_id))
+        g_ptr_array_remove_index (cal->events, i - 1);
+    }
+  for (guint i = 0; i < events->len; i++)
+    {
+      CalEvent *e = events->pdata[i];
+      g_free (e->id);
+      e->id = g_uuid_string_random ();
+      g_free (e->calendar);
+      e->calendar = g_strdup (calendar_id);
+      g_free (e->href);
+      e->href = g_strdup (href);
+      e->dirty = FALSE;
+      g_ptr_array_add (cal->events, e);
+    }
+  g_ptr_array_set_free_func (events, NULL);
+  g_ptr_array_set_size (events, 0);
+  void (*hook) (void) = change_hook;
+  change_hook = NULL;
+  save (cal);
+  change_hook = hook;
+}
+
+void
+calendar_remove_resource (Calendar *cal, const char *calendar_id, const char *href)
+{
+  for (guint i = cal->events->len; i > 0; i--)
+    {
+      CalEvent *e = cal->events->pdata[i - 1];
+      if (e->href && g_str_equal (e->href, href) && g_str_equal (e->calendar, calendar_id))
+        g_ptr_array_remove_index (cal->events, i - 1);
+    }
+  void (*hook) (void) = change_hook;
+  change_hook = NULL;
+  save (cal);
+  change_hook = hook;
+}
+
+const GPtrArray *
+calendar_pending_deletes (Calendar *cal)
+{
+  return cal->pending;
+}
+
+void
+calendar_clear_pending_delete (Calendar *cal, const char *href)
+{
+  for (guint i = cal->pending->len; i > 0; i--)
+    if (g_str_equal (((CalPendingDelete *) cal->pending->pdata[i - 1])->href, href))
+      g_ptr_array_remove_index (cal->pending, i - 1);
+  void (*hook) (void) = change_hook;
+  change_hook = NULL;
+  save (cal);
+  change_hook = hook;
+}
+
+void
+calendar_unlink_account (Calendar *cal, const char *account, gboolean delete_events)
+{
+  for (guint i = cal->calendars->len; i > 0; i--)
+    {
+      CalCalendar *c = cal->calendars->pdata[i - 1];
+      if (!c->account || !g_str_equal (c->account, account))
+        continue;
+      g_autofree char *id = g_strdup (c->id);
+      for (guint k = cal->pending->len; k > 0; k--)
+        if (g_str_equal (((CalPendingDelete *) cal->pending->pdata[k - 1])->calendar, id))
+          g_ptr_array_remove_index (cal->pending, k - 1);
+      if (delete_events)
+        {
+          for (guint k = cal->events->len; k > 0; k--)
+            if (g_str_equal (((CalEvent *) cal->events->pdata[k - 1])->calendar, id))
+              g_ptr_array_remove_index (cal->events, k - 1);
+          g_ptr_array_remove_index (cal->calendars, i - 1);
+        }
+      else
+        {
+          /* it stays as a plain local calendar */
+          g_clear_pointer (&c->account, g_free);
+          g_clear_pointer (&c->href, g_free);
+          g_clear_pointer (&c->sync_state, g_free);
+          for (guint k = 0; k < cal->events->len; k++)
+            {
+              CalEvent *e = cal->events->pdata[k];
+              if (g_str_equal (e->calendar, id))
+                {
+                  g_clear_pointer (&e->href, g_free);
+                  g_clear_pointer (&e->etag, g_free);
+                  e->dirty = FALSE;
+                }
+            }
+        }
+    }
+  /* never leave the calendar without one of the user's own */
+  if (!calendar_default_target (cal))
+    {
+      CalCalendar *c = g_new0 (CalCalendar, 1);
+      c->id = g_strdup ("personal-own");
+      c->name = g_strdup ("Personal");
+      c->visible = TRUE;
+      g_ptr_array_insert (cal->calendars, 0, c);
+    }
+  save (cal);
+}
+
 /* ---- editing ------------------------------------------------------------ */
 
 const char *
@@ -541,6 +860,8 @@ calendar_add (Calendar *cal, CalEvent *ev)
 {
   g_free (ev->id);
   ev->id = g_uuid_string_random ();
+  if (!ev->uid)
+    ev->uid = g_uuid_string_random ();
   /* subscriptions are read-only: a new event goes to a calendar of the user's own */
   CalCalendar *c = find_calendar_exact (cal, ev->calendar);
   if (!c || c->url)
@@ -548,6 +869,7 @@ calendar_add (Calendar *cal, CalEvent *ev)
       g_free (ev->calendar);
       ev->calendar = g_strdup (calendar_default_target (cal)->id);
     }
+  touch (cal, ev);
   g_ptr_array_add (cal->events, ev);
   save (cal);
   return ev->id;
@@ -565,8 +887,11 @@ calendar_import (Calendar *cal, GPtrArray *events, const char *calendar_id)
       CalEvent *e = events->pdata[i];
       g_free (e->id);
       e->id = g_uuid_string_random ();
+      if (!e->uid)
+        e->uid = g_uuid_string_random ();
       g_free (e->calendar);
       e->calendar = g_strdup (c->id);
+      touch (cal, e);
       g_ptr_array_add (cal->events, e);
     }
   g_ptr_array_set_free_func (events, NULL);
@@ -582,7 +907,25 @@ calendar_update (Calendar *cal, CalEvent *ev)
   for (guint i = 0; i < cal->events->len; i++)
     if (g_str_equal (((CalEvent *) cal->events->pdata[i])->id, ev->id))
       {
-        calendar_event_free (cal->events->pdata[i]);
+        CalEvent *old = cal->events->pdata[i];
+        /* the edited copy comes from the editor: it keeps who the event is on the server */
+        if (!ev->uid)
+          ev->uid = g_strdup (old->uid);
+        if (!ev->recurrence_id)
+          ev->recurrence_id = old->recurrence_id;
+        if (!ev->calendar)
+          ev->calendar = g_strdup (old->calendar);      /* an edit without a calendar keeps its own */
+        if (g_str_equal (old->calendar, ev->calendar))
+          {
+            if (!ev->href)
+              ev->href = g_strdup (old->href);
+            if (!ev->etag)
+              ev->etag = g_strdup (old->etag);
+          }
+        else
+          add_pending_delete (cal, old);     /* moved to another calendar: gone from the old one */
+        touch (cal, ev);
+        calendar_event_free (old);
         cal->events->pdata[i] = ev;
         save (cal);
         return TRUE;
@@ -606,6 +949,19 @@ calendar_remove (Calendar *cal, const char *id)
     if (g_str_equal (((CalEvent *) cal->events->pdata[i])->id, id))
       {
         CalEvent *ev = g_ptr_array_steal_index (cal->events, i);
+        if (ev->recurrence_id)
+          touch (cal, master_of (cal, ev));      /* one changed showing went away: the series changed */
+        else
+          {
+            add_pending_delete (cal, ev);
+            /* the series is gone, and so are its changed showings */
+            for (guint k = cal->events->len; ev->uid && k > 0; k--)
+              {
+                CalEvent *o = cal->events->pdata[k - 1];
+                if (o->recurrence_id && o->uid && g_str_equal (o->uid, ev->uid) && g_str_equal (o->calendar, ev->calendar))
+                  g_ptr_array_remove_index (cal->events, k - 1);
+              }
+          }
         to_trash (cal, ev);
         save (cal);
         return TRUE;
@@ -621,6 +977,9 @@ calendar_undo_delete (Calendar *cal, char **title)
   CalEvent *ev = g_ptr_array_steal_index (cal->trash, cal->trash->len - 1);
   if (title)
     *title = g_strdup (ev->title);
+  if (ev->href)
+    calendar_clear_pending_delete (cal, ev->href);
+  touch (cal, ev);
   g_ptr_array_add (cal->events, ev);
   save (cal);
   return TRUE;
@@ -656,6 +1015,7 @@ calendar_set_done (Calendar *cal, const char *id, gint64 occ_start, gboolean don
       ev = cal->events->pdata[i];
   if (!ev)
     return;
+  touch (cal, ev);
   if (ev->repeat == CAL_REPEAT_NONE)
     ev->done = done;
   else if (done && !has_time (ev->completed, occ_start))
@@ -868,6 +1228,7 @@ calendar_apply_delete (Calendar *cal, const char *id, gint64 occ_start, CalScope
     add_time (&master->exceptions, occ_start);
   else if (!truncate_before (master, occ_start))
     return calendar_remove (cal, id);
+  touch (cal, master);
   save (cal);
   return TRUE;
 }
@@ -899,9 +1260,20 @@ calendar_apply_edit (Calendar *cal, const char *id, gint64 occ_start, CalScope s
   if (scope == CAL_SCOPE_ONE)
     {
       add_time (&master->exceptions, occ_start);
+      touch (cal, master);
       edited->repeat = CAL_REPEAT_NONE;
       edited->until = 0;
       edited->count = 0;
+      /* a changed single showing is part of the series: same UID, and which showing it replaces */
+      g_free (edited->uid);
+      edited->uid = g_strdup (master->uid);
+      edited->recurrence_id = occ_start;
+      g_free (edited->href);
+      edited->href = g_strdup (master->href);
+      g_free (edited->etag);
+      edited->etag = g_strdup (master->etag);
+      g_free (edited->calendar);
+      edited->calendar = g_strdup (master->calendar);
       calendar_add (cal, edited);   /* saves */
       return TRUE;
     }
@@ -916,6 +1288,13 @@ calendar_apply_edit (Calendar *cal, const char *id, gint64 occ_start, CalScope s
       g_autofree char *keep = g_strdup (id);
       calendar_remove (cal, keep);
     }
+  else
+    touch (cal, master);
+  g_free (edited->uid);
+  edited->uid = NULL;                  /* a new series: a new identity */
+  g_clear_pointer (&edited->href, g_free);
+  g_clear_pointer (&edited->etag, g_free);
+  edited->recurrence_id = 0;
   calendar_add (cal, edited);
   return TRUE;
 }
@@ -1022,7 +1401,9 @@ calendar_default (void)
 {
   if (!default_calendar)
     {
-      g_autofree char *path = g_build_filename (g_get_user_data_dir (), "npu-chat", "calendar.json", NULL);
+      /* CALENDAR_DATA_FILE is for tests: GLib remembers the data directory, so it cannot be changed with XDG_DATA_HOME */
+      const char *override = g_getenv ("CALENDAR_DATA_FILE");
+      g_autofree char *path = override ? g_strdup (override) : g_build_filename (g_get_user_data_dir (), "npu-chat", "calendar.json", NULL);
       default_calendar = calendar_new (path);
     }
   return default_calendar;

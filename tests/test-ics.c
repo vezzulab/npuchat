@@ -191,6 +191,72 @@ test_roundtrip (void)
 }
 
 static void
+test_server_resource (void)
+{
+  /* a weekly series with one changed showing and an exception, as one resource */
+  CalEvent *series = calendar_event_new ("Standup", at (2026, 10, 5, 9, 0), at (2026, 10, 5, 9, 30), FALSE);
+  series->uid = g_strdup ("series-1");
+  series->repeat = CAL_REPEAT_WEEKLY;
+  gint64 ex = at (2026, 10, 26, 9, 0), moved_from = at (2026, 10, 12, 9, 0);
+  series->exceptions = g_array_new (FALSE, FALSE, sizeof (gint64));
+  g_array_append_val (series->exceptions, moved_from);
+  g_array_append_val (series->exceptions, ex);
+  calendar_event_add_alert (series, 10);
+  CalEvent *over = calendar_event_new ("Standup (late)", at (2026, 10, 12, 11, 0), at (2026, 10, 12, 11, 30), FALSE);
+  over->uid = g_strdup ("series-1");
+  over->recurrence_id = moved_from;
+  g_autoptr (GPtrArray) group = g_ptr_array_new_with_free_func ((GDestroyNotify) calendar_event_free);
+  g_ptr_array_add (group, over);      /* the order does not matter: the series is written first */
+  g_ptr_array_add (group, series);
+
+  g_autofree char *text = calendar_ics_export_events (group);
+  /* a series keeps its clock time across daylight saving: no zone, no Z */
+  g_assert_nonnull (strstr (text, "DTSTART:20261005T090000\r\n"));
+  g_assert_null (strstr (text, "DTSTART:20261005T090000Z"));
+  g_assert_nonnull (strstr (text, "RECURRENCE-ID:20261012T090000\r\n"));
+  g_assert_nonnull (strstr (text, "EXDATE:20261026T090000\r\n"));
+  g_assert_true (strstr (text, "RRULE:FREQ=WEEKLY") < strstr (text, "RECURRENCE-ID"));
+
+  g_autoptr (GPtrArray) back = calendar_ics_parse (text);
+  g_assert_cmpuint (back->len, ==, 2);
+  const CalEvent *s2 = by_title (back, "Standup");
+  const CalEvent *o2 = by_title (back, "Standup (late)");
+  g_assert_nonnull (s2);
+  g_assert_nonnull (o2);
+  g_assert_cmpstr (s2->uid, ==, "series-1");
+  g_assert_cmpstr (o2->uid, ==, "series-1");
+  g_assert_cmpint (o2->recurrence_id, ==, moved_from);
+  g_assert_cmpint (s2->recurrence_id, ==, 0);
+  g_assert_cmpint (o2->start, ==, at (2026, 10, 12, 11, 0));
+  g_assert_cmpuint (s2->exceptions->len, ==, 2);
+  g_assert_cmpint (calendar_event_alert (s2, 0), ==, 10);
+
+  /* a single event keeps its absolute moment; a reminder is an event marked as one */
+  CalEvent *single = calendar_event_new ("Dentist", at (2026, 10, 9, 15, 0), at (2026, 10, 9, 16, 0), FALSE);
+  single->uid = g_strdup ("single-1");
+  CalEvent *rem = calendar_event_new ("Pay rent", at (2026, 10, 9, 10, 0), 0, FALSE);
+  rem->uid = g_strdup ("rem-1");
+  rem->reminder = TRUE;
+  rem->done = TRUE;
+  g_autoptr (GPtrArray) one = g_ptr_array_new_with_free_func ((GDestroyNotify) calendar_event_free);
+  g_ptr_array_add (one, single);
+  g_autofree char *t1 = calendar_ics_export_events (one);
+  g_assert_nonnull (strstr (t1, "DTSTART:2026"));
+  g_assert_nonnull (strstr (t1, "Z\r\n"));
+  g_autoptr (GPtrArray) two = g_ptr_array_new_with_free_func ((GDestroyNotify) calendar_event_free);
+  g_ptr_array_add (two, rem);
+  g_autofree char *t2 = calendar_ics_export_events (two);
+  g_assert_nonnull (strstr (t2, "BEGIN:VEVENT"));
+  g_assert_null (strstr (t2, "VTODO"));
+  g_assert_nonnull (strstr (t2, "X-CALENDAR-REMINDER:TRUE"));
+  g_autoptr (GPtrArray) rem_back = calendar_ics_parse (t2);
+  g_assert_cmpuint (rem_back->len, ==, 1);
+  g_assert_true (((CalEvent *) rem_back->pdata[0])->reminder);
+  g_assert_true (((CalEvent *) rem_back->pdata[0])->done);
+  g_assert_cmpint (((CalEvent *) rem_back->pdata[0])->end - ((CalEvent *) rem_back->pdata[0])->start, ==, 900);
+}
+
+static void
 test_hostile (void)
 {
   /* none of these may crash, hang or leak; most produce nothing */
@@ -228,6 +294,7 @@ main (int argc, char **argv)
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/ics/parse", test_parse);
   g_test_add_func ("/ics/roundtrip", test_roundtrip);
+  g_test_add_func ("/ics/server-resource", test_server_resource);
   g_test_add_func ("/ics/hostile", test_hostile);
   return g_test_run ();
 }

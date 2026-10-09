@@ -11,3 +11,9 @@ GPtrArray *calendar_ics_parse (const char *text);
 
 /* One calendar of the user's (or all of them when calendar_id is NULL) as an .ics text. */
 char *calendar_ics_export (Calendar *cal, const char *calendar_id);
+
+/* The text of one resource for a CalDAV server: the events (a series and its changed
+ * showings share a UID). Times of repeating events are written without a zone so that
+ * "every Monday at 9" stays at 9 across daylight saving; reminders travel as events
+ * marked with X-CALENDAR-REMINDER. */
+char *calendar_ics_export_events (const GPtrArray *events);

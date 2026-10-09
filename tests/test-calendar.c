@@ -565,6 +565,137 @@ test_scope_with_count (void)
 }
 
 static void
+test_sync_model (void)
+{
+  g_autofree char *dir = g_dir_make_tmp ("cal-XXXXXX", NULL);
+  g_autofree char *path = g_build_filename (dir, "calendar.json", NULL);
+  Calendar *cal = calendar_new (path);
+  g_autofree char *local = g_strdup (((CalCalendar *) calendar_calendars (cal)->pdata[0])->id);
+  g_autofree char *icloud = g_strdup (calendar_linked_add (cal, "iCloud", 3, "acct-1", "/u/calendars/home/"));
+
+  /* events in a plain local calendar never need syncing */
+  CalEvent *l = calendar_event_new ("Local", at (2026, 10, 9, 9, 0), 0, FALSE);
+  l->calendar = g_strdup (local);
+  g_autofree char *lid = g_strdup (calendar_add (cal, l));
+  g_assert_false (calendar_find (cal, lid)->dirty);
+
+  /* a new event in the synced calendar is dirty and has an identity */
+  CalEvent *e = calendar_event_new ("Dentist", at (2026, 10, 9, 15, 0), 0, FALSE);
+  e->calendar = g_strdup (icloud);
+  g_autofree char *eid = g_strdup (calendar_add (cal, e));
+  g_assert_true (calendar_find (cal, eid)->dirty);
+  g_assert_nonnull (calendar_find (cal, eid)->uid);
+  g_autofree char *uid = g_strdup (calendar_find (cal, eid)->uid);
+  GPtrArray *dirty = calendar_dirty_events (cal, icloud);
+  g_assert_cmpuint (dirty->len, ==, 1);
+  g_ptr_array_unref (dirty);
+
+  /* after the upload it is clean and knows where it lives */
+  calendar_mark_synced (cal, icloud, uid, "/u/calendars/home/abc.ics", "\"etag-1\"");
+  g_assert_false (calendar_find (cal, eid)->dirty);
+  g_assert_cmpstr (calendar_find (cal, eid)->href, ==, "/u/calendars/home/abc.ics");
+
+  /* an edit from the editor arrives as a fresh copy: it keeps its identity and becomes dirty */
+  CalEvent *edit = calendar_event_new ("Dentist (new time)", at (2026, 10, 9, 16, 0), 0, FALSE);
+  edit->id = g_strdup (eid);
+  edit->calendar = g_strdup (icloud);
+  g_assert_true (calendar_update (cal, edit));
+  const CalEvent *after = calendar_find (cal, eid);
+  g_assert_true (after->dirty);
+  g_assert_cmpstr (after->uid, ==, uid);
+  g_assert_cmpstr (after->href, ==, "/u/calendars/home/abc.ics");
+  g_assert_cmpstr (after->etag, ==, "\"etag-1\"");
+  calendar_mark_synced (cal, icloud, uid, "/u/calendars/home/abc.ics", "\"etag-2\"");
+
+  /* a repeating one: changing one showing makes a real override of the same series */
+  CalEvent *w = calendar_event_new ("Gym", at (2026, 10, 5, 7, 0), at (2026, 10, 5, 8, 0), FALSE);
+  w->calendar = g_strdup (icloud);
+  w->repeat = CAL_REPEAT_WEEKLY;
+  g_autofree char *wid = g_strdup (calendar_add (cal, w));
+  g_autofree char *wuid = g_strdup (calendar_find (cal, wid)->uid);
+  calendar_mark_synced (cal, icloud, wuid, "/u/calendars/home/gym.ics", "\"g1\"");
+  CalEvent *moved = calendar_event_new ("Gym (late)", at (2026, 10, 12, 9, 0), at (2026, 10, 12, 10, 0), FALSE);
+  g_assert_true (calendar_apply_edit (cal, wid, at (2026, 10, 12, 7, 0), CAL_SCOPE_ONE, moved));
+  GPtrArray *group = calendar_events_with_uid (cal, icloud, wuid);
+  g_assert_cmpuint (group->len, ==, 2);
+  const CalEvent *over = NULL;
+  for (guint i = 0; i < group->len; i++)
+    if (((CalEvent *) group->pdata[i])->recurrence_id)
+      over = group->pdata[i];
+  g_assert_nonnull (over);
+  g_assert_cmpint (over->recurrence_id, ==, at (2026, 10, 12, 7, 0));
+  g_assert_cmpstr (over->href, ==, "/u/calendars/home/gym.ics");
+  g_assert_true (calendar_find (cal, wid)->dirty);              /* the series got an exception */
+  g_ptr_array_unref (group);
+  calendar_mark_synced (cal, icloud, wuid, "/u/calendars/home/gym.ics", "\"g2\"");
+
+  /* deleting the series takes its changed showings and queues one deletion on the server */
+  g_assert_true (calendar_remove (cal, wid));
+  GPtrArray *gone = calendar_events_with_uid (cal, icloud, wuid);
+  g_assert_cmpuint (gone->len, ==, 0);
+  g_ptr_array_unref (gone);
+  const GPtrArray *pending = calendar_pending_deletes (cal);
+  g_assert_cmpuint (pending->len, ==, 1);
+  g_assert_cmpstr (((CalPendingDelete *) pending->pdata[0])->href, ==, "/u/calendars/home/gym.ics");
+  g_assert_cmpstr (((CalPendingDelete *) pending->pdata[0])->etag, ==, "\"g2\"");
+
+  /* everything survives a restart */
+  calendar_free (cal);
+  cal = calendar_new (path);
+  g_assert_cmpuint (calendar_pending_deletes (cal)->len, ==, 1);
+  g_assert_cmpstr (calendar_calendar_find (cal, icloud)->account, ==, "acct-1");
+  g_assert_cmpstr (calendar_calendar_find (cal, icloud)->href, ==, "/u/calendars/home/");
+  g_assert_cmpstr (calendar_find (cal, eid)->etag, ==, "\"etag-2\"");
+
+  /* undoing the deletion cancels it */
+  g_autofree char *title = NULL;
+  g_assert_true (calendar_undo_delete (cal, &title));
+  g_assert_cmpuint (calendar_pending_deletes (cal)->len, ==, 0);
+  g_assert_true (calendar_find (cal, wid)->dirty);
+
+  /* the server's version of a resource replaces ours without queueing anything */
+  GPtrArray *fresh = g_ptr_array_new_with_free_func ((GDestroyNotify) calendar_event_free);
+  CalEvent *srv = calendar_event_new ("Dentist (server)", at (2026, 10, 9, 17, 0), 0, FALSE);
+  srv->uid = g_strdup (uid);
+  srv->etag = g_strdup ("\"etag-3\"");
+  g_ptr_array_add (fresh, srv);
+  calendar_replace_resource (cal, icloud, "/u/calendars/home/abc.ics", fresh);
+  g_ptr_array_unref (fresh);
+  GPtrArray *same = calendar_events_with_uid (cal, icloud, uid);
+  g_assert_cmpuint (same->len, ==, 1);
+  g_assert_cmpstr (((CalEvent *) same->pdata[0])->title, ==, "Dentist (server)");
+  g_assert_false (((CalEvent *) same->pdata[0])->dirty);
+  g_assert_cmpstr (((CalEvent *) same->pdata[0])->href, ==, "/u/calendars/home/abc.ics");
+  g_ptr_array_unref (same);
+  calendar_remove_resource (cal, icloud, "/u/calendars/home/abc.ics");
+  GPtrArray *gone2 = calendar_events_with_uid (cal, icloud, uid);
+  g_assert_cmpuint (gone2->len, ==, 0);
+  g_ptr_array_unref (gone2);
+
+  /* moving an event to another calendar deletes it from the old one on the server */
+  CalEvent *mv = calendar_event_new ("Move me", at (2026, 10, 10, 9, 0), 0, FALSE);
+  mv->calendar = g_strdup (icloud);
+  g_autofree char *mid = g_strdup (calendar_add (cal, mv));
+  calendar_mark_synced (cal, icloud, calendar_find (cal, mid)->uid, "/u/calendars/home/move.ics", "\"m1\"");
+  guint before = calendar_pending_deletes (cal)->len;
+  CalEvent *to_local = calendar_event_new ("Move me", at (2026, 10, 10, 9, 0), 0, FALSE);
+  to_local->id = g_strdup (mid);
+  to_local->calendar = g_strdup (local);
+  g_assert_true (calendar_update (cal, to_local));
+  g_assert_cmpuint (calendar_pending_deletes (cal)->len, ==, before + 1);
+  g_assert_false (calendar_find (cal, mid)->dirty);                /* it is a local event now */
+  g_assert_null (calendar_find (cal, mid)->href);
+
+  /* stopping the sync keeps the events as local ones */
+  calendar_unlink_account (cal, "acct-1", FALSE);
+  g_assert_null (calendar_calendar_find (cal, icloud)->account);
+  g_assert_cmpuint (calendar_pending_deletes (cal)->len, ==, 0);
+  calendar_free (cal);
+  g_remove (path);
+  g_rmdir (dir);
+}
+
+static void
 test_parse (void)
 {
   gint64 t;
@@ -599,6 +730,7 @@ main (int argc, char **argv)
   g_test_add_func ("/calendar/alerts-trash", test_alerts_and_trash);
   g_test_add_func ("/calendar/free-slots-subscriptions", test_free_slots_and_subscriptions);
   g_test_add_func ("/calendar/scope-count", test_scope_with_count);
+  g_test_add_func ("/calendar/sync-model", test_sync_model);
   g_test_add_func ("/calendar/parse", test_parse);
   return g_test_run ();
 }
