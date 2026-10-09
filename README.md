@@ -8,6 +8,8 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT-ff7a18">
 </p>
 
+<p align="center"><b>English</b> · <a href="README.es.md">Español</a></p>
+
 **NPU Chat** is a lightweight desktop app for chatting with local AI models on the NPU of AMD Ryzen AI laptops. It uses [FastFlowLM](https://github.com/FastFlowLM/FastFlowLM) under the hood. No cloud, no browser, no clutter.
 
 ## Why NPU Chat?
@@ -23,13 +25,13 @@ Most local AI apps on Linux (Ollama, llama.cpp, LM Studio) run models on the CPU
 ## Features
 
 - **100% local:** runs on the NPU, works offline.
-- **Only models that fit:** checks your NPU, RAM and disk, and shows the expected speed of each model.
+- **Only models that fit:** checks your NPU, RAM and disk, and shows the expected speed of each model. A model too big for your memory is not offered, downloaded or loaded, so the machine is never pushed to its limit.
 - **Assistants:** create your own (psychologist, strategist, chef…) or add one of the 48 in the gallery.
 - **Chat with your documents:** add PDF, text or Markdown files (or drop them into a chat) and get answers with sources. Libraries stay on your computer, and you can attach them to a chat or to an assistant.
 - **Skills:** the model can use a calculator, know the date and time, check your laptop's battery and memory, and look things up on Wikipedia (opt-in). It decides when, and you see what it did.
 - **Calendar:** day, week, month and year views, repeats, reminders, alerts with snooze, drag to create and move, quick entry (“dinner with Ana thursday 7pm”), import and export, printing, and sync with your iPhone through iCloud (or any CalDAV server). The model can look at your agenda and add, move, rename and delete events, mark reminders done and find free time, all by name and with undo. Everything stays in one local file. It also exists as a standalone app.
 - **Teams:** pick several assistants (e.g. personal trainer + nutritionist) and the right specialist answers each topic; one with nothing to add passes to the next.
-- **Battery-aware:** power saver on battery, full speed when plugged in, and the model is unloaded when idle.
+- **Battery-aware:** power saver on battery, full speed when plugged in, and the model is unloaded when idle (after 10 minutes on battery, 30 plugged in) and loads on your first message.
 - **Updates itself:** new versions install in one click, verified with SHA-256.
 - **The basics, done well:** chat history, Markdown and code blocks, light and dark themes, English and Español.
 
