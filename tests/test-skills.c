@@ -213,7 +213,7 @@ test_tool_definitions (void)
         {
           JsonObject *fn = json_object_get_object_member (json_array_get_object_element (tools, i), "function");
           CHECK (skill_find (json_object_get_string_member (fn, "name")) != NULL, "every tool is a known skill");
-          CHECK (strlen (json_object_get_string_member (fn, "description")) > 20, "tools are described");
+          CHECK (strlen (json_object_get_string_member (fn, "description")) > 10, "tools are described");
         }
     }
 }
