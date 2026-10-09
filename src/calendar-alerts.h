@@ -23,3 +23,6 @@ void  calendar_alerts_snooze (const char *event_id, gint64 occurrence_start, int
 gint64 calendar_alerts_next_wake (gint64 now);
 
 #define CALENDAR_SNOOZE_SECONDS (9 * 60)
+/* called when another program changed the calendar file (so views can redraw) */
+void calendar_alerts_set_external_change_handler (void (*handler) (void));
+

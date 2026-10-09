@@ -3230,6 +3230,7 @@ main_menu (void)
 GtkWidget *
 calendar_ui_view_new (void)
 {
+  calendar_alerts_set_external_change_handler (calendar_ui_refresh);
   U.mode = VIEW_WEEK;
   const char *want = g_getenv ("CALENDAR_VIEW");
   if (want && g_str_equal (want, "month"))

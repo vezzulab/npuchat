@@ -147,6 +147,29 @@ on_open (GSimpleAction *action, GVariant *param, gpointer data)
     g_application_activate (app);
 }
 
+/* the other program (Calendar app / NPU Chat) may have saved: pick that up */
+static guint watch;
+static void (*external_change) (void);
+
+void
+calendar_alerts_set_external_change_handler (void (*handler) (void))
+{
+  external_change = handler;
+}
+
+static gboolean
+on_watch (gpointer data)
+{
+  (void) data;
+  if (calendar_reload_if_changed (calendar_default ()))
+    {
+      arm ();
+      if (external_change)
+        external_change ();
+    }
+  return G_SOURCE_CONTINUE;
+}
+
 void
 calendar_alerts_set_icon (const char *name)
 {
@@ -167,6 +190,8 @@ calendar_alerts_start (GApplication *application)
   if (app && !g_action_map_lookup_action (G_ACTION_MAP (app), "calendar-snooze"))
     g_action_map_add_action_entries (G_ACTION_MAP (app), entries, G_N_ELEMENTS (entries), NULL);
   arm ();
+  if (!watch)
+    watch = g_timeout_add_seconds (2, on_watch, NULL);
 }
 
 void
@@ -178,6 +203,9 @@ calendar_alerts_reschedule (void)
 void
 calendar_alerts_stop (void)
 {
+  if (watch)
+    g_source_remove (watch);
+  watch = 0;
   if (timer)
     g_source_remove (timer);
   timer = 0;

@@ -77,6 +77,8 @@ typedef struct _Calendar Calendar;
 
 Calendar *calendar_new (const char *path);   /* loads the file when it exists */
 void      calendar_free (Calendar *cal);
+/* re-reads the file when another program saved it; TRUE when something may have changed */
+gboolean  calendar_reload_if_changed (Calendar *cal);
 
 CalEvent *calendar_event_new (const char *title, gint64 start, gint64 end, gboolean all_day);
 void      calendar_event_free (CalEvent *ev);

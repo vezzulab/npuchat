@@ -84,6 +84,35 @@ test_bounded (void)
   calendar_free (cal);
 }
 
+/* two programs share one file: neither may wipe out what the other saved */
+static void
+test_two_programs (void)
+{
+  g_autofree char *dir = g_dir_make_tmp ("cal-XXXXXX", NULL);
+  g_autofree char *path = g_build_filename (dir, "calendar.json", NULL);
+  Calendar *app = calendar_new (path);
+  calendar_add (app, calendar_event_new ("from the app", at (2026, 10, 9, 9, 0), 0, FALSE));
+  Calendar *chat = calendar_new (path);
+  g_assert_cmpuint (calendar_count (chat), ==, 1);
+  calendar_add (chat, calendar_event_new ("from the chat", at (2026, 10, 9, 10, 0), 0, FALSE));
+
+  g_assert_cmpuint (calendar_count (app), ==, 1); /* not looked yet */
+  g_assert_true (calendar_reload_if_changed (app));
+  g_assert_cmpuint (calendar_count (app), ==, 2);
+  g_assert_false (calendar_reload_if_changed (app)); /* nothing new */
+
+  /* the chat is stale now, and the app saves: the chat's next change must keep both */
+  calendar_add (app, calendar_event_new ("second from the app", at (2026, 10, 9, 11, 0), 0, FALSE));
+  calendar_add (chat, calendar_event_new ("second from the chat", at (2026, 10, 9, 12, 0), 0, FALSE));
+  g_assert_cmpuint (calendar_count (chat), ==, 4);
+  g_assert_true (calendar_reload_if_changed (app));
+  g_assert_cmpuint (calendar_count (app), ==, 4);
+  calendar_free (app);
+  calendar_free (chat);
+  g_remove (path);
+  g_rmdir (dir);
+}
+
 static void
 test_sorted_and_roundtrip (void)
 {
@@ -762,6 +791,7 @@ main (int argc, char **argv)
   g_test_add_func ("/calendar/single", test_single);
   g_test_add_func ("/calendar/repeat", test_repeat);
   g_test_add_func ("/calendar/bounded", test_bounded);
+  g_test_add_func ("/calendar/two-programs", test_two_programs);
   g_test_add_func ("/calendar/roundtrip", test_sorted_and_roundtrip);
   g_test_add_func ("/calendar/edit", test_edit);
   g_test_add_func ("/calendar/calendars", test_calendars);
