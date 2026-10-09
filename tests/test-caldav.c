@@ -158,6 +158,28 @@ become (const char *dir)
 int
 main (void)
 {
+  /* iCloud wraps each event in CDATA, exactly like this (captured structure, invented event) */
+  {
+    const char *icloud_answer =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<multistatus xmlns=\"DAV:\">\n<response xmlns=\"DAV:\">\n"
+      "<href>/1/calendars/work/ABC.ics</href><propstat><prop><getetag xmlns=\"DAV:\">\"m727er5a\"</getetag>\n"
+      "<calendar-data xmlns=\"urn:ietf:params:xml:ns:caldav\"><![CDATA[BEGIN:VCALENDAR\r\nSUMMARY:Tom & Jerry <party>\r\nEND:VCALENDAR\r\n]]></calendar-data>\n"
+      "</prop><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>";
+    g_autofree char *data = caldav_xml_first_text (icloud_answer, "calendar-data");
+    CHECK (data && strstr (data, "BEGIN:VCALENDAR") && strstr (data, "Tom & Jerry <party>") && strstr (data, "END:VCALENDAR"),
+           "the event inside CDATA is read (%s)", data ? data : "nothing");
+    CHECK (data && strstr (data, "BEGIN:VCALENDAR") < strstr (data, "SUMMARY") && strchr (data, '\n'), "with its lines kept apart");
+    g_autofree char *tag = caldav_xml_first_text (icloud_answer, "getetag");
+    CHECK (tag && strstr (tag, "m727er5a"), "and the tag next to it");
+    /* prefixes, as other servers write them */
+    g_autofree char *prefixed = caldav_xml_first_text ("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:response><C:calendar-data>X &amp; Y</C:calendar-data></D:response></D:multistatus>", "calendar-data");
+    CHECK (prefixed && g_str_equal (prefixed, "X & Y"), "prefixed names and entities");
+    g_autofree char *broken = caldav_xml_first_text ("<a><b>text", "b");
+    CHECK (broken == NULL, "broken XML is refused");
+    g_autofree char *open_cdata = caldav_xml_first_text ("<a><b><![CDATA[never closed</b></a>", "b");
+    CHECK (open_cdata == NULL, "an unclosed CDATA is refused, not trusted");
+  }
+
   /* Apple's app passwords, as Apple shows them (also pasted without dashes or with spaces) */
   CHECK (caldav_looks_like_app_password ("abcd-efgh-ijkl-mnop"), "app password with dashes");
   CHECK (caldav_looks_like_app_password ("abcdefghijklmnop"), "app password without dashes");

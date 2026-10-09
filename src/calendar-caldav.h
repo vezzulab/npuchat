@@ -58,3 +58,6 @@ void     caldav_sync_stop (void);
 
 /* Exposed for tests. */
 char *caldav_resolve (const char *base, const char *href);
+
+/* For tests: the text of the first element with this local name in an XML answer, or NULL. */
+char *caldav_xml_first_text (const char *xml, const char *element);

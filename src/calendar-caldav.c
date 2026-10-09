@@ -15,6 +15,17 @@
 #define MAX_REDIRECTS 5
 
 static GPtrArray *accounts;
+
+/* CALDAV_DEBUG=1 explains each step on stderr: statuses and counts, never passwords or event text */
+static gboolean
+debug_on (void)
+{
+  static int on = -1;
+  if (on < 0)
+    on = g_getenv ("CALDAV_DEBUG") != NULL;
+  return on;
+}
+#define DEBUG(...) G_STMT_START { if (debug_on ()) g_printerr ("caldav: " __VA_ARGS__); } G_STMT_END
 static void (*changed_cb) (void);
 static guint periodic, soon, first;
 static gboolean running, again;
@@ -94,12 +105,44 @@ xml_text (GMarkupParseContext *ctx, const char *text, gsize len, gpointer data, 
     g_string_append_len (((Xml *) b->stack->pdata[b->stack->len - 1])->text, text, (gssize) len);
 }
 
+/* GLib's XML reader drops the contents of <![CDATA[ ]]> sections, and iCloud sends every
+ * event that way. Turn each one into ordinary escaped text before parsing. */
+static char *
+expand_cdata (const char *xml)
+{
+  GString *out = g_string_new (NULL);
+  const char *p = xml;
+  while (*p)
+    {
+      const char *open = strstr (p, "<![CDATA[");
+      if (!open)
+        {
+          g_string_append (out, p);
+          break;
+        }
+      g_string_append_len (out, p, open - p);
+      const char *start = open + 9;
+      const char *close = strstr (start, "]]>");
+      if (!close)
+        {
+          g_string_append (out, open);      /* broken: leave it for the parser to complain about */
+          break;
+        }
+      g_autofree char *content = g_strndup (start, (gsize) (close - start));
+      g_autofree char *escaped = g_markup_escape_text (content, -1);
+      g_string_append (out, escaped);
+      p = close + 3;
+    }
+  return g_string_free (out, FALSE);
+}
+
 /* NULL when the text is not well-formed XML */
 static Xml *
-xml_parse (const char *text)
+xml_parse (const char *text_in)
 {
-  if (!text)
+  if (!text_in)
     return NULL;
+  g_autofree char *text = expand_cdata (text_in);
   XmlBuild b = { g_ptr_array_new (), NULL };
   GMarkupParser parser = { xml_start, xml_end, xml_text, NULL, NULL };
   GMarkupParseContext *ctx = g_markup_parse_context_new (&parser, 0, &b, NULL);
@@ -145,6 +188,16 @@ static char *
 xml_text_of (const Xml *x)
 {
   return x ? g_strstrip (g_strdup (x->text->str)) : NULL;
+}
+
+char *
+caldav_xml_first_text (const char *xml, const char *element)
+{
+  Xml *root = xml_parse (xml);
+  const Xml *node = root ? (g_str_equal (root->name, element) ? root : xml_find (root, element)) : NULL;
+  char *text = node ? g_strdup (node->text->str) : NULL;
+  xml_free (root);
+  return text;
 }
 
 /* ---- addresses ---------------------------------------------------------- */
@@ -1065,9 +1118,11 @@ on_server_list (const Reply *r, const char *error, gpointer data)
   Run *run = data;
   if (error)
     {
+      DEBUG ("%s: listing failed: %s\n", run->cal_name, error);
       calendar_failed (run, error);
       return;
     }
+  DEBUG ("%s: listing answered %u, %zu bytes\n", run->cal_name, r->status, strlen (r->body));
   if (r->status != 207)
     {
       calendar_failed (run, reason (r, NULL));
@@ -1076,6 +1131,7 @@ on_server_list (const Reply *r, const char *error, gpointer data)
   Xml *root = xml_parse (r->body);
   if (!root)
     {
+      DEBUG ("%s: the listing is not well-formed XML\n", run->cal_name);
       calendar_failed (run, "The server's answer could not be read.");
       return;
     }
@@ -1140,6 +1196,7 @@ on_server_list (const Reply *r, const char *error, gpointer data)
       calendar_remove_resource (calendar_default (), run->cal_id, stale->pdata[i]);
       run->arrived = TRUE;
     }
+  DEBUG ("%s: %u on the server, %u to fetch, %u gone\n", run->cal_name, g_hash_table_size (run->server), run->fetch->len, stale->len);
   run->fi = 0;
   fetch_next (run);
 }
@@ -1165,9 +1222,11 @@ on_multiget (const Reply *r, const char *error, gpointer data)
   Run *run = data;
   if (error)
     {
+      DEBUG ("%s: fetching failed: %s\n", run->cal_name, error);
       calendar_failed (run, error);
       return;
     }
+  DEBUG ("%s: fetch answered %u, %zu bytes\n", run->cal_name, r->status, strlen (r->body));
   if (r->status != 207)
     {
       calendar_failed (run, reason (r, NULL));
@@ -1176,9 +1235,11 @@ on_multiget (const Reply *r, const char *error, gpointer data)
   Xml *root = xml_parse (r->body);
   if (!root)
     {
+      DEBUG ("%s: the fetched answer is not well-formed XML\n", run->cal_name);
       calendar_failed (run, "The server's answer could not be read.");
       return;
     }
+  guint got = 0;
   for (guint i = 0; i < root->kids->len; i++)
     {
       const Xml *resp = root->kids->pdata[i];
@@ -1200,7 +1261,9 @@ on_multiget (const Reply *r, const char *error, gpointer data)
       calendar_replace_resource (calendar_default (), run->cal_id, abs, events);
       g_ptr_array_unref (events);
       run->arrived = TRUE;
+      got++;
     }
+  DEBUG ("%s: %u of %u resources had calendar data\n", run->cal_name, got, root->kids->len);
   xml_free (root);
   fetch_next (run);
 }
