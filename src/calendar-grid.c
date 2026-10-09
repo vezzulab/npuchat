@@ -667,6 +667,35 @@ on_drag_end (GtkGestureDrag *gesture, double dx, double dy, gpointer data)
 }
 
 static void
+on_right_click (GtkGestureClick *gesture, int n_press, double x, double y, gpointer data)
+{
+  Grid *g = data;
+  (void) gesture;
+  (void) n_press;
+  if (!g->cb.context || x < GUTTER)
+    return;
+  const Block *b = block_at (g, x, y);
+  if (b)
+    {
+      g_free (g->selected);
+      g->selected = g_strdup (b->id);
+      g->selected_occ = b->occ_start;
+      gtk_widget_queue_draw (g->area);
+      g->cb.context (b->id, b->occ_start, 0, g->area, x, y, g->data);
+      return;
+    }
+  gint64 day = day_at (g, x_to_column (g, x));
+  g->cb.context (NULL, 0, time_at (day, y_to_minutes (y, TRUE)), g->area, x, y, g->data);
+}
+
+void
+cal_grid_test_context (GtkWidget *grid, double x, double y)
+{
+  Grid *g = g_object_get_data (G_OBJECT (grid), "grid");
+  on_right_click (NULL, 1, x, y, g);
+}
+
+static void
 on_click (GtkGestureClick *gesture, int n_press, double x, double y, gpointer data)
 {
   Grid *g = data;
@@ -769,13 +798,19 @@ cal_grid_new (const CalGridCallbacks *callbacks, gpointer data)
   g_object_set_data_full (G_OBJECT (g->area), "grid", g, grid_free);
 
   GtkGesture *drag = gtk_gesture_drag_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (drag), GDK_BUTTON_PRIMARY);
   g_signal_connect (drag, "drag-begin", G_CALLBACK (on_drag_begin), g);
   g_signal_connect (drag, "drag-update", G_CALLBACK (on_drag_update), g);
   g_signal_connect (drag, "drag-end", G_CALLBACK (on_drag_end), g);
   gtk_widget_add_controller (g->area, GTK_EVENT_CONTROLLER (drag));
   GtkGesture *click = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), GDK_BUTTON_PRIMARY);
   g_signal_connect (click, "released", G_CALLBACK (on_click), g);
   gtk_widget_add_controller (g->area, GTK_EVENT_CONTROLLER (click));
+  GtkGesture *right = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (right), GDK_BUTTON_SECONDARY);
+  g_signal_connect (right, "pressed", G_CALLBACK (on_right_click), g);
+  gtk_widget_add_controller (g->area, GTK_EVENT_CONTROLLER (right));
   GtkEventController *motion = gtk_event_controller_motion_new ();
   g_signal_connect (motion, "motion", G_CALLBACK (on_motion), g);
   gtk_widget_add_controller (g->area, motion);

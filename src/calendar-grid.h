@@ -12,6 +12,8 @@ typedef struct {
   void (*picked) (const char *event_id, gint64 occurrence_start, GtkWidget *grid, double x, double y, gpointer data);
   void (*open) (const char *event_id, gint64 occurrence_start, gpointer data);      /* double click */
   void (*create) (gint64 start, gint64 end, gpointer data);                         /* dragged over free time */
+  /* right click: on an event (event_id set) or on free time (event_id NULL, time is the moment clicked) */
+  void (*context) (const char *event_id, gint64 occurrence_start, gint64 time, GtkWidget *grid, double x, double y, gpointer data);
   /* the check circle of a reminder was clicked */
   void (*toggled) (const char *event_id, gint64 occurrence_start, gpointer data);
   /* moved or resized: the showing that started at occ_start now runs from new_start to new_end */
@@ -33,3 +35,6 @@ guint      cal_grid_draw_count (GtkWidget *grid);
 void       cal_grid_set_hours (GtkWidget *grid, int from, int to);
 /* The selected event, or NULL; occurrence_start tells which showing. */
 const char *cal_grid_selected (GtkWidget *grid, gint64 *occurrence_start);
+
+/* For tests: a right click at a point. */
+void       cal_grid_test_context (GtkWidget *grid, double x, double y);

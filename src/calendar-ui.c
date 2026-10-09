@@ -48,10 +48,15 @@ static CalEvent *clipboard_event;
 static void (*background_handler) (gboolean background, gboolean autostart);
 static gboolean standalone;   /* its own window, so it carries its own settings */
 static char *editor_title_hint;  /* a title typed in quick entry, for the full editor */
+static int editor_preset;        /* what a right-click menu asked the editor to start as */
+#define PRESET_REMINDER 1
+#define PRESET_ALLDAY 2
 
 static void free_data (gpointer data, GClosure *closure) { (void) closure; g_free (data); }
 
 static void refresh_all (void);
+static void menu_for_event (GtkWidget *parent, double x, double y, const char *id, gint64 occ);
+static void menu_for_time (GtkWidget *parent, double x, double y, gint64 time, gboolean with_time, gboolean offer_day);
 static void print_view (void);
 static void refresh_done (const char *calendar_id, guint events, const char *error, gpointer data);
 static void open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 end);
@@ -372,6 +377,22 @@ edit_showing (const char *id, gint64 occ_start, CalEvent *edited, AdwDialog *clo
 
 /* ---- details popover ---------------------------------------------------- */
 
+/* Popovers hang from the window itself, not from the chip or cell that was clicked: those are
+ * rebuilt on every refresh, and a popover must not outlive its parent. */
+static GtkWidget *
+popover_home (GtkWidget *from, GdkRectangle *rect)
+{
+  graphene_point_t p = GRAPHENE_POINT_INIT ((float) rect->x, (float) rect->y);
+  graphene_point_t out;
+  if (U.view && gtk_widget_compute_point (from, U.view, &p, &out))
+    {
+      rect->x = (int) out.x;
+      rect->y = (int) out.y;
+      return U.view;
+    }
+  return from;
+}
+
 typedef struct {
   char  *id;
   gint64 occ_start;
@@ -533,9 +554,10 @@ show_event_popover (const char *id, gint64 occ_start, GtkWidget *parent, GdkRect
     }
 
   gtk_popover_set_child (GTK_POPOVER (pop), box);
-  gtk_widget_set_parent (pop, parent);
-  if (where)
-    gtk_popover_set_pointing_to (GTK_POPOVER (pop), where);
+  GdkRectangle rect = where ? *where : (GdkRectangle) { 0, 0, gtk_widget_get_width (parent), gtk_widget_get_height (parent) };
+  GtkWidget *home = popover_home (parent, &rect);
+  gtk_widget_set_parent (pop, home);
+  gtk_popover_set_pointing_to (GTK_POPOVER (pop), &rect);
   g_signal_connect (pop, "closed", G_CALLBACK (on_popover_closed), NULL);
   gtk_popover_popup (GTK_POPOVER (pop));
 }
@@ -1074,6 +1096,11 @@ open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 en
   g_signal_connect (e->reminder, "notify::active", G_CALLBACK (on_editor_changed), e);
   g_signal_connect (e->repeat, "notify::selected", G_CALLBACK (on_editor_changed), e);
   g_signal_connect (e->ends_row, "notify::selected", G_CALLBACK (on_editor_changed), e);
+  if (!existing && editor_preset == PRESET_REMINDER)
+    adw_switch_row_set_active (ADW_SWITCH_ROW (e->reminder), TRUE);
+  else if (!existing && editor_preset == PRESET_ALLDAY)
+    adw_switch_row_set_active (ADW_SWITCH_ROW (e->all_day), TRUE);
+  editor_preset = 0;
   editor_sync (e);
   last_editor = e;
   adw_dialog_present (e->dialog, U.view);
@@ -1105,6 +1132,16 @@ on_chip_pressed (GtkGestureClick *g, int n_press, double x, double y, gpointer d
   show_event_popover (id, *occ, chip, &r);
 }
 
+static void
+on_chip_right (GtkGestureClick *g, int n_press, double x, double y, gpointer data)
+{
+  (void) n_press;
+  GtkWidget *chip = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (g));
+  gint64 *occ = g_object_get_data (G_OBJECT (chip), "occ");
+  gtk_gesture_set_state (GTK_GESTURE (g), GTK_EVENT_SEQUENCE_CLAIMED);
+  menu_for_event (chip, x, y, data, *occ);
+}
+
 static GtkWidget *
 make_chip (const CalOccurrence *o, gboolean show_time)
 {
@@ -1121,14 +1158,238 @@ make_chip (const CalOccurrence *o, gboolean show_time)
   add_color_class (chip, calendar_of (o->event)->color);
   g_object_set_data_full (G_OBJECT (chip), "occ", g_memdup2 (&o->start, sizeof o->start), g_free);
   GtkGesture *click = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), GDK_BUTTON_PRIMARY);
   g_signal_connect_data (click, "pressed", G_CALLBACK (on_chip_pressed), g_strdup (o->event->id), free_data, 0);
   gtk_widget_add_controller (chip, GTK_EVENT_CONTROLLER (click));
+  GtkGesture *right = gtk_gesture_click_new ();
+  gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (right), GDK_BUTTON_SECONDARY);
+  g_signal_connect_data (right, "pressed", G_CALLBACK (on_chip_right), g_strdup (o->event->id), free_data, 0);
+  gtk_widget_add_controller (chip, GTK_EVENT_CONTROLLER (right));
   return chip;
 }
 static gboolean
 occurrence_visible (const CalOccurrence *o)
 {
   return calendar_of (o->event)->visible;
+}
+
+/* ---- right click: a small menu where you clicked ------------------------ */
+
+typedef struct {
+  gint64     time;        /* the moment or day that was clicked (0 for an event) */
+  char      *id;          /* the event, when one was clicked */
+  gint64     occ;
+  GtkWidget *parent;      /* alive for as long as the menu is */
+  double     x, y;
+} Ctx;
+
+typedef struct {
+  const char *label;
+  void      (*run) (const Ctx *c);
+  gboolean    destructive;
+} MenuEntry;
+
+static void
+ctx_free (gpointer p)
+{
+  Ctx *c = p;
+  g_free (c->id);
+  g_free (c);
+}
+
+static void
+on_menu_item (GtkButton *b, gpointer data)
+{
+  GtkPopover *pop = data;
+  const Ctx *c = g_object_get_data (G_OBJECT (pop), "ctx");
+  void (*run) (const Ctx *) = g_object_get_data (G_OBJECT (b), "run");
+  gtk_popover_popdown (pop);
+  run (c);
+}
+
+static void
+show_menu (Ctx *ctx, const MenuEntry *entries, guint n)
+{
+  GtkWidget *pop = gtk_popover_new ();
+  g_object_set_data_full (G_OBJECT (pop), "ctx", ctx, ctx_free);
+  gtk_widget_add_css_class (pop, "menu");
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
+  gtk_widget_set_margin_start (box, 4);
+  gtk_widget_set_margin_end (box, 4);
+  gtk_widget_set_margin_top (box, 4);
+  gtk_widget_set_margin_bottom (box, 4);
+  for (guint i = 0; i < n; i++)
+    {
+      GtkWidget *b = gtk_button_new_with_label (entries[i].label);
+      gtk_widget_add_css_class (b, "flat");
+      if (entries[i].destructive)
+        gtk_widget_add_css_class (b, "destructive-text");
+      GtkWidget *label = gtk_button_get_child (GTK_BUTTON (b));
+      if (GTK_IS_LABEL (label))
+        gtk_label_set_xalign (GTK_LABEL (label), 0);
+      g_object_set_data (G_OBJECT (b), "run", (gpointer) entries[i].run);
+      g_signal_connect (b, "clicked", G_CALLBACK (on_menu_item), pop);
+      gtk_box_append (GTK_BOX (box), b);
+    }
+  gtk_popover_set_child (GTK_POPOVER (pop), box);
+  GdkRectangle where = { (int) ctx->x, (int) ctx->y, 1, 1 };
+  gtk_widget_set_parent (pop, popover_home (ctx->parent, &where));
+  gtk_popover_set_pointing_to (GTK_POPOVER (pop), &where);
+  gtk_popover_set_has_arrow (GTK_POPOVER (pop), FALSE);
+  gtk_popover_set_position (GTK_POPOVER (pop), GTK_POS_BOTTOM);
+  g_signal_connect (pop, "closed", G_CALLBACK (on_popover_closed), NULL);
+  gtk_popover_popup (GTK_POPOVER (pop));
+}
+
+static Ctx *
+ctx_new (GtkWidget *parent, double x, double y, gint64 time, const char *id, gint64 occ)
+{
+  Ctx *c = g_new0 (Ctx, 1);
+  c->parent = parent;
+  c->x = x;
+  c->y = y;
+  c->time = time;
+  c->id = g_strdup (id);
+  c->occ = occ;
+  return c;
+}
+
+static void
+act_new_event (const Ctx *c)
+{
+  open_editor (NULL, 0, c->time, c->time + 3600);
+}
+
+static void
+act_new_reminder (const Ctx *c)
+{
+  editor_preset = PRESET_REMINDER;
+  open_editor (NULL, 0, c->time, c->time + 900);
+}
+
+static void
+act_new_allday (const Ctx *c)
+{
+  editor_preset = PRESET_ALLDAY;
+  open_editor (NULL, 0, calendar_day_start (c->time), 0);
+}
+
+static void
+act_goto_day (const Ctx *c)
+{
+  U.anchor = calendar_day_start (c->time);
+  U.mode = VIEW_DAY;
+  gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_DAY]), TRUE);
+  refresh_all ();
+}
+
+static void
+act_edit_event (const Ctx *c)
+{
+  const CalEvent *ev = calendar_find (calendar_default (), c->id);
+  if (ev)
+    open_editor (ev, c->occ, 0, 0);
+}
+
+static void
+act_duplicate_event (const Ctx *c)
+{
+  const CalEvent *ev = calendar_find (calendar_default (), c->id);
+  if (!ev)
+    return;
+  CalEvent *copy = calendar_event_copy (ev);
+  g_clear_pointer (&copy->uid, g_free);
+  g_clear_pointer (&copy->href, g_free);
+  g_clear_pointer (&copy->etag, g_free);
+  g_clear_pointer (&copy->exceptions, g_array_unref);
+  g_clear_pointer (&copy->completed, g_array_unref);
+  copy->recurrence_id = 0;
+  copy->done = FALSE;
+  /* the showing that was clicked, not the series' first one */
+  gint64 length = ev->end - ev->start;
+  copy->start = c->occ;
+  copy->end = c->occ + length;
+  if (calendar_of (ev)->url)
+    {
+      g_free (copy->calendar);
+      copy->calendar = NULL;
+    }
+  calendar_add (calendar_default (), copy);
+  refresh_all ();
+}
+
+static void
+act_toggle_done (const Ctx *c)
+{
+  const CalEvent *ev = calendar_find (calendar_default (), c->id);
+  if (ev)
+    calendar_set_done (calendar_default (), c->id, c->occ, !calendar_is_done (ev, c->occ));
+  refresh_all ();
+}
+
+static void
+act_delete_event (const Ctx *c)
+{
+  delete_showing (c->id, c->occ, NULL);
+}
+
+static void
+act_details (const Ctx *c)
+{
+  GdkRectangle r = { (int) c->x, (int) c->y, 1, 1 };
+  show_event_popover (c->id, c->occ, c->parent, &r);
+}
+
+/* what to offer on an event */
+static void
+menu_for_event (GtkWidget *parent, double x, double y, const char *id, gint64 occ)
+{
+  const CalEvent *ev = calendar_find (calendar_default (), id);
+  if (!ev)
+    return;
+  g_free (sel_id);
+  sel_id = g_strdup (id);
+  sel_occ = occ;
+  Ctx *c = ctx_new (parent, x, y, 0, id, occ);
+  if (calendar_of (ev)->url)
+    {
+      static const MenuEntry read_only[] = { { NULL, act_details, FALSE } };
+      MenuEntry e[1] = { read_only[0] };
+      e[0].label = TR ("Ver detalles", "Show details");
+      show_menu (c, e, 1);
+      return;
+    }
+  MenuEntry e[4];
+  guint n = 0;
+  e[n++] = (MenuEntry) { TR ("Editar…", "Edit…"), act_edit_event, FALSE };
+  e[n++] = (MenuEntry) { TR ("Duplicar", "Duplicate"), act_duplicate_event, FALSE };
+  if (ev->reminder)
+    e[n++] = (MenuEntry) { calendar_is_done (ev, occ) ? TR ("Marcar pendiente", "Mark not done") : TR ("Marcar como hecho", "Mark done"),
+                           act_toggle_done, FALSE };
+  e[n++] = (MenuEntry) { TR ("Borrar", "Delete"), act_delete_event, TRUE };
+  show_menu (c, e, n);
+}
+
+/* what to offer on a day or a moment: new things, or look at it closer */
+static void
+menu_for_time (GtkWidget *parent, double x, double y, gint64 time, gboolean with_time, gboolean offer_day)
+{
+  Ctx *c = ctx_new (parent, x, y, time, NULL, 0);
+  g_autofree char *clock = NULL;
+  if (with_time)
+    {
+      g_autoptr (GDateTime) d = g_date_time_new_from_unix_local (time);
+      clock = g_date_time_format (d, "%H:%M");
+    }
+  g_autofree char *new_label = clock ? g_strdup_printf (TR ("Nuevo evento a las %s", "New event at %s"), clock) : g_strdup (TR ("Nuevo evento", "New event"));
+  MenuEntry e[4];
+  guint n = 0;
+  e[n++] = (MenuEntry) { new_label, act_new_event, FALSE };
+  e[n++] = (MenuEntry) { TR ("Nuevo recordatorio", "New reminder"), act_new_reminder, FALSE };
+  e[n++] = (MenuEntry) { TR ("Evento de todo el día", "All-day event"), act_new_allday, FALSE };
+  if (offer_day)
+    e[n++] = (MenuEntry) { TR ("Ver este día", "Show this day"), act_goto_day, FALSE };
+  show_menu (c, e, n);
 }
 
 /* ---- month view --------------------------------------------------------- */
@@ -1145,6 +1406,17 @@ on_day_clicked (GtkGestureClick *g, int n_press, double x, double y, gpointer da
       return;
     }
   refresh_all ();
+}
+
+static void
+on_day_right (GtkGestureClick *g, int n_press, double x, double y, gpointer data)
+{
+  (void) n_press;
+  gint64 *day = data;
+  GtkWidget *cell = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (g));
+  U.anchor = *day;
+  /* a new event in a month starts at nine, like a double click does */
+  menu_for_time (cell, x, y, *day + 9 * 3600, FALSE, TRUE);
 }
 
 static void
@@ -1239,8 +1511,13 @@ rebuild_month (void)
         }
 
       GtkGesture *click = gtk_gesture_click_new ();
+      gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), GDK_BUTTON_PRIMARY);
       g_signal_connect_data (click, "pressed", G_CALLBACK (on_day_clicked), g_memdup2 (&day, sizeof day), free_data, 0);
       gtk_widget_add_controller (cell, GTK_EVENT_CONTROLLER (click));
+      GtkGesture *right = gtk_gesture_click_new ();
+      gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (right), GDK_BUTTON_SECONDARY);
+      g_signal_connect_data (right, "pressed", G_CALLBACK (on_day_right), g_memdup2 (&day, sizeof day), free_data, 0);
+      gtk_widget_add_controller (cell, GTK_EVENT_CONTROLLER (right));
       gtk_grid_attach (GTK_GRID (U.month_grid), cell, col, i / 7, 1, 1);
     }
   g_array_free (occ, TRUE);
@@ -1424,6 +1701,16 @@ on_grid_create (gint64 start, gint64 end, gpointer data)
 }
 
 static void
+on_grid_context (const char *id, gint64 occ_start, gint64 time, GtkWidget *grid, double x, double y, gpointer data)
+{
+  (void) data;
+  if (id)
+    menu_for_event (grid, x, y, id, occ_start);
+  else
+    menu_for_time (grid, x, y, time, TRUE, U.mode == VIEW_WEEK);
+}
+
+static void
 on_grid_toggled (const char *id, gint64 occ_start, gpointer data)
 {
   (void) data;
@@ -1506,6 +1793,10 @@ month_widget (gint64 m0, gboolean highlight)
         gtk_widget_add_css_class (b, "selected");
       g_object_set_data_full (G_OBJECT (b), "day", g_memdup2 (&day, sizeof day), g_free);
       g_signal_connect (b, "clicked", G_CALLBACK (on_mini_day), NULL);
+      GtkGesture *right = gtk_gesture_click_new ();
+      gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (right), GDK_BUTTON_SECONDARY);
+      g_signal_connect_data (right, "pressed", G_CALLBACK (on_day_right), g_memdup2 (&day, sizeof day), free_data, 0);
+      gtk_widget_add_controller (b, GTK_EVENT_CONTROLLER (right));
       gtk_grid_attach (GTK_GRID (grid), b, i % 7, 1 + i / 7, 1, 1);
     }
   return grid;
@@ -3019,7 +3310,7 @@ calendar_ui_view_new (void)
   gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (year_scroll), U.year_grid);
 
   /* ---- week and day page ---- */
-  CalGridCallbacks cb = { on_grid_picked, on_grid_open, on_grid_create, on_grid_toggled, on_grid_moved };
+  CalGridCallbacks cb = { on_grid_picked, on_grid_open, on_grid_create, on_grid_context, on_grid_toggled, on_grid_moved };
   U.time_grid = cal_grid_new (&cb, NULL);
   U.scroller = gtk_scrolled_window_new ();
   gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (U.scroller), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
@@ -3218,6 +3509,68 @@ selftest_step (gpointer data)
   test_create_start = test_create_end = 0;
   cal_grid_test_drag (U.time_grid, x, y, x1, y1);
   CHECK (test_create_start == today + 18 * 3600 && test_create_end == today + 19 * 3600 + 1800, "dragging over free time proposes that range");
+  /* right click: the menus open without trouble, and each entry does what it says */
+  {
+    settle ();
+    cal_grid_point (U.time_grid, today + 16 * 3600, &x, &y);
+    cal_grid_test_context (U.time_grid, x, y);              /* on free time */
+    cal_grid_point (U.time_grid, s + 1800, &x, &y);
+    cal_grid_test_context (U.time_grid, x, y);              /* on an event */
+    for (int i = 0; i < 20; i++)
+      g_main_context_iteration (NULL, FALSE);
+
+    gint64 t14 = today + 14 * 3600;
+    Ctx at14 = { t14, NULL, 0, U.time_grid, 0, 0 };
+    act_new_event (&at14);
+    CHECK (last_editor != NULL && last_editor->day == today && (int) gtk_spin_button_get_value (GTK_SPIN_BUTTON (last_editor->start_h)) == 14 &&
+           (int) gtk_spin_button_get_value (GTK_SPIN_BUTTON (last_editor->end_h)) == 15, "new event starts at the clicked time, an hour long");
+    if (last_editor)
+      adw_dialog_force_close (last_editor->dialog);
+    act_new_reminder (&at14);
+    CHECK (last_editor != NULL && adw_switch_row_get_active (ADW_SWITCH_ROW (last_editor->reminder)), "new reminder starts as a reminder");
+    if (last_editor)
+      adw_dialog_force_close (last_editor->dialog);
+    act_new_allday (&at14);
+    CHECK (last_editor != NULL && adw_switch_row_get_active (ADW_SWITCH_ROW (last_editor->all_day)) && last_editor->day == today,
+           "all-day event starts as all day, on that day");
+    if (last_editor)
+      adw_dialog_force_close (last_editor->dialog);
+    act_new_event (&at14);
+    CHECK (last_editor && !adw_switch_row_get_active (ADW_SWITCH_ROW (last_editor->reminder)) && !adw_switch_row_get_active (ADW_SWITCH_ROW (last_editor->all_day)),
+           "and the presets do not stick to the next editor");
+    if (last_editor)
+      adw_dialog_force_close (last_editor->dialog);
+
+    Ctx on_event = { 0, (char *) event_id, s, U.time_grid, 0, 0 };
+    guint before_dup = calendar_count (cal);
+    act_duplicate_event (&on_event);
+    CHECK (calendar_count (cal) == before_dup + 1, "duplicate adds a copy");
+    act_edit_event (&on_event);
+    CHECK (last_editor != NULL && last_editor->id != NULL && g_str_equal (last_editor->id, event_id), "edit opens that event");
+    if (last_editor)
+      adw_dialog_force_close (last_editor->dialog);
+
+    CalEvent *task = calendar_event_new ("Right-click task", t14, 0, FALSE);
+    task->reminder = TRUE;
+    g_autofree char *task_id = g_strdup (calendar_add (cal, task));
+    Ctx on_task = { 0, task_id, t14, U.time_grid, 0, 0 };
+    act_toggle_done (&on_task);
+    CHECK (calendar_is_done (calendar_find (cal, task_id), t14), "toggle marks a reminder done");
+    act_toggle_done (&on_task);
+    CHECK (!calendar_is_done (calendar_find (cal, task_id), t14), "and not done again");
+    act_delete_event (&on_task);
+    CHECK (calendar_find (cal, task_id) == NULL, "delete removes it");
+    g_autofree char *back_title = NULL;
+    CHECK (calendar_undo_delete (cal, &back_title), "and it can be undone");
+
+    act_goto_day (&at14);
+    CHECK (U.mode == VIEW_DAY, "show this day switches to the day view");
+    U.mode = VIEW_WEEK;
+    gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_WEEK]), TRUE);
+    refresh_all ();
+    settle ();
+  }
+
   /* the editor: fill the form and save, then look at what was stored */
   {
     gint64 when = today + 20 * 3600;
