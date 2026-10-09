@@ -596,6 +596,28 @@ calendar_default_target (Calendar *cal)
   return NULL;
 }
 
+const CalCalendar *
+calendar_preferred_target (Calendar *cal, const char *preferred_id)
+{
+  CalCalendar *p = find_calendar_exact (cal, preferred_id);
+  if (p && !p->url)
+    return p;
+  const CalCalendar *visible_linked = NULL, *visible = NULL;
+  for (guint i = 0; i < cal->calendars->len; i++)
+    {
+      const CalCalendar *c = cal->calendars->pdata[i];
+      if (c->url || !c->visible)
+        continue;
+      if (c->account && !visible_linked)
+        visible_linked = c;
+      if (!visible)
+        visible = c;
+    }
+  if (visible_linked)
+    return visible_linked;
+  return visible ? visible : calendar_default_target (cal);
+}
+
 const char *
 calendar_calendar_add (Calendar *cal, const char *name, guint color)
 {
@@ -868,8 +890,12 @@ calendar_add (Calendar *cal, CalEvent *ev)
   if (!c || c->url)
     {
       g_free (ev->calendar);
-      ev->calendar = g_strdup (calendar_default_target (cal)->id);
+      ev->calendar = g_strdup (calendar_preferred_target (cal, NULL)->id);
+      c = find_calendar_exact (cal, ev->calendar);
     }
+  /* an event added to a calendar you have hidden would vanish: show the calendar again */
+  if (c && !c->visible)
+    c->visible = TRUE;
   touch (cal, ev);
   g_ptr_array_add (cal->events, ev);
   save (cal);
@@ -925,6 +951,11 @@ calendar_update (Calendar *cal, CalEvent *ev)
           }
         else
           add_pending_delete (cal, old);     /* moved to another calendar: gone from the old one */
+        {
+          CalCalendar *moved_to = find_calendar_exact (cal, ev->calendar);
+          if (moved_to && !moved_to->visible)
+            moved_to->visible = TRUE;
+        }
         touch (cal, ev);
         calendar_event_free (old);
         cal->events->pdata[i] = ev;

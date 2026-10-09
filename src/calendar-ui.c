@@ -618,8 +618,8 @@ apply_defaults (CalEvent *ev)
   const CalSettings *cs = calendar_settings ();
   if (cs->default_alert >= 0 && calendar_event_alert_count (ev) == 0)
     calendar_event_add_alert (ev, cs->default_alert);
-  const CalCalendar *c = cs->default_calendar ? calendar_calendar_find (calendar_default (), cs->default_calendar) : NULL;
-  if (c && !c->url)
+  const CalCalendar *c = calendar_preferred_target (calendar_default (), cs->default_calendar);
+  if (c)
     {
       g_free (ev->calendar);
       ev->calendar = g_strdup (c->id);
@@ -1102,7 +1102,8 @@ open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 en
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->cal_combo), TR ("Calendario", "Calendar"));
   g_autoptr (GtkStringList) names = gtk_string_list_new (NULL);
   guint cal_sel = 0;
-  const char *want_cal = existing ? existing->calendar : calendar_settings ()->default_calendar;
+  const CalCalendar *preferred = calendar_preferred_target (calendar_default (), calendar_settings ()->default_calendar);
+  const char *want_cal = existing ? existing->calendar : (preferred ? preferred->id : NULL);
   for (guint i = 0; i < e->own->len; i++)
     {
       const CalCalendar *c = e->own->pdata[i];

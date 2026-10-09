@@ -85,6 +85,7 @@ discover_done (const char *error, GPtrArray *cals, gpointer data)
       c->href = g_strdup (src->href);
       c->name = g_strdup (src->name);
       c->color = g_strdup (src->color);
+      c->source = g_strdup (src->source);
       g_ptr_array_add (w->cals, c);
     }
   w->finished = TRUE;
@@ -116,6 +117,7 @@ free_remotes (GPtrArray *list)
       g_free (c->href);
       g_free (c->name);
       g_free (c->color);
+      g_free (c->source);
       g_free (c);
     }
   if (list)
@@ -178,6 +180,36 @@ main (void)
     CHECK (broken == NULL, "broken XML is refused");
     g_autofree char *open_cdata = caldav_xml_first_text ("<a><b><![CDATA[never closed</b></a>", "b");
     CHECK (open_cdata == NULL, "an unclosed CDATA is refused, not trusted");
+  }
+
+  /* the calendar list of a real iCloud account (structure captured, names and addresses invented) */
+  {
+    const char *list =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?><multistatus xmlns=\"DAV:\">"
+      "<response><href>/1/calendars/home/</href><propstat><prop><displayname>Personal</displayname>"
+      "<resourcetype><collection/><calendar xmlns=\"urn:ietf:params:xml:ns:caldav\"/></resourcetype>"
+      "<supported-calendar-component-set xmlns=\"urn:ietf:params:xml:ns:caldav\"><comp name=\"VEVENT\"/></supported-calendar-component-set>"
+      "</prop><status>HTTP/1.1 200 OK</status></propstat></response>"
+      "<response><href>/1/calendars/reminders/</href><propstat><prop><displayname>Reminders</displayname>"
+      "<resourcetype><collection/><calendar xmlns=\"urn:ietf:params:xml:ns:caldav\"/></resourcetype>"
+      "<supported-calendar-component-set xmlns=\"urn:ietf:params:xml:ns:caldav\"><comp name=\"VTODO\"/></supported-calendar-component-set>"
+      "</prop><status>HTTP/1.1 200 OK</status></propstat></response>"
+      "<response><href>/1/calendars/ABC/</href><propstat><prop><displayname>Trash pickup</displayname>"
+      "<resourcetype><collection/><subscribed xmlns=\"http://calendarserver.org/ns/\"/></resourcetype>"
+      "<source xmlns=\"http://calendarserver.org/ns/\"><href xmlns=\"DAV:\">webcal://example.org/feeds/trash.ics</href></source>"
+      "</prop><status>HTTP/1.1 200 OK</status></propstat></response>"
+      "<response><href>/1/calendars/XYZ/</href><propstat><prop><displayname>Broken subscription</displayname>"
+      "<resourcetype><collection/><subscribed xmlns=\"http://calendarserver.org/ns/\"/></resourcetype>"
+      "</prop><status>HTTP/1.1 200 OK</status></propstat></response>"
+      "<response><href>/1/inbox/</href><propstat><prop><resourcetype><collection/><notification xmlns=\"http://calendarserver.org/ns/\"/></resourcetype></prop>"
+      "<status>HTTP/1.1 200 OK</status></propstat></response></multistatus>";
+    GPtrArray *cals = caldav_parse_calendar_list (list, "https://p1-caldav.icloud.com:443/1/calendars/");
+    CHECK (cals && cals->len == 2, "an event calendar and an internet subscription are listed; to-do lists, notifications and unusable ones are not (%u)", cals ? cals->len : 0);
+    RemoteCalendar *own = cals && cals->len > 0 ? cals->pdata[0] : NULL, *subscribed = cals && cals->len > 1 ? cals->pdata[1] : NULL;
+    CHECK (own && g_str_equal (own->name, "Personal") && own->source == NULL, "the ordinary calendar has no source address");
+    CHECK (subscribed && g_str_equal (subscribed->name, "Trash pickup") && subscribed->source && g_str_equal (subscribed->source, "https://example.org/feeds/trash.ics"),
+           "the subscription carries its address, turned into https");
+    caldav_remote_list_free (cals);
   }
 
   /* Apple's app passwords, as Apple shows them (also pasted without dashes or with spaces) */

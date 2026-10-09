@@ -21,6 +21,7 @@ typedef struct {
   char *href;         /* absolute address */
   char *name;
   char *color;        /* "#RRGGBB" or NULL */
+  char *source;       /* for an internet calendar you subscribed to on your phone: its address (https); else NULL */
 } RemoteCalendar;
 
 /* ---- accounts, kept in ~/.config/calendar/accounts.json (readable only by you) ---- */
@@ -61,3 +62,7 @@ char *caldav_resolve (const char *base, const char *href);
 
 /* For tests: the text of the first element with this local name in an XML answer, or NULL. */
 char *caldav_xml_first_text (const char *xml, const char *element);
+
+/* For tests: the calendars named in a server's answer, and freeing such a list. */
+GPtrArray *caldav_parse_calendar_list (const char *xml, const char *base);
+void       caldav_remote_list_free (GPtrArray *list);

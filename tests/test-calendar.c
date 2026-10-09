@@ -696,6 +696,50 @@ test_sync_model (void)
 }
 
 static void
+test_where_new_events_go (void)
+{
+  Calendar *cal = calendar_new (NULL);
+  g_autofree char *local = g_strdup (((CalCalendar *) calendar_calendars (cal)->pdata[0])->id);
+  g_autofree char *icloud = g_strdup (calendar_linked_add (cal, "iCloud", 3, "acct-1", "/u/home/"));
+  const char *sub = calendar_subscription_add (cal, "Holidays", 4, "https://example.org/h.ics", 24);
+  g_autofree char *sub_id = g_strdup (sub);
+
+  /* both visible: a calendar kept in step with a server wins, so the event reaches the phone */
+  g_assert_cmpstr (calendar_preferred_target (cal, NULL)->id, ==, icloud);
+  /* the user's own choice wins when it takes events */
+  g_assert_cmpstr (calendar_preferred_target (cal, local)->id, ==, local);
+  /* a subscription is never a target, even if asked for */
+  g_assert_cmpstr (calendar_preferred_target (cal, sub_id)->id, ==, icloud);
+  /* a hidden one is not chosen for you */
+  calendar_calendar_find (cal, icloud)->visible = FALSE;
+  g_assert_cmpstr (calendar_preferred_target (cal, NULL)->id, ==, local);
+  calendar_calendar_find (cal, local)->visible = FALSE;
+  g_assert_nonnull (calendar_preferred_target (cal, NULL));            /* still somewhere to put it */
+
+  /* an event added with no calendar lands in a visible one, and nothing vanishes */
+  calendar_calendar_find (cal, local)->visible = TRUE;
+  calendar_calendar_find (cal, icloud)->visible = FALSE;
+  const char *id = calendar_add (cal, calendar_event_new ("No calendar given", at (2026, 10, 9, 9, 0), 0, FALSE));
+  g_assert_cmpstr (calendar_find (cal, id)->calendar, ==, local);
+
+  /* adding to a calendar you had hidden shows it again: the event is seen */
+  CalEvent *e = calendar_event_new ("Into the hidden one", at (2026, 10, 9, 10, 0), 0, FALSE);
+  e->calendar = g_strdup (icloud);
+  g_assert_false (calendar_calendar_find (cal, icloud)->visible);
+  calendar_add (cal, e);
+  g_assert_true (calendar_calendar_find (cal, icloud)->visible);
+
+  /* moving an event into a hidden calendar shows it too */
+  calendar_calendar_find (cal, local)->visible = FALSE;
+  CalEvent *move = calendar_event_new ("No calendar given", at (2026, 10, 9, 9, 0), 0, FALSE);
+  move->id = g_strdup (id);
+  move->calendar = g_strdup (local);
+  g_assert_true (calendar_update (cal, move));
+  g_assert_true (calendar_calendar_find (cal, local)->visible);
+  calendar_free (cal);
+}
+
+static void
 test_parse (void)
 {
   gint64 t;
@@ -731,6 +775,7 @@ main (int argc, char **argv)
   g_test_add_func ("/calendar/free-slots-subscriptions", test_free_slots_and_subscriptions);
   g_test_add_func ("/calendar/scope-count", test_scope_with_count);
   g_test_add_func ("/calendar/sync-model", test_sync_model);
+  g_test_add_func ("/calendar/where-new-events-go", test_where_new_events_go);
   g_test_add_func ("/calendar/parse", test_parse);
   return g_test_run ();
 }

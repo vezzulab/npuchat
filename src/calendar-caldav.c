@@ -571,20 +571,28 @@ typedef struct {
 
 static void discover_step_home (Discover *d, const char *principal);
 
-static void
-discover_finish (Discover *d, const char *error, GPtrArray *cals)
+void
+caldav_remote_list_free (GPtrArray *list)
 {
-  GPtrArray *list = cals ? cals : g_ptr_array_new ();
-  d->done (error, list, d->data);
-  for (guint i = 0; i < list->len; i++)
+  for (guint i = 0; list && i < list->len; i++)
     {
       RemoteCalendar *c = list->pdata[i];
       g_free (c->href);
       g_free (c->name);
       g_free (c->color);
+      g_free (c->source);
       g_free (c);
     }
-  g_ptr_array_unref (list);
+  if (list)
+    g_ptr_array_unref (list);
+}
+
+static void
+discover_finish (Discover *d, const char *error, GPtrArray *cals)
+{
+  GPtrArray *list = cals ? cals : g_ptr_array_new ();
+  d->done (error, list, d->data);
+  caldav_remote_list_free (list);
   g_free (d->account_id);
   g_free (d->base);
   g_free (d);
@@ -601,6 +609,21 @@ describe_status (guint status)
     case 429: return "The server asks to try again later.";
     default:  return "The server did not answer as a calendar server should.";
     }
+}
+
+/* "webcal://…" is how an internet calendar is shared; it is fetched over https */
+static char *
+https_address (const char *text)
+{
+  if (!text || !*text)
+    return NULL;
+  if (g_ascii_strncasecmp (text, "webcal://", 9) == 0)
+    return g_strconcat ("https://", text + 9, NULL);
+  if (g_ascii_strncasecmp (text, "webcals://", 10) == 0)
+    return g_strconcat ("https://", text + 10, NULL);
+  if (g_ascii_strncasecmp (text, "https://", 8) == 0 || g_ascii_strncasecmp (text, "http://", 7) == 0)
+    return g_strdup (text);
+  return NULL;
 }
 
 static GPtrArray *
@@ -622,7 +645,9 @@ parse_calendars (const Xml *root, const char *base)
             continue;
           const Xml *prop = xml_find (ps, "prop");
           const Xml *type = xml_find (prop, "resourcetype");
-          if (!type || !xml_find (type, "calendar"))
+          gboolean is_calendar = type && xml_find (type, "calendar");
+          gboolean is_subscribed = type && xml_find (type, "subscribed");
+          if (!is_calendar && !is_subscribed)
             continue;
           const Xml *comps = xml_find (prop, "supported-calendar-component-set");
           gboolean events = !comps;
@@ -633,12 +658,21 @@ parse_calendars (const Xml *root, const char *base)
             }
           if (!events)
             continue;      /* a list of to-dos, not events */
+          g_autofree char *source = NULL;
+          if (is_subscribed)
+            {
+              g_autofree char *raw = xml_text_of (xml_find (xml_find (prop, "source"), "href"));
+              source = https_address (raw);
+              if (!source)
+                continue;  /* a subscription whose address we cannot use */
+            }
           g_autofree char *href = xml_text_of (xml_find (resp, "href"));
           g_autofree char *abs = caldav_resolve (base, href);
           if (!abs)
             continue;
           RemoteCalendar *rc = g_new0 (RemoteCalendar, 1);
           rc->href = g_steal_pointer (&abs);
+          rc->source = g_steal_pointer (&source);
           g_autofree char *name = xml_text_of (xml_find (prop, "displayname"));
           rc->name = name && *name ? g_steal_pointer (&name) : g_strdup ("Calendar");
           g_autofree char *color = xml_text_of (xml_find (prop, "calendar-color"));
@@ -647,6 +681,15 @@ parse_calendars (const Xml *root, const char *base)
         }
     }
   return out;
+}
+
+GPtrArray *
+caldav_parse_calendar_list (const char *xml, const char *base)
+{
+  Xml *root = xml_parse (xml);
+  GPtrArray *list = parse_calendars (root, base);
+  xml_free (root);
+  return list;
 }
 
 static void
@@ -705,8 +748,8 @@ on_home (const Reply *r, const char *error, gpointer data)
   d->base = g_strdup (home);
   static const char *body =
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-    "<d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:a=\"http://apple.com/ns/ical/\">"
-    "<d:prop><d:displayname/><d:resourcetype/><c:supported-calendar-component-set/><a:calendar-color/></d:prop></d:propfind>";
+    "<d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\" xmlns:a=\"http://apple.com/ns/ical/\" xmlns:cs=\"http://calendarserver.org/ns/\">"
+    "<d:prop><d:displayname/><d:resourcetype/><c:supported-calendar-component-set/><a:calendar-color/><cs:source/></d:prop></d:propfind>";
   http (a, "PROPFIND", home, "1", "application/xml; charset=utf-8", body, NULL, FALSE, on_calendars, d);
 }
 

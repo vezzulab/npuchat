@@ -129,6 +129,10 @@ void calendar_unlink_account (Calendar *cal, const char *account, gboolean delet
 
 /* The first calendar that accepts new events (not a subscription). */
 const CalCalendar *calendar_default_target (Calendar *cal);
+/* Where a new event should go: the preferred calendar if it takes events, else the first one you
+ * can see that is kept in step with a server (so it reaches your phone), else the first you can see,
+ * else the first that takes events. Never a subscription. */
+const CalCalendar *calendar_preferred_target (Calendar *cal, const char *preferred_id);
 
 /* Adds all these events to a calendar and saves once. Takes ownership of the events and empties
  * the array. Returns how many were added. */

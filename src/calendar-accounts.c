@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "calendar-caldav.h"
+#include "calendar-subscribe.h"
 #include "calendar-ui.h"
 #include "calendar.h"
 #include "i18n.h"
@@ -49,6 +50,7 @@ choose_free (gpointer p)
       g_free (r->href);
       g_free (r->name);
       g_free (r->color);
+      g_free (r->source);
       g_free (r);
     }
   g_ptr_array_unref (c->remotes);
@@ -68,6 +70,15 @@ on_first_sync (const char *error, gpointer data)
 }
 
 static void
+on_subscription_loaded (const char *calendar_id, guint events, const char *error, gpointer data)
+{
+  (void) calendar_id; (void) events; (void) data;
+  calendar_ui_refresh ();
+  if (error)
+    g_message ("calendar: loading a subscribed calendar failed: %s", error);
+}
+
+static void
 on_choose_response (AdwAlertDialog *dialog, const char *response, gpointer data)
 {
   (void) dialog;
@@ -82,6 +93,25 @@ on_choose_response (AdwAlertDialog *dialog, const char *response, gpointer data)
     {
       RemoteCalendar *r = c->remotes->pdata[i];
       gboolean wanted = gtk_check_button_get_active (GTK_CHECK_BUTTON (c->checks->pdata[i]));
+      if (r->source)
+        {
+          /* an internet calendar subscribed to on the phone: here it is read from its own address */
+          const CalCalendar *have_sub = NULL;
+          for (guint k = 0; k < cals->len; k++)
+            {
+              const CalCalendar *l = cals->pdata[k];
+              if (l->url && g_str_equal (l->url, r->source))
+                have_sub = l;
+            }
+          if (wanted && !have_sub)
+            {
+              const char *id = calendar_subscription_add (calendar_default (), r->name,
+                                                          r->color ? calendar_color_nearest (r->color) : 5, r->source, 24);
+              g_autofree char *keep = g_strdup (id);
+              calendar_subscription_fetch (keep, on_subscription_loaded, NULL);
+            }
+          continue;
+        }
       CalCalendar *have = NULL;
       for (guint k = 0; k < cals->len; k++)
         {
@@ -94,7 +124,6 @@ on_choose_response (AdwAlertDialog *dialog, const char *response, gpointer data)
       else if (!wanted && have)
         {
           /* no longer kept in step: it stays here as a plain calendar */
-          g_autofree char *id = g_strdup (have->id);
           g_free (have->account);
           have->account = NULL;
           g_clear_pointer (&have->href, g_free);
@@ -119,6 +148,7 @@ show_choose (CalAccount *a, GPtrArray *remotes)
       r->href = g_strdup (src->href);
       r->name = g_strdup (src->name);
       r->color = g_strdup (src->color);
+      r->source = g_strdup (src->source);
       g_ptr_array_add (c->remotes, r);
     }
   AdwDialog *d = adw_alert_dialog_new (TR ("¿Qué calendarios mantengo al día?", "Which calendars should I keep in step?"),
@@ -141,9 +171,19 @@ show_choose (CalAccount *a, GPtrArray *remotes)
           const CalCalendar *l = cals->pdata[k];
           have |= l->account && g_str_equal (l->account, a->id) && l->href && g_str_equal (l->href, r->href);
         }
-      GtkWidget *check = gtk_check_button_new_with_label (r->name);
+      if (r->source)
+        {
+          for (guint k = 0; k < cals->len; k++)
+            {
+              const CalCalendar *l = cals->pdata[k];
+              have |= l->url && g_str_equal (l->url, r->source);
+            }
+          any_linked |= have;
+        }
+      g_autofree char *label = r->source ? g_strdup_printf (TR ("%s (calendario de internet)", "%s (internet calendar)"), r->name) : g_strdup (r->name);
+      GtkWidget *check = gtk_check_button_new_with_label (label);
       /* a first connection starts with everything chosen; later visits show what is kept now */
-      gtk_check_button_set_active (GTK_CHECK_BUTTON (check), have || !any_linked);
+      gtk_check_button_set_active (GTK_CHECK_BUTTON (check), have || !any_linked || r->source != NULL);
       g_ptr_array_add (c->checks, check);
       gtk_box_append (GTK_BOX (box), check);
     }
