@@ -110,6 +110,32 @@ range_of (const char *when, gint64 *from, gint64 *to)
   return TRUE;
 }
 
+/* The model sometimes copies the clock from the context note into what it passes on
+ * ("friday 20:10 (UTC-04:00)"). Such a time is never the user's; remove it. */
+static char *
+clean_words (const char *text)
+{
+  if (!text)
+    return NULL;
+  g_autofree char *copy = g_strdup (text);
+  char *paren = strstr (copy, "(UTC");
+  if (paren)
+    {
+      char *close = strchr (paren, ')');
+      /* drop a time right before it, and the parenthesis itself */
+      char *start = paren;
+      while (start > copy && start[-1] == ' ')
+        start--;
+      char *t = start;
+      while (t > copy && (g_ascii_isdigit (t[-1]) || t[-1] == ':'))
+        t--;
+      if (t < start && strchr (t, ':') && strchr (t, ':') < start)
+        start = t;
+      memmove (start, close ? close + 1 : paren + strlen (paren), strlen (close ? close + 1 : paren + strlen (paren)) + 1);
+    }
+  return g_strstrip (g_strdup (copy));
+}
+
 /* ---- agenda ------------------------------------------------------------- */
 
 char *
@@ -146,7 +172,8 @@ calendar_tool_add (const char *text, gboolean *ok)
 {
   CalQuick q;
   *ok = FALSE;
-  if (!text || !calendar_quick_parse (text, now_unix (), english (), &q))
+  g_autofree char *clean = clean_words (text);
+  if (!clean || !calendar_quick_parse (clean, now_unix (), english (), &q))
     return g_strdup ("Error: describe the event, for example: dentist tomorrow 3pm.");
   if (!*q.title)
     {
@@ -279,7 +306,7 @@ calendar_tool_change (const char *event, const char *new_time, const char *new_t
       matches_free (&m);
       return g_steal_pointer (&problem);
     }
-  g_autofree char *time_text = g_strstrip (g_strdup (new_time ? new_time : ""));
+  g_autofree char *time_text = clean_words (new_time ? new_time : "");
   gboolean has_time = *time_text != 0;
   gboolean has_title = new_title && *new_title;
   gboolean has_place = new_location && *new_location;

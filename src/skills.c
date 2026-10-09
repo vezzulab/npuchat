@@ -161,34 +161,27 @@ skills_build_tools (JsonBuilder *b, gboolean (*enabled) (const char *id, gpointe
                       "space, load and the NPU. Use it when the user asks about their computer.", NULL, NULL);
       else if (g_str_equal (id, "calendar"))
         {
-          add_function (b, "calendar_agenda",
-                        "List the events in the user's calendar. Use it for any question about their schedule, "
-                        "agenda, appointments or free time.",
-                        "when", "today, tomorrow, week, next week, month, or a date like 2026-10-09");
+          /* short on purpose: every word here is sent to the model with each new chat */
+          add_function (b, "calendar_agenda", "List calendar events.", "when", "today, tomorrow, week, next week, month or YYYY-MM-DD");
           add_function (b, "calendar_add",
-                        "Add an event or a reminder to the user's calendar. Pass it exactly as the user said it, with "
-                        "its day, time, repeat and alert, for example: dentist tomorrow 3pm, or: remind me to pay rent "
-                        "friday, or: gym every monday 6am. Do not work out dates yourself.",
-                        "event", "The event in the user's own words");
-          add_function (b, "calendar_find", "Search the calendar for events by name.", "query", "Part of the event's name");
+                        "Add an event or reminder. Pass the user's own words: dentist tomorrow 3pm | remind me to pay rent friday | gym every monday 6am.",
+                        "event", "In the user's words");
+          add_function (b, "calendar_find", "Search events by name.", "query", "Part of the name");
           static const ParamSpec change[] = {
-            { "event", "Part of the name of the event to change", TRUE },
-            { "new_time", "The new day and time as the user said it, for example: friday 4pm", FALSE },
-            { "new_title", "A new name for the event", FALSE },
-            { "new_location", "A new place for the event", FALSE },
+            { "event", "Part of its name", TRUE },
+            { "new_time", "For example: friday 4pm", FALSE },
+            { "new_title", "New name", FALSE },
+            { "new_location", "New place", FALSE },
           };
-          add_function_params (b, "calendar_change", "Change an event: move it to another time, rename it or change its place.", change,
-                               G_N_ELEMENTS (change));
-          add_function (b, "calendar_delete", "Delete an event from the calendar. The user can undo it.", "event",
-                        "Part of the name of the event to delete");
-          add_function (b, "calendar_undo", "Bring back the event that was deleted last.", NULL, NULL);
+          add_function_params (b, "calendar_change", "Move, rename or change the place of an event.", change, G_N_ELEMENTS (change));
+          add_function (b, "calendar_delete", "Delete an event (undoable). Do not search first.", "event", "Part of its name");
+          add_function (b, "calendar_undo", "Undo: restore the last deleted event.", NULL, NULL);
           static const ParamSpec free_params[] = {
-            { "minutes", "How long a gap is needed, in minutes", TRUE },
+            { "minutes", "Length of the gap", TRUE },
             { "when", "today, tomorrow, week, next week or a date", FALSE },
           };
-          add_function_params (b, "calendar_free", "Find free time in the user's calendar, for example to schedule something.",
-                               free_params, G_N_ELEMENTS (free_params));
-          add_function (b, "calendar_done", "Mark a reminder as done.", "event", "Part of the reminder's name");
+          add_function_params (b, "calendar_free", "Find free time.", free_params, G_N_ELEMENTS (free_params));
+          add_function (b, "calendar_done", "The user finished a reminder: mark it done.", "event", "Part of its name");
         }
       else if (g_str_equal (id, "wikipedia"))
         add_function (b, id,
@@ -532,10 +525,10 @@ skills_instructions (gboolean (*enabled) (const char *id, gpointer data), gpoint
     g_string_append (s, " Call system_status for questions about this computer; battery and memory change, "
                         "so never reuse an earlier value.");
   if (enabled ("calendar", data))
-    g_string_append (s, " For the calendar you MUST call a tool, never answer from memory: calendar_agenda for any question "
-                        "about their schedule, calendar_add to add or remember an event or reminder, calendar_change to "
-                        "move or rename one, calendar_delete to delete one, calendar_free to find free time. Pass the "
-                        "user's own words, never dates you worked out.");
+    g_string_append (s, " For the calendar always call a tool: calendar_agenda for any question about their schedule, calendar_add "
+                        "to add an event or reminder, calendar_change, calendar_delete, calendar_undo (to undo a delete), "
+                        "calendar_done (when they say they did a reminder) and calendar_free for the rest. Pass the "
+                        "user's own words; never put the current time or dates you worked out.");
   if (enabled ("wikipedia", data))
     g_string_append (s, " You MUST call wikipedia whenever the user asks about a specific person, place, organization "
                         "or event, or says 'search' or 'look up'. Never answer those from memory.");

@@ -130,6 +130,15 @@ main (void)
   g_autofree char *no_free = calendar_tool_free ("700", "tomorrow");
   CHECK (strstr (no_free, "no gap"), "no 15-hour gap: %s", no_free);
 
+  /* a time copied from the context note is not the user's */
+  g_autofree char *leak_when = iso_in (9, "");
+  g_strstrip (leak_when);
+  g_autofree char *leak_text = g_strdup_printf ("pay the water bill %s 20:10 (UTC-04:00)", leak_when);
+  g_autofree char *leaked = calendar_tool_add (leak_text, &ok);
+  CHECK (ok && strstr (leaked, "Pay the water bill") && !strstr (leaked, "20:10") && strstr (leaked, "all day"), "context time removed: %s", leaked);
+  g_autofree char *leak2 = calendar_tool_add ("remind me to call mom friday 20:10 (UTC-04:00)", &ok);
+  CHECK (ok && strstr (leak2, "Call mom") && !strstr (leak2, "20:10") && !strstr (leak2, "UTC"), "and for reminders: %s", leak2);
+
   /* every function survives nonsense */
   g_autofree char *big = g_strnfill (5000, 'x');
   const char *junk[] = { NULL, "", "   ", "\n\n", big, "😀", "'; DROP TABLE", "-1", "99999999999999999999" };
