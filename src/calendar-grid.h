@@ -25,3 +25,4 @@ double     cal_grid_hour_y (GtkWidget *grid, int hour);
 /* For tests: where a time shows up, and a press-drag-release between two points. */
 gboolean   cal_grid_point (GtkWidget *grid, gint64 t, double *x, double *y);
 void       cal_grid_test_drag (GtkWidget *grid, double x0, double y0, double x1, double y1);
+guint      cal_grid_draw_count (GtkWidget *grid);

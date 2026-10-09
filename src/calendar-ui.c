@@ -1725,6 +1725,17 @@ calendar_ui_open (GtkWidget *parent)
 
 /* ---- self-test: drives the real grid the way a mouse would --------------- */
 
+/* Waits until the grid has really been drawn again, so its blocks match what the test just did. */
+static void
+settle (void)
+{
+  guint before = cal_grid_draw_count (U.time_grid);
+  gtk_widget_queue_draw (U.time_grid);
+  gint64 deadline = g_get_monotonic_time () + 3 * G_USEC_PER_SEC;
+  while (cal_grid_draw_count (U.time_grid) == before && g_get_monotonic_time () < deadline)
+    g_main_context_iteration (NULL, TRUE);
+}
+
 static gboolean
 selftest_step (gpointer data)
 {
@@ -1746,12 +1757,8 @@ selftest_step (gpointer data)
   U.mode = VIEW_WEEK;
   U.anchor = today;
   refresh_all ();
-  /* the blocks are laid out during drawing, so give the toolkit a few frames */
-  for (int i = 0; i < 30; i++)
-    g_main_context_iteration (NULL, FALSE);
-  gtk_widget_queue_draw (U.time_grid);
-  for (int i = 0; i < 30; i++)
-    g_main_context_iteration (NULL, FALSE);
+  /* the blocks are laid out during drawing, so wait for a real frame */
+  settle ();
 
   /* move: from the middle of the event to four hours later */
   CHECK (cal_grid_point (U.time_grid, t10 + 1800, &x, &y), "event position");
@@ -1762,8 +1769,7 @@ selftest_step (gpointer data)
   CHECK (ev && ev->end - ev->start == 3600, "move keeps the duration");
 
   /* stretch: drag the bottom edge down one hour */
-  for (int i = 0; i < 30; i++)
-    g_main_context_iteration (NULL, FALSE);
+  settle ();
   gint64 s = ev ? ev->start : t10;
   cal_grid_point (U.time_grid, s + 3600 - 300, &x, &y); /* inside the bottom strip */
   cal_grid_point (U.time_grid, s + 2 * 3600, &x1, &y1);
@@ -1773,8 +1779,7 @@ selftest_step (gpointer data)
   CHECK (ev && ev->start == s, "stretching keeps the start");
 
   /* a plain click must not move anything */
-  for (int i = 0; i < 30; i++)
-    g_main_context_iteration (NULL, FALSE);
+  settle ();
   cal_grid_point (U.time_grid, s + 1800, &x, &y);
   cal_grid_test_drag (U.time_grid, x, y, x + 1, y + 1);
   ev = calendar_find (cal, event_id);

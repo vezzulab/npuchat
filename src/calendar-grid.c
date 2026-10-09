@@ -39,6 +39,7 @@ typedef struct {
   /* proposed result while dragging */
   gint64              ghost_start, ghost_end;
   char               *selected;
+  guint               draws;       /* how many times the grid was drawn, for tests */
 } Grid;
 
 static void
@@ -293,6 +294,7 @@ draw_cb (GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data
 {
   (void) area;
   Grid *g = data;
+  g->draws++;
   GdkRGBA fg;
   gtk_widget_get_color (g->area, &fg);
   double cw = column_width (g);
@@ -722,4 +724,11 @@ cal_grid_test_drag (GtkWidget *grid, double x0, double y0, double x1, double y1)
   on_drag_begin (NULL, x0, y0, g);
   on_drag_update (NULL, x1 - x0, y1 - y0, g);
   on_drag_end (NULL, x1 - x0, y1 - y0, g);
+}
+
+guint
+cal_grid_draw_count (GtkWidget *grid)
+{
+  Grid *g = g_object_get_data (G_OBJECT (grid), "grid");
+  return g->draws;
 }
