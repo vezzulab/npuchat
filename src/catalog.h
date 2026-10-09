@@ -24,7 +24,7 @@ typedef enum {
 void        catalog_describe (const FlmModel *model, ModelInfo *out);
 const char *catalog_family (const char *name);
 ModelFit    catalog_fit (const ModelInfo *model, const SysInfo *sys);
-gboolean    catalog_recommended (const ModelInfo *model);
+gboolean    catalog_recommended (const ModelInfo *model, const SysInfo *sys);
 double      catalog_max_footprint (const SysInfo *sys);
 /* Expected decode speed on this laptop, 0 if unknown. */
 double      catalog_tokens_per_second (const ModelInfo *model);

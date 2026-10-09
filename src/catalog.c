@@ -7,12 +7,22 @@
  * Ryzen AI 5 430, i.e. ~100 GB/s of effective memory bandwidth. */
 #define EFFECTIVE_BANDWIDTH_GBS 100.0
 
-/* RAM kept free for the desktop and other apps. */
-#define SYSTEM_RESERVE_GB 3.5
 /* KV cache and runtime buffers on top of estimated weights. */
 #define RUNTIME_OVERHEAD_GB 1.5
 /* flm's "footprint" already covers the runtime; leave room for the KV cache. */
 #define KV_CACHE_GB 1.0
+
+/* RAM kept free for the desktop and other apps. A real desktop (browser, editor) needs
+ * more margin on a small machine than on a big one. */
+static double
+system_reserve (double ram_gb)
+{
+  if (ram_gb >= 32)
+    return 4.0;
+  if (ram_gb >= 24)
+    return 4.5;
+  return 5.5;
+}
 
 static double
 parse_params (const char *name)
@@ -115,7 +125,7 @@ catalog_fit (const ModelInfo *model, const SysInfo *sys)
   if (!sys->npu_supported)
     return FIT_NO_NPU;
   if (model->ram_gb > 0 && sys->ram_total_gb > 0 &&
-      model->ram_gb > sys->ram_total_gb - SYSTEM_RESERVE_GB)
+      model->ram_gb > sys->ram_total_gb - system_reserve (sys->ram_total_gb))
     return FIT_RAM;
   if (model->size_gb > 0 && sys->disk_free_gb > 0 && model->size_gb * 1.1 > sys->disk_free_gb)
     return FIT_DISK;
@@ -123,16 +133,21 @@ catalog_fit (const ModelInfo *model, const SysInfo *sys)
 }
 
 gboolean
-catalog_recommended (const ModelInfo *model)
+catalog_recommended (const ModelInfo *model, const SysInfo *sys)
 {
   /* The sweet spot for a 16 GB laptop NPU: 7-9B general chat models. */
-  return model->chat && model->params_b >= 7 && model->params_b <= 9.5;
+  if (!model->chat || model->params_b < 7 || model->params_b > 9.5)
+    return FALSE;
+  /* Not when it would take most of this machine's memory. */
+  if (model->ram_gb > 0 && sys->ram_total_gb > 0 && model->ram_gb > sys->ram_total_gb * 0.6)
+    return FALSE;
+  return TRUE;
 }
 
 double
 catalog_max_footprint (const SysInfo *sys)
 {
-  return MAX (sys->ram_total_gb - SYSTEM_RESERVE_GB - KV_CACHE_GB, 0);
+  return MAX (sys->ram_total_gb - system_reserve (sys->ram_total_gb) - KV_CACHE_GB, 0);
 }
 
 double

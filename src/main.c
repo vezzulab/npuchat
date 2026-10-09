@@ -26,7 +26,8 @@
 #include "sysinfo.h"
 
 #define APP_ID "io.github.vezzulab.NpuChat"
-#define IDLE_UNLOAD_SECONDS (10 * 60)
+#define IDLE_UNLOAD_SECONDS (10 * 60)    /* on battery */
+#define IDLE_UNLOAD_SECONDS_AC (30 * 60) /* plugged in */
 
 /* An assistant reply being streamed or shown. root holds a strong ref so the
  * widgets survive if the chat view is cleared while tokens still arrive. */
@@ -490,14 +491,14 @@ idle_unload (gpointer user_data)
   return G_SOURCE_REMOVE;
 }
 
-/* On battery, free the NPU and RAM after a while without use. */
+/* Free the NPU and RAM after a while without use: sooner on battery. */
 static void
 arm_idle_timer (void)
 {
   disarm_idle ();
-  if (A.idle_unload && power_on_battery () && !flm_is_external () &&
-      flm_state () == FLM_READY && !A.reply)
-    A.idle_id = g_timeout_add_seconds (IDLE_UNLOAD_SECONDS, idle_unload, NULL);
+  if (A.idle_unload && !flm_is_external () && flm_state () == FLM_READY && !A.reply)
+    A.idle_id = g_timeout_add_seconds (power_on_battery () ? IDLE_UNLOAD_SECONDS : IDLE_UNLOAD_SECONDS_AC,
+                                       idle_unload, NULL);
 }
 
 static void
@@ -2993,7 +2994,7 @@ badge (const char *text, const char *css)
 }
 
 static GtkWidget *
-available_row (FlmModel *m, const ModelInfo *info)
+available_row (FlmModel *m, const ModelInfo *info, const SysInfo *sys)
 {
   GtkWidget *row = adw_action_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), m->name);
@@ -3011,7 +3012,7 @@ available_row (FlmModel *m, const ModelInfo *info)
   adw_action_row_set_subtitle (ADW_ACTION_ROW (row), sub->str);
   g_object_set_data_full (G_OBJECT (row), "model", g_strdup (m->name), g_free);
 
-  if (catalog_recommended (info))
+  if (catalog_recommended (info, sys))
     adw_action_row_add_suffix (ADW_ACTION_ROW (row), badge (TR ("Recomendado", "Recommended"), "accent"));
 
   GtkWidget *bar = gtk_progress_bar_new ();
@@ -3039,12 +3040,13 @@ typedef struct {
 } Candidate;
 
 static int
-by_recommendation (gconstpointer a, gconstpointer b)
+by_recommendation (gconstpointer a, gconstpointer b, gpointer user_data)
 {
   const Candidate *ca = a;
   const Candidate *cb = b;
-  gboolean ra = catalog_recommended (&ca->info);
-  gboolean rb = catalog_recommended (&cb->info);
+  const SysInfo *sys = user_data;
+  gboolean ra = catalog_recommended (&ca->info, sys);
+  gboolean rb = catalog_recommended (&cb->info, sys);
   if (ra != rb)
     return rb - ra;
   if (ca->info.params_b != cb->info.params_b)
@@ -3082,12 +3084,12 @@ on_available_listed (GPtrArray *models, const char *error, gpointer user_data)
         }
       g_array_append_val (cands, c);
     }
-  g_array_sort (cands, by_recommendation);
+  g_array_sort_with_data (cands, by_recommendation, (gpointer) md->sys);
 
   for (guint i = 0; i < cands->len; i++)
     {
       Candidate *c = &g_array_index (cands, Candidate, i);
-      gtk_list_box_append (md->available, available_row (c->model, &c->info));
+      gtk_list_box_append (md->available, available_row (c->model, &c->info, md->sys));
     }
 
   if (hidden > 0)
@@ -3433,13 +3435,12 @@ on_flm_state (FlmState state, const char *message, gpointer user_data)
 static void
 on_detected (gboolean external, gpointer user_data)
 {
+  (void) external;
   (void) user_data;
   if (A.quitting)
     return;
-  /* Load the last model right away only when plugged in; on battery it
-   * loads on the first message instead. */
-  if (!external && A.model && A.flm_present && !power_on_battery () && memlock_ok ())
-    flm_load (A.model, effective_pmode ());
+  /* The model loads on the first message (ensure_loaded), not at start, so it
+   * does not hold the NPU's memory while the app is only open. */
   update_header (NULL);
 }
 
