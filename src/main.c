@@ -444,6 +444,16 @@ installed_find (const char *name)
   return NULL;
 }
 
+/* A model this machine cannot hold with room to spare is never loaded, however it got here. */
+static gboolean
+model_too_big (const FlmModel *m)
+{
+  ModelInfo info;
+  catalog_describe (m, &info);
+  g_autoptr (SysInfo) sys = sysinfo_get ();
+  return catalog_fit (&info, sys) == FIT_RAM;
+}
+
 static guint
 installed_chat_count (void)
 {
@@ -2797,6 +2807,14 @@ select_model (const char *name)
   if (A.model_button)
     gtk_menu_button_popdown (A.model_button);
 
+  FlmModel *chosen = installed_find (name);
+  if (chosen && model_too_big (chosen))
+    {
+      toast ("%s", TR ("Ese modelo es demasiado grande para la memoria de este equipo.",
+                       "That model is too big for this computer's memory."));
+      return;
+    }
+
   if (g_strcmp0 (name, A.model) == 0 && flm_state () != FLM_ERROR && flm_state () != FLM_STOPPED)
     return;
 
@@ -2884,6 +2902,18 @@ on_installed_listed (GPtrArray *models, const char *error, gpointer user_data)
       flm_stop ();
       g_clear_pointer (&A.model, g_free);
       settings_save ();
+    }
+
+  FlmModel *current = A.model ? installed_find (A.model) : NULL;
+  if (current && model_too_big (current) && !flm_is_external ())
+    {
+      if (A.reply)
+        stop_generation ();
+      flm_stop ();
+      g_clear_pointer (&A.model, g_free);
+      settings_save ();
+      toast ("%s", TR ("El modelo elegido es demasiado grande para la memoria de este equipo y no se cargará. Elige uno más pequeño.",
+                       "The chosen model is too big for this computer's memory and will not be loaded. Pick a smaller one."));
     }
 
   rebuild_picker ();
@@ -3190,6 +3220,8 @@ installed_row (FlmModel *m)
 
   if (g_strcmp0 (m->name, A.model) == 0)
     adw_action_row_add_suffix (ADW_ACTION_ROW (row), badge (TR ("En uso", "In use"), "accent"));
+  else if (info.chat && model_too_big (m))
+    adw_action_row_add_suffix (ADW_ACTION_ROW (row), badge (TR ("Demasiado grande", "Too big"), NULL));
   else if (info.chat)
     {
       GtkWidget *use = gtk_button_new_with_label (TR ("Usar", "Use"));
