@@ -49,6 +49,10 @@ test_spanish (void)
   check ("cena con Ana el viernes a las 8", "Cena con Ana", at (2026, 10, 9, 20, 0), at (2026, 10, 9, 21, 0), FALSE, CAL_REPEAT_NONE, FALSE);
   check ("reunión el viernes a las 8", "Reunión", at (2026, 10, 9, 8, 0), at (2026, 10, 9, 9, 0), FALSE, CAL_REPEAT_NONE, FALSE);
   check ("llamar a mamá el sábado 10:00", "Llamar a mamá", at (2026, 10, 10, 10, 0), at (2026, 10, 10, 11, 0), FALSE, CAL_REPEAT_NONE, FALSE);
+  check ("Comprar regalos viernes 16 de octubre", "Comprar regalos", at (2026, 10, 16, 0, 0), at (2026, 10, 17, 0, 0), TRUE, CAL_REPEAT_NONE, FALSE);
+  check ("regalos jueves, 15 de octubre de 2026", "Regalos", at (2026, 10, 15, 0, 0), at (2026, 10, 16, 0, 0), TRUE, CAL_REPEAT_NONE, FALSE);
+  check ("regalos 15 de octubre 2026", "Regalos", at (2026, 10, 15, 0, 0), at (2026, 10, 16, 0, 0), TRUE, CAL_REPEAT_NONE, FALSE);
+  check ("regalos para Evelyn el día 15", "Regalos para Evelyn", at (2026, 10, 15, 0, 0), at (2026, 10, 16, 0, 0), TRUE, CAL_REPEAT_NONE, FALSE);
   check ("entrega pasado mañana", "Entrega", at (2026, 10, 10, 0, 0), at (2026, 10, 11, 0, 0), TRUE, CAL_REPEAT_NONE, FALSE);
   check ("médico el próximo martes a las 11 de la mañana", "Médico", at (2026, 10, 13, 11, 0), at (2026, 10, 13, 12, 0), FALSE, CAL_REPEAT_NONE, FALSE);
 }
@@ -56,6 +60,7 @@ test_spanish (void)
 static void
 test_english (void)
 {
+  check ("gifts friday october 16 2026", "Gifts", at (2026, 10, 16, 0, 0), at (2026, 10, 17, 0, 0), TRUE, CAL_REPEAT_NONE, TRUE);
   check ("lunch with Sam tomorrow at noon", "Lunch with Sam", at (2026, 10, 9, 12, 0), at (2026, 10, 9, 13, 0), FALSE, CAL_REPEAT_NONE, TRUE);
   check ("meeting friday from 2 to 3pm", "Meeting", at (2026, 10, 9, 14, 0), at (2026, 10, 9, 15, 0), FALSE, CAL_REPEAT_NONE, TRUE);
   check ("dentist oct 20 4pm", "Dentist", at (2026, 10, 20, 16, 0), at (2026, 10, 20, 17, 0), FALSE, CAL_REPEAT_NONE, TRUE);

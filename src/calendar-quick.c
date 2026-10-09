@@ -134,6 +134,31 @@ all_digits (const char *t, int max_len)
   return TRUE;
 }
 
+/* a four digit year at k, optionally after "de": how many words it takes (0: none) */
+static guint
+year_at (const Words *w, guint k, int *year)
+{
+  guint skip = is (w, k, "de", NULL, NULL, NULL) ? 1 : 0;
+  if (k + skip < w->n && !w->used[k + skip] && all_digits (w->norm[k + skip], 4) && strlen (w->norm[k + skip]) == 4)
+    {
+      *year = atoi (w->norm[k + skip]);
+      return skip + 1;
+    }
+  return 0;
+}
+
+/* "16 de octubre", "16 octubre", "october 16": a day and month start at k */
+static gboolean
+date_starts_at (const Words *w, guint k)
+{
+  if (k + 1 >= w->n || w->used[k])
+    return FALSE;
+  const char *t = w->norm[k];
+  if (all_digits (t, 2))
+    return month_of (w->norm[k + 1]) || (k + 2 < w->n && is (w, k + 1, "de", NULL, NULL, NULL) && month_of (w->norm[k + 2]));
+  return month_of (t) && strlen (t) >= 3 && all_digits (w->norm[k + 1], 2);
+}
+
 /* ---- clocks ------------------------------------------------------------- */
 
 typedef struct {
@@ -148,6 +173,8 @@ parse_clock (const char *t, Clock *c)
 {
   int h, m = 0;
   char suffix[4] = "";
+  if (strspn (t, "0123456789") > 2) /* "2026" is a year, not 20:26 */
+    return FALSE;
   int n = sscanf (t, "%2d:%2d%3s", &h, &m, suffix);
   if (n >= 2)
     c->sure = TRUE;
@@ -639,6 +666,11 @@ calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQui
           day = add_days (today, diff);
           use (&w, i, 2);
         }
+      else if (weekday_of (t) >= 0 && date_starts_at (&w, i + 1))
+        {
+          /* "friday 16 october": the date decides, the weekday is only a label */
+          use (&w, i, 1);
+        }
       else if (weekday_of (t) >= 0 && (strlen (t) > 3 || (i > 0 && is (&w, i - 1, "el", "on", NULL, NULL))))
         {
           int diff = (weekday_of (t) - dow_of (today) + 7) % 7;
@@ -650,12 +682,7 @@ calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQui
       else if (all_digits (t, 2) && i + 2 < w.n && is (&w, i + 1, "de", NULL, NULL, NULL) && !w.used[i + 2] && month_of (w.norm[i + 2]))
         {
           int year = 0;
-          guint len = 3;
-          if (i + 4 < w.n && is (&w, i + 3, "de", NULL, NULL, NULL) && all_digits (w.norm[i + 4], 4) && strlen (w.norm[i + 4]) == 4)
-            {
-              year = atoi (w.norm[i + 4]);
-              len = 5;
-            }
+          guint len = 3 + year_at (&w, i + 3, &year);
           day = month_day (today, month_of (w.norm[i + 2]), atoi (t), year);
           use (&w, i, len);
           if (i > 0 && is (&w, i - 1, "el", NULL, NULL, NULL))
@@ -663,13 +690,17 @@ calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQui
         }
       else if (month_of (t) && strlen (t) >= 3 && i + 1 < w.n && !w.used[i + 1] && all_digits (w.norm[i + 1], 2))
         {
-          day = month_day (today, month_of (t), atoi (w.norm[i + 1]), 0);
-          use (&w, i, 2);
+          int year = 0;
+          guint len = 2 + year_at (&w, i + 2, &year);
+          day = month_day (today, month_of (t), atoi (w.norm[i + 1]), year);
+          use (&w, i, len);
         }
       else if (all_digits (t, 2) && i + 1 < w.n && !w.used[i + 1] && month_of (w.norm[i + 1]) && strlen (w.norm[i + 1]) >= 3)
         {
-          day = month_day (today, month_of (w.norm[i + 1]), atoi (t), 0);
-          use (&w, i, 2);
+          int year = 0;
+          guint len = 2 + year_at (&w, i + 2, &year);
+          day = month_day (today, month_of (w.norm[i + 1]), atoi (t), year);
+          use (&w, i, len);
         }
       else
         {
@@ -702,6 +733,12 @@ calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQui
                   day = month_day (today, mm, dd, cnt == 3 ? y : 0);
                   use (&w, i, 1);
                 }
+            }
+          else if (i > 1 && is (&w, i - 1, "dia", "day", NULL, NULL) && is (&w, i - 2, "el", "the", NULL, NULL) &&
+                   all_digits (t, 2) && atoi (t) >= 1 && atoi (t) <= 31)
+            {
+              day = next_day_of_month (today, atoi (t));
+              use (&w, i - 2, 3);
             }
           else if (i > 0 && is (&w, i - 1, "el", NULL, NULL, NULL) && all_digits (t, 2) && atoi (t) >= 1 && atoi (t) <= 31)
             {
