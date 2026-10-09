@@ -583,6 +583,16 @@ calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQui
       day = at_clock (today, h, start_c.m) > now ? today : add_days (today, 1);
     }
 
+  /* "dinner at 8" means 8 in the evening: the word in the title decides a bare hour */
+  if (have_time && !start_c.sure && !start_c.ampm && !hint_start)
+    {
+      static const char *evening[] = { "cena", "cenar", "cenamos", "dinner", "supper", "noche", "night", "tonight", "evening", "nocturna" };
+      for (guint i = 0; i < w.n && !hint_start; i++)
+        for (guint k = 0; k < G_N_ELEMENTS (evening); k++)
+          if (g_str_equal (w.norm[i], evening[k]) && start_c.h >= 5 && start_c.h <= 11)
+            hint_start = 2;
+    }
+
   /* assemble */
   gint64 start, end;
   gboolean all_day = !have_time;

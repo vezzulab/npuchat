@@ -46,6 +46,9 @@ test_spanish (void)
   check ("clase de inglés martes 8 de la noche", "Clase de inglés", at (2026, 10, 13, 20, 0), at (2026, 10, 13, 21, 0), FALSE, CAL_REPEAT_NONE, FALSE);
   check ("doctor en 3 días 9:30", "Doctor", at (2026, 10, 11, 9, 30), at (2026, 10, 11, 10, 30), FALSE, CAL_REPEAT_NONE, FALSE);
   check ("cumpleaños de Luis 25/12 todos los años", "Cumpleaños de Luis", at (2026, 12, 25, 0, 0), at (2026, 12, 26, 0, 0), TRUE, CAL_REPEAT_YEARLY, FALSE);
+  check ("cena con Ana el viernes a las 8", "Cena con Ana", at (2026, 10, 9, 20, 0), at (2026, 10, 9, 21, 0), FALSE, CAL_REPEAT_NONE, FALSE);
+  check ("reunión el viernes a las 8", "Reunión", at (2026, 10, 9, 8, 0), at (2026, 10, 9, 9, 0), FALSE, CAL_REPEAT_NONE, FALSE);
+  check ("llamar a mamá el sábado 10:00", "Llamar a mamá", at (2026, 10, 10, 10, 0), at (2026, 10, 10, 11, 0), FALSE, CAL_REPEAT_NONE, FALSE);
   check ("entrega pasado mañana", "Entrega", at (2026, 10, 10, 0, 0), at (2026, 10, 11, 0, 0), TRUE, CAL_REPEAT_NONE, FALSE);
   check ("médico el próximo martes a las 11 de la mañana", "Médico", at (2026, 10, 13, 11, 0), at (2026, 10, 13, 12, 0), FALSE, CAL_REPEAT_NONE, FALSE);
 }
@@ -62,6 +65,7 @@ test_english (void)
   check ("review 10/20 11am", "Review", at (2026, 10, 20, 11, 0), at (2026, 10, 20, 12, 0), FALSE, CAL_REPEAT_NONE, TRUE);
   check ("Party Feb 6", "Party", at (2027, 2, 6, 0, 0), at (2027, 2, 7, 0, 0), TRUE, CAL_REPEAT_NONE, TRUE);
   check ("workout tomorrow 7am 1h30", "Workout", at (2026, 10, 9, 7, 0), at (2026, 10, 9, 8, 30), FALSE, CAL_REPEAT_NONE, TRUE);
+  check ("dinner with Sam friday at 8", "Dinner with Sam", at (2026, 10, 9, 20, 0), at (2026, 10, 9, 21, 0), FALSE, CAL_REPEAT_NONE, TRUE);
   check ("meeting at 3", "Meeting", at (2026, 10, 8, 15, 0), at (2026, 10, 8, 16, 0), FALSE, CAL_REPEAT_NONE, TRUE);
   check ("standup at 9am", "Standup", at (2026, 10, 9, 9, 0), at (2026, 10, 9, 10, 0), FALSE, CAL_REPEAT_NONE, TRUE);
   check ("coffee with Dana thursday 10-11am", "Coffee with Dana", at (2026, 10, 8, 10, 0), at (2026, 10, 8, 11, 0), FALSE, CAL_REPEAT_NONE, TRUE);
