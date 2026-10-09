@@ -27,7 +27,7 @@ resources = gnome.compile_resources('resources',
 executable('npu-chat',
   'src/main.c', 'src/flm.c', 'src/markdown.c', 'src/i18n.c',
   'src/sysinfo.c', 'src/catalog.c', 'src/store.c', 'src/power.c',
-  'src/assistants.c', 'src/templates.c', 'src/updater.c', 'src/rag.c', 'src/net.c', 'src/skills.c', 'src/copilotkey.c', 'src/calendar.c', 'src/calendar-ui.c', 'src/calendar-grid.c', 'src/calendar-quick.c', 'src/calendar-alerts.c',
+  'src/assistants.c', 'src/templates.c', 'src/updater.c', 'src/rag.c', 'src/net.c', 'src/skills.c', 'src/copilotkey.c', 'src/launcher.c', 'src/calendar.c', 'src/calendar-ui.c', 'src/calendar-grid.c', 'src/calendar-quick.c', 'src/calendar-alerts.c',
   'src/calendar-settings.c', 'src/calendar-ics.c', 'src/calendar-print.c', 'src/calendar-subscribe.c', 'src/calendar-tools.c', 'src/calendar-caldav.c', 'src/calendar-accounts.c',
   resources,
   dependencies: deps,
@@ -35,7 +35,7 @@ executable('npu-chat',
 
 install_data('data/io.github.vezzulab.NpuChat.desktop',
   install_dir: get_option('datadir') / 'applications')
-install_data('data/io.github.vezzulab.NpuChat.svg',
+install_data('data/io.github.vezzulab.NpuChat.svg', 'data/io.github.vezzulab.NpuChat.Calendar.svg',
   install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'apps')
 
 if get_option('tests')

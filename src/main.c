@@ -20,6 +20,7 @@
 #include "calendar-subscribe.h"
 #include "calendar-caldav.h"
 #include "calendar-ui.h"
+#include "launcher.h"
 #include "store.h"
 #include "templates.h"
 #include "updater.h"
@@ -3973,7 +3974,19 @@ static void act_new_chat (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_AC
 static void act_models (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_models_dialog (FALSE); }
 static void act_download (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_models_dialog (TRUE); }
 static void act_skills (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_skills_dialog (); }
-static void act_calendar (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; calendar_ui_open (GTK_WIDGET (A.win)); }
+static GtkWindow *calendar_win;    /* the calendar on its own, when NPU Chat was started with --calendar */
+static gboolean   calendar_first;  /* started with --calendar: the first activation shows only the calendar */
+
+static void
+act_calendar (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  UNUSED_ACTION_ARGS;
+  /* the calendar has one view: if it already has a window of its own, bring that forward */
+  if (calendar_win)
+    gtk_window_present (calendar_win);
+  else
+    calendar_ui_open (GTK_WIDGET (A.win));
+}
 static void act_prefs (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; open_preferences (); }
 static void act_refresh (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; refresh_models (); }
 static void act_retry (GSimpleAction *a, GVariant *p, gpointer d) { UNUSED_ACTION_ARGS; ensure_loaded (); }
@@ -6024,6 +6037,62 @@ on_shutdown (GApplication *app, gpointer user_data)
 #endif
 }
 
+/* What both the chat and the calendar-only window need: settings, language, theme, styles,
+ * and the calendar's background work (alerts, subscriptions, sync). Runs once. */
+static void
+start_base (GApplication *app)
+{
+  static gboolean done;
+  if (done)
+    return;
+  done = TRUE;
+
+  settings_load ();
+  calendar_alerts_set_icon ("io.github.vezzulab.NpuChat");
+  calendar_alerts_start (app);
+  calendar_subscriptions_start (calendar_ui_refresh);
+  caldav_sync_start (calendar_ui_refresh);
+  i18n_set (A.lang);
+  apply_theme ();
+  launcher_install_calendar_entry (g_getenv ("APPIMAGE"), g_getenv ("APPDIR"), g_get_user_data_dir ());
+
+  GtkCssProvider *css = gtk_css_provider_new ();
+  gtk_css_provider_load_from_resource (css, "/io/github/vezzulab/NpuChat/style.css");
+  gtk_style_context_add_provider_for_display (gdk_display_get_default (), GTK_STYLE_PROVIDER (css),
+                                              GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+  g_object_unref (css);
+  gtk_icon_theme_add_resource_path (gtk_icon_theme_get_for_display (gdk_display_get_default ()),
+                                    "/io/github/vezzulab/NpuChat/icons");
+}
+
+static void
+on_calendar_win_destroy (GtkWidget *w, gpointer user_data)
+{
+  (void) w;
+  (void) user_data;
+  calendar_ui_forget ();
+  calendar_win = NULL;
+}
+
+/* The calendar alone, in a window of its own: no chat, no model. */
+static void
+show_calendar_window (GApplication *app)
+{
+  if (calendar_win)
+    {
+      gtk_window_present (calendar_win);
+      return;
+    }
+  start_base (app);
+  calendar_win = GTK_WINDOW (adw_application_window_new (GTK_APPLICATION (app)));
+  gtk_window_set_title (calendar_win, TR ("Calendario", "Calendar"));
+  gtk_window_set_icon_name (calendar_win, "io.github.vezzulab.NpuChat.Calendar");
+  gtk_window_set_default_size (calendar_win, 1200, 800);
+  adw_application_window_set_content (ADW_APPLICATION_WINDOW (calendar_win), calendar_ui_view_new ());
+  g_signal_connect (calendar_win, "destroy", G_CALLBACK (on_calendar_win_destroy), NULL);
+  gtk_window_present (calendar_win);
+}
+
 static void
 on_activate (GApplication *app, gpointer user_data)
 {
@@ -6037,21 +6106,17 @@ on_activate (GApplication *app, gpointer user_data)
       return;
     }
 
-  settings_load ();
-  calendar_alerts_set_icon ("io.github.vezzulab.NpuChat");
-  calendar_alerts_start (G_APPLICATION (app));
-  calendar_subscriptions_start (calendar_ui_refresh);
-  caldav_sync_start (calendar_ui_refresh);
-  i18n_set (A.lang);
-  apply_theme ();
+  if (calendar_first)
+    {
+      calendar_first = FALSE;
+      show_calendar_window (app);
+      return;
+    }
+  /* opened as plain NPU Chat while only the calendar was up: the chat takes its place */
+  if (calendar_win)
+    gtk_window_destroy (calendar_win);
 
-  GtkCssProvider *css = gtk_css_provider_new ();
-  gtk_css_provider_load_from_resource (css, "/io/github/vezzulab/NpuChat/style.css");
-  gtk_style_context_add_provider_for_display (gdk_display_get_default (), GTK_STYLE_PROVIDER (css),
-                                              GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-  g_object_unref (css);
-  gtk_icon_theme_add_resource_path (gtk_icon_theme_get_for_display (gdk_display_get_default ()),
-                                    "/io/github/vezzulab/NpuChat/icons");
+  start_base (app);
 
   A.http_error = g_string_new (NULL);
   A.pulling = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
@@ -6379,10 +6444,47 @@ selftest_tick (gpointer user_data)
 }
 #endif
 
+/* "Calendar" in the application menu starts NPU Chat with --calendar. */
+static void
+act_open_calendar (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  UNUSED_ACTION_ARGS;
+  GApplication *app = g_application_get_default ();
+  if (A.win)
+    calendar_ui_open (GTK_WIDGET (A.win));
+  else
+    show_calendar_window (app);
+}
+
+static gint
+on_local_options (GApplication *app, GVariantDict *options, gpointer user_data)
+{
+  (void) user_data;
+  if (!g_variant_dict_contains (options, "calendar"))
+    return -1;
+
+  g_autoptr (GError) error = NULL;
+  if (g_application_register (app, NULL, &error) && g_application_get_is_remote (app))
+    {
+      /* NPU Chat is already running: ask it to show the calendar, then leave */
+      g_action_group_activate_action (G_ACTION_GROUP (app), "open-calendar", NULL);
+      return 0;
+    }
+  calendar_first = TRUE;
+  return -1;
+}
+
 int
 main (int argc, char **argv)
 {
   g_autoptr (AdwApplication) app = adw_application_new (APP_ID, G_APPLICATION_DEFAULT_FLAGS);
+  g_application_add_main_option (G_APPLICATION (app), "calendar", 0, G_OPTION_FLAG_NONE, G_OPTION_ARG_NONE,
+                                 "Open only the calendar", NULL);
+  const GActionEntry app_actions[] = {
+    { "open-calendar", act_open_calendar, NULL, NULL, NULL, { 0 } },
+  };
+  g_action_map_add_action_entries (G_ACTION_MAP (app), app_actions, G_N_ELEMENTS (app_actions), NULL);
+  g_signal_connect (app, "handle-local-options", G_CALLBACK (on_local_options), NULL);
   g_signal_connect (app, "activate", G_CALLBACK (on_activate), NULL);
   g_signal_connect (app, "shutdown", G_CALLBACK (on_shutdown), NULL);
   return g_application_run (G_APPLICATION (app), argc, argv);

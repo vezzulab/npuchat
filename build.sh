@@ -23,5 +23,7 @@ sed "s|^Exec=.*|Exec=$HOME/.local/bin/npu-chat|" data/io.github.vezzulab.NpuChat
   > ~/.local/share/applications/io.github.vezzulab.NpuChat.desktop
 install -Dm644 data/io.github.vezzulab.NpuChat.svg \
   ~/.local/share/icons/hicolor/scalable/apps/io.github.vezzulab.NpuChat.svg
+install -Dm644 data/io.github.vezzulab.NpuChat.Calendar.svg \
+  ~/.local/share/icons/hicolor/scalable/apps/io.github.vezzulab.NpuChat.Calendar.svg
 command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true
 echo "Installed: run 'npu-chat' or open NPU Chat from the app menu."
