@@ -5,7 +5,11 @@
 
 #include "calendar-alerts.h"
 #include "calendar-grid.h"
+#include "calendar-ics.h"
+#include "calendar-print.h"
+#include "calendar-subscribe.h"
 #include "calendar-quick.h"
+#include "calendar-settings.h"
 #include "calendar.h"
 #include "i18n.h"
 #include "selftest.h"
@@ -25,7 +29,7 @@ static struct {
   GtkWidget *toggle[4];
   GtkWidget *stack;
   /* month */
-  GtkWidget *month_weekdays, *month_grid, *year_grid;
+  GtkWidget *month_weekdays, *month_grid, *month_wn, *year_grid;
   /* week and day */
   GtkWidget *week_head, *week_allday, *time_grid, *scroller;
   /* sidebar */
@@ -36,35 +40,28 @@ static struct {
   gboolean   scrolled;
 } U;
 
+static char *sel_id;          /* the event picked last in the month view or a popover */
+static gint64 sel_occ;
+static CalEvent *clipboard_event;
+static void (*background_handler) (gboolean background, gboolean autostart);
 static gboolean standalone;   /* its own window, so it carries its own settings */
 static char *editor_title_hint;  /* a title typed in quick entry, for the full editor */
 
 static void free_data (gpointer data, GClosure *closure) { (void) closure; g_free (data); }
 
 static void refresh_all (void);
+static void print_view (void);
+static void refresh_done (const char *calendar_id, guint events, const char *error, gpointer data);
 static void open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 end);
 
 /* ---- appearance: system, light or dark (the standalone app keeps its own) -- */
 
-static char *
-settings_path (void)
-{
-  return g_build_filename (g_get_user_config_dir (), "calendar", "settings.ini", NULL);
-}
 
 static const char *
 saved_theme (void)
 {
-  static char value[16];
-  g_autoptr (GKeyFile) kf = g_key_file_new ();
-  g_autofree char *path = settings_path ();
-  g_autofree char *v = NULL;
-  if (g_key_file_load_from_file (kf, path, G_KEY_FILE_NONE, NULL))
-    v = g_key_file_get_string (kf, "calendar", "theme", NULL);
-  g_strlcpy (value, v ? v : "system", sizeof value);
-  return value;
+  return calendar_settings ()->theme;
 }
-
 static void
 apply_theme (const char *theme)
 {
@@ -74,20 +71,10 @@ apply_theme (const char *theme)
                                                                          : ADW_COLOR_SCHEME_DEFAULT);
 }
 
-static void
-on_theme_toggled (GtkToggleButton *b, gpointer data)
+void
+calendar_ui_set_background_handler (void (*handler) (gboolean, gboolean))
 {
-  if (!gtk_toggle_button_get_active (b))
-    return;
-  const char *theme = data;
-  apply_theme (theme);
-  g_autoptr (GKeyFile) kf = g_key_file_new ();
-  g_autofree char *path = settings_path ();
-  g_key_file_load_from_file (kf, path, G_KEY_FILE_NONE, NULL);
-  g_key_file_set_string (kf, "calendar", "theme", theme);
-  g_autofree char *dir = g_path_get_dirname (path);
-  g_mkdir_with_parents (dir, 0700);
-  g_key_file_save_to_file (kf, path, NULL);
+  background_handler = handler;
 }
 
 void
@@ -120,9 +107,13 @@ english (void)
 static int
 week_start (void)
 {
+  const CalSettings *cs = calendar_settings ();
+  if (cs->days == 5)
+    return 0;                        /* Monday to Friday always starts on Monday */
+  if (cs->first_day)
+    return cs->first_day - 1;
   return english () ? 6 : 0;
 }
-
 static GDateTime *
 local_dt (gint64 t)
 {
@@ -429,11 +420,27 @@ on_pop_delete (GtkButton *b, gpointer data)
 }
 
 static void
+on_pop_done (GtkButton *b, gpointer data)
+{
+  (void) b;
+  GtkPopover *pop = data;
+  PopData *d = g_object_get_data (G_OBJECT (pop), "pop");
+  const CalEvent *ev = calendar_find (calendar_default (), d->id);
+  gtk_popover_popdown (pop);
+  if (ev)
+    calendar_set_done (calendar_default (), d->id, d->occ_start, !calendar_is_done (ev, d->occ_start));
+  refresh_all ();
+}
+
+static void
 show_event_popover (const char *id, gint64 occ_start, GtkWidget *parent, GdkRectangle *where)
 {
   const CalEvent *ev = calendar_find (calendar_default (), id);
   if (!ev)
     return;
+  g_free (sel_id);
+  sel_id = g_strdup (id);
+  sel_occ = occ_start;
   GtkWidget *pop = gtk_popover_new ();
   PopData *d = g_new0 (PopData, 1);
   d->id = g_strdup (id);
@@ -445,7 +452,7 @@ show_event_popover (const char *id, gint64 occ_start, GtkWidget *parent, GdkRect
   gtk_widget_set_margin_end (box, 6);
   gtk_widget_set_margin_top (box, 6);
   gtk_widget_set_margin_bottom (box, 6);
-  gtk_widget_set_size_request (box, 240, -1);
+  gtk_widget_set_size_request (box, 250, -1);
 
   GtkWidget *head = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
   GtkWidget *bar = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
@@ -462,9 +469,15 @@ show_event_popover (const char *id, gint64 occ_start, GtkWidget *parent, GdkRect
 
   CalOccurrence o = { ev, occ_start, occ_start + (ev->end - ev->start) };
   g_autofree char *day = format_day (occ_start);
-  g_autofree char *when = time_text (&o);
+  g_autofree char *when_text = time_text (&o);
+  if (ev->end - ev->start > 86400 || (!ev->all_day && calendar_day_start (o.end - 1) != calendar_day_start (occ_start)))
+    {
+      g_autofree char *last = format_day (o.end - 1);
+      g_free (when_text);
+      when_text = ev->all_day ? g_strdup_printf ("%s → %s", day, last) : g_strdup_printf ("→ %s", last);
+    }
   const char *rep = repeat_label (ev->repeat);
-  g_autofree char *line = rep ? g_strdup_printf ("%s\n%s · %s", day, when, rep) : g_strdup_printf ("%s\n%s", day, when);
+  g_autofree char *line = rep ? g_strdup_printf ("%s\n%s · %s", day, when_text, rep) : g_strdup_printf ("%s\n%s", day, when_text);
   GtkWidget *l = gtk_label_new (line);
   gtk_label_set_xalign (GTK_LABEL (l), 0);
   gtk_box_append (GTK_BOX (box), l);
@@ -475,6 +488,16 @@ show_event_popover (const char *id, gint64 occ_start, GtkWidget *parent, GdkRect
   gtk_label_set_xalign (GTK_LABEL (cl), 0);
   gtk_label_set_wrap (GTK_LABEL (cl), TRUE);
   gtk_box_append (GTK_BOX (box), cl);
+  if (*ev->url)
+    {
+      g_autofree char *markup = g_markup_printf_escaped ("<a href=\"%s\">%s</a>", ev->url, ev->url);
+      GtkWidget *ul = gtk_label_new (NULL);
+      gtk_label_set_markup (GTK_LABEL (ul), markup);
+      gtk_label_set_xalign (GTK_LABEL (ul), 0);
+      gtk_label_set_ellipsize (GTK_LABEL (ul), PANGO_ELLIPSIZE_END);
+      gtk_label_set_max_width_chars (GTK_LABEL (ul), 34);
+      gtk_box_append (GTK_BOX (box), ul);
+    }
   if (*ev->notes)
     {
       GtkWidget *nl = gtk_label_new (ev->notes);
@@ -486,15 +509,26 @@ show_event_popover (const char *id, gint64 occ_start, GtkWidget *parent, GdkRect
 
   GtkWidget *actions = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
   gtk_widget_set_margin_top (actions, 6);
-  GtkWidget *edit = gtk_button_new_with_label (TR ("Editar", "Edit"));
-  gtk_widget_set_hexpand (edit, TRUE);
-  g_signal_connect (edit, "clicked", G_CALLBACK (on_pop_edit), pop);
-  GtkWidget *del = gtk_button_new_with_label (TR ("Borrar", "Delete"));
-  gtk_widget_add_css_class (del, "destructive-action");
-  g_signal_connect (del, "clicked", G_CALLBACK (on_pop_delete), pop);
-  gtk_box_append (GTK_BOX (actions), edit);
-  gtk_box_append (GTK_BOX (actions), del);
-  gtk_box_append (GTK_BOX (box), actions);
+  if (ev->reminder)
+    {
+      GtkWidget *done = gtk_button_new_with_label (calendar_is_done (ev, occ_start) ? TR ("Marcar pendiente", "Mark not done")
+                                                                                    : TR ("Marcar como hecho", "Mark done"));
+      gtk_widget_set_hexpand (done, TRUE);
+      g_signal_connect (done, "clicked", G_CALLBACK (on_pop_done), pop);
+      gtk_box_append (GTK_BOX (box), done);
+    }
+  if (!calendar_of (ev)->url)
+    {
+      GtkWidget *edit = gtk_button_new_with_label (TR ("Editar", "Edit"));
+      gtk_widget_set_hexpand (edit, TRUE);
+      g_signal_connect (edit, "clicked", G_CALLBACK (on_pop_edit), pop);
+      GtkWidget *del = gtk_button_new_with_label (TR ("Borrar", "Delete"));
+      gtk_widget_add_css_class (del, "destructive-action");
+      g_signal_connect (del, "clicked", G_CALLBACK (on_pop_delete), pop);
+      gtk_box_append (GTK_BOX (actions), edit);
+      gtk_box_append (GTK_BOX (actions), del);
+      gtk_box_append (GTK_BOX (box), actions);
+    }
 
   gtk_popover_set_child (GTK_POPOVER (pop), box);
   gtk_widget_set_parent (pop, parent);
@@ -503,60 +537,159 @@ show_event_popover (const char *id, gint64 occ_start, GtkWidget *parent, GdkRect
   g_signal_connect (pop, "closed", G_CALLBACK (on_popover_closed), NULL);
   gtk_popover_popup (GTK_POPOVER (pop));
 }
-
 /* ---- event editor ------------------------------------------------------- */
 
-static const int alert_minutes[] = { CAL_NO_ALERT, 0, 5, 10, 15, 30, 60, 1440 };
+static const int alert_minutes[] = { -1, 0, 5, 10, 15, 30, 60, 120, 1440, 2880, 10080 };
+
+static GtkStringList *
+alert_choices (void)
+{
+  const char *items[] = { TR ("Ninguno", "None"), TR ("A la hora del evento", "At time of event"),
+                          TR ("5 minutos antes", "5 minutes before"), TR ("10 minutos antes", "10 minutes before"),
+                          TR ("15 minutos antes", "15 minutes before"), TR ("30 minutos antes", "30 minutes before"),
+                          TR ("1 hora antes", "1 hour before"), TR ("2 horas antes", "2 hours before"),
+                          TR ("1 día antes", "1 day before"), TR ("2 días antes", "2 days before"),
+                          TR ("1 semana antes", "1 week before"), NULL };
+  return gtk_string_list_new (items);
+}
+
+static guint
+alert_index (int minutes)
+{
+  for (guint i = 0; i < G_N_ELEMENTS (alert_minutes); i++)
+    if (alert_minutes[i] == minutes)
+      return i;
+  return 0;
+}
+
+/* new events start with the alert and the calendar chosen in the settings */
+static void
+apply_defaults (CalEvent *ev)
+{
+  const CalSettings *cs = calendar_settings ();
+  if (cs->default_alert >= 0 && calendar_event_alert_count (ev) == 0)
+    calendar_event_add_alert (ev, cs->default_alert);
+  const CalCalendar *c = cs->default_calendar ? calendar_calendar_find (calendar_default (), cs->default_calendar) : NULL;
+  if (c && !c->url)
+    {
+      g_free (ev->calendar);
+      ev->calendar = g_strdup (c->id);
+    }
+}
+
+/* the calendars the user can add events to: not the subscriptions */
+static GPtrArray *
+own_calendars (void)
+{
+  GPtrArray *own = g_ptr_array_new ();
+  GPtrArray *all = calendar_calendars (calendar_default ());
+  for (guint i = 0; i < all->len; i++)
+    if (!((CalCalendar *) all->pdata[i])->url)
+      g_ptr_array_add (own, all->pdata[i]);
+  return own;
+}
 
 typedef struct {
   AdwDialog *dialog;
   char      *id;          /* NULL when creating */
   gint64     occ_start;   /* the showing being edited */
-  gint64     day;         /* local midnight of the chosen day */
-  gint64     until;
-  GtkWidget *title, *location, *notes, *all_day, *date_button, *calendar, *times_row;
-  GtkWidget *start_h, *start_m, *end_h, *end_m, *repeat, *cal_combo, *alert;
+  gint64     day, end_day, until_day;   /* local midnights */
+  GtkWidget *title, *location, *url, *notes, *all_day, *reminder;
+  GtkWidget *date_btn[3], *date_cal[3];                 /* start, end, repeat-until */
+  GtkWidget *start_row, *end_date_row, *end_time_row;
+  GtkWidget *start_h, *start_m, *end_h, *end_m;
+  GtkWidget *repeat, *interval_row, *weekday_row, *monthly_row, *ends_row, *until_row, *count_row;
+  GtkWidget *weekday[7];
+  GtkWidget *alert1, *alert2, *cal_combo;
+  GPtrArray *own;
 } Editor;
+
+static Editor *last_editor;   /* for the self-test, which fills the form like a person would */
 
 static void
 editor_free (AdwDialog *dialog, gpointer data)
 {
   (void) dialog;
   Editor *e = data;
+  if (last_editor == e)
+    last_editor = NULL;
   g_free (e->id);
+  g_ptr_array_unref (e->own);
   g_free (e);
 }
 
-static void
-editor_update_date_label (Editor *e)
+static gint64 *
+editor_day (Editor *e, int which)
 {
-  g_autofree char *text = format_day (e->day);
-  gtk_menu_button_set_label (GTK_MENU_BUTTON (e->date_button), text);
+  return which == 0 ? &e->day : which == 1 ? &e->end_day : &e->until_day;
 }
 
 static void
-on_editor_day_selected (GtkCalendar *calendar, gpointer data)
+editor_update_date_labels (Editor *e)
+{
+  for (int i = 0; i < 3; i++)
+    {
+      gint64 d = *editor_day (e, i);
+      g_autofree char *text = format_day (d ? d : e->day);
+      gtk_menu_button_set_label (GTK_MENU_BUTTON (e->date_btn[i]), text);
+    }
+}
+
+/* shows only the rows that make sense for what is chosen */
+static void
+editor_sync (Editor *e)
+{
+  gboolean all_day = adw_switch_row_get_active (ADW_SWITCH_ROW (e->all_day));
+  gboolean reminder = adw_switch_row_get_active (ADW_SWITCH_ROW (e->reminder));
+  guint rep = adw_combo_row_get_selected (ADW_COMBO_ROW (e->repeat));
+  guint ends = adw_combo_row_get_selected (ADW_COMBO_ROW (e->ends_row));
+  gtk_widget_set_visible (e->start_row, !all_day);
+  gtk_widget_set_visible (e->end_date_row, !reminder);
+  gtk_widget_set_visible (e->end_time_row, !reminder && !all_day);
+  gtk_widget_set_visible (e->interval_row, rep != 0);
+  gtk_widget_set_visible (e->weekday_row, rep == CAL_REPEAT_WEEKLY);
+  gtk_widget_set_visible (e->monthly_row, rep == CAL_REPEAT_MONTHLY);
+  gtk_widget_set_visible (e->ends_row, rep != 0);
+  gtk_widget_set_visible (e->until_row, rep != 0 && ends == 1);
+  gtk_widget_set_visible (e->count_row, rep != 0 && ends == 2);
+  static const char *units_es[] = { "", "días", "semanas", "meses", "años" };
+  static const char *units_en[] = { "", "days", "weeks", "months", "years" };
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (e->interval_row), english () ? units_en[MIN (rep, 4)] : units_es[MIN (rep, 4)]);
+}
+
+static void
+on_editor_changed (GObject *obj, GParamSpec *pspec, gpointer data)
+{
+  (void) obj; (void) pspec;
+  editor_sync (data);
+}
+
+static void
+on_editor_date (GtkCalendar *calendar, gpointer data)
 {
   Editor *e = data;
+  int which = GPOINTER_TO_INT (g_object_get_data (G_OBJECT (calendar), "which"));
   g_autoptr (GDateTime) d = gtk_calendar_get_date (calendar);
   g_autoptr (GDateTime) m = g_date_time_new_local (g_date_time_get_year (d), g_date_time_get_month (d),
                                                     g_date_time_get_day_of_month (d), 0, 0, 0);
-  e->day = g_date_time_to_unix (m);
-  editor_update_date_label (e);
-}
-
-static void
-on_editor_all_day (GObject *row, GParamSpec *pspec, gpointer data)
-{
-  (void) pspec;
-  Editor *e = data;
-  gtk_widget_set_visible (e->times_row, !adw_switch_row_get_active (ADW_SWITCH_ROW (row)));
+  gint64 picked = g_date_time_to_unix (m);
+  gint64 *day = editor_day (e, which);
+  if (which == 0)
+    {
+      /* moving the start moves the end with it, so the event keeps its length in days */
+      gint64 delta = picked - e->day;
+      e->end_day = calendar_day_start (e->end_day + delta + 12 * 3600);
+    }
+  *day = picked;
+  if (e->end_day < e->day)
+    e->end_day = e->day;
+  editor_update_date_labels (e);
 }
 
 static gint64
-editor_time (Editor *e, GtkWidget *h, GtkWidget *m)
+editor_time (gint64 day, GtkWidget *h, GtkWidget *m)
 {
-  g_autoptr (GDateTime) d = local_dt (e->day);
+  g_autoptr (GDateTime) d = local_dt (day);
   g_autoptr (GDateTime) t = g_date_time_new_local (g_date_time_get_year (d), g_date_time_get_month (d),
                                                     g_date_time_get_day_of_month (d),
                                                     (int) gtk_spin_button_get_value (GTK_SPIN_BUTTON (h)),
@@ -570,24 +703,65 @@ on_editor_save (GtkButton *button, gpointer data)
   (void) button;
   Editor *e = data;
   gboolean all_day = adw_switch_row_get_active (ADW_SWITCH_ROW (e->all_day));
-  gint64 start = all_day ? e->day : editor_time (e, e->start_h, e->start_m);
-  gint64 end = all_day ? calendar_day_next (e->day) : editor_time (e, e->end_h, e->end_m);
+  gboolean reminder = adw_switch_row_get_active (ADW_SWITCH_ROW (e->reminder));
+  gint64 start = all_day ? e->day : editor_time (e->day, e->start_h, e->start_m);
+  gint64 end;
+  if (reminder)
+    end = all_day ? calendar_day_next (e->day) : start + 900;
+  else if (all_day)
+    end = calendar_day_next (MAX (e->end_day, e->day));
+  else
+    end = editor_time (e->end_day, e->end_h, e->end_m);
   if (end <= start)
     end = start + 900;
 
   const char *title = gtk_editable_get_text (GTK_EDITABLE (e->title));
   CalEvent *ev = calendar_event_new (*title ? title : TR ("Sin título", "Untitled"), start, end, all_day);
+  ev->reminder = reminder;
   g_free (ev->notes);
   ev->notes = g_strdup (gtk_editable_get_text (GTK_EDITABLE (e->notes)));
   g_free (ev->location);
   ev->location = g_strdup (gtk_editable_get_text (GTK_EDITABLE (e->location)));
-  ev->repeat = (CalRepeat) adw_combo_row_get_selected (ADW_COMBO_ROW (e->repeat));
-  ev->until = ev->repeat == CAL_REPEAT_NONE ? 0 : e->until;
-  ev->alert = alert_minutes[adw_combo_row_get_selected (ADW_COMBO_ROW (e->alert))];
-  GPtrArray *cals = calendar_calendars (calendar_default ());
+  g_free (ev->url);
+  ev->url = g_strdup (gtk_editable_get_text (GTK_EDITABLE (e->url)));
+
+  guint rep = adw_combo_row_get_selected (ADW_COMBO_ROW (e->repeat));
+  ev->repeat = (CalRepeat) rep;
+  if (rep != 0)
+    {
+      guint step = (guint) adw_spin_row_get_value (ADW_SPIN_ROW (e->interval_row));
+      ev->interval = step > 1 ? step : 0;
+      if (rep == CAL_REPEAT_WEEKLY)
+        {
+          guint mask = 0;
+          for (int i = 0; i < 7; i++)
+            if (gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (e->weekday[i])))
+              mask |= 1u << i;
+          g_autoptr (GDateTime) sd = local_dt (start);
+          /* only the start's own weekday is the same as not choosing any */
+          ev->weekdays = mask == (1u << (g_date_time_get_day_of_week (sd) - 1)) ? 0 : mask;
+        }
+      if (rep == CAL_REPEAT_MONTHLY)
+        ev->monthly = (CalMonthly) adw_combo_row_get_selected (ADW_COMBO_ROW (e->monthly_row));
+      guint ends = adw_combo_row_get_selected (ADW_COMBO_ROW (e->ends_row));
+      if (ends == 1)
+        ev->until = calendar_day_start (MAX (e->until_day, e->day));
+      else if (ends == 2)
+        ev->count = (int) adw_spin_row_get_value (ADW_SPIN_ROW (e->count_row));
+    }
+
+  int minutes[2];
+  guint n = 0;
+  for (int k = 0; k < 2; k++)
+    {
+      int m = alert_minutes[adw_combo_row_get_selected (ADW_COMBO_ROW (k ? e->alert2 : e->alert1))];
+      if (m >= 0)
+        minutes[n++] = m;
+    }
+  calendar_event_set_alerts (ev, minutes, n);
   guint ci = adw_combo_row_get_selected (ADW_COMBO_ROW (e->cal_combo));
   g_free (ev->calendar);
-  ev->calendar = g_strdup (((CalCalendar *) cals->pdata[MIN (ci, cals->len - 1)])->id);
+  ev->calendar = g_strdup (((CalCalendar *) e->own->pdata[MIN (ci, e->own->len - 1)])->id);
 
   U.anchor = e->day;
   if (e->id)
@@ -608,6 +782,16 @@ on_editor_delete (GtkButton *button, gpointer data)
   delete_showing (e->id, e->occ_start, e->dialog);
 }
 
+/* two digits, so 5 reads 05 */
+static gboolean
+on_spin_output (GtkSpinButton *spin, gpointer data)
+{
+  (void) data;
+  g_autofree char *text = g_strdup_printf ("%02d", (int) gtk_spin_button_get_value (spin));
+  gtk_editable_set_text (GTK_EDITABLE (spin), text);
+  return TRUE;
+}
+
 static GtkWidget *
 time_spins (GtkWidget **hour, GtkWidget **minute, int h, int m)
 {
@@ -619,44 +803,72 @@ time_spins (GtkWidget **hour, GtkWidget **minute, int h, int m)
   gtk_spin_button_set_value (GTK_SPIN_BUTTON (*minute), m);
   gtk_spin_button_set_wrap (GTK_SPIN_BUTTON (*hour), TRUE);
   gtk_spin_button_set_wrap (GTK_SPIN_BUTTON (*minute), TRUE);
+  g_signal_connect (*hour, "output", G_CALLBACK (on_spin_output), NULL);
+  g_signal_connect (*minute, "output", G_CALLBACK (on_spin_output), NULL);
   gtk_box_append (GTK_BOX (box), *hour);
   gtk_box_append (GTK_BOX (box), gtk_label_new (":"));
   gtk_box_append (GTK_BOX (box), *minute);
   return box;
 }
 
+/* a row with a button that opens a calendar to pick the day */
+static GtkWidget *
+date_row (Editor *e, int which, const char *title)
+{
+  GtkWidget *row = adw_action_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), title);
+  e->date_btn[which] = gtk_menu_button_new ();
+  gtk_widget_set_valign (e->date_btn[which], GTK_ALIGN_CENTER);
+  e->date_cal[which] = gtk_calendar_new ();
+  g_object_set_data (G_OBJECT (e->date_cal[which]), "which", GINT_TO_POINTER (which));
+  GtkWidget *pop = gtk_popover_new ();
+  gtk_popover_set_child (GTK_POPOVER (pop), e->date_cal[which]);
+  gtk_menu_button_set_popover (GTK_MENU_BUTTON (e->date_btn[which]), pop);
+  adw_action_row_add_suffix (ADW_ACTION_ROW (row), e->date_btn[which]);
+  g_autoptr (GDateTime) d = local_dt (*editor_day (e, which) ? *editor_day (e, which) : e->day);
+  /* gtk_calendar_set_date only exists from GTK 4.20; Ubuntu 24.04 ships 4.14 */
+  G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+  gtk_calendar_select_day (GTK_CALENDAR (e->date_cal[which]), d);
+  G_GNUC_END_IGNORE_DEPRECATIONS
+  g_signal_connect (e->date_cal[which], "day-selected", G_CALLBACK (on_editor_date), e);
+  return row;
+}
+
 /* existing: edit it. Otherwise a new event from start to end (0 = the chosen day, next hour). */
 static void
 open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 end)
 {
+  if (existing && calendar_of (existing)->url)
+    return;                          /* subscribed calendars are read-only */
   Editor *e = g_new0 (Editor, 1);
+  e->own = own_calendars ();
   e->id = existing ? g_strdup (existing->id) : NULL;
   e->occ_start = existing ? (occ_start ? occ_start : existing->start) : 0;
-  e->until = existing ? existing->until : 0;
 
   g_autoptr (GDateTime) now = g_date_time_new_now_local ();
   int start_h, start_m = 0, end_h, end_m = 0;
   gboolean all_day = existing && existing->all_day;
+  gint64 span = existing ? existing->end - existing->start : 3600;
   if (existing)
     {
       e->day = calendar_day_start (e->occ_start);
-      if (!existing->all_day)
-        {
-          g_autoptr (GDateTime) s = local_dt (e->occ_start);
-          g_autoptr (GDateTime) en = local_dt (e->occ_start + (existing->end - existing->start));
-          start_h = g_date_time_get_hour (s);
-          start_m = g_date_time_get_minute (s);
-          end_h = g_date_time_get_hour (en);
-          end_m = g_date_time_get_minute (en);
-        }
-      else
-        start_h = end_h = 9;
+      e->end_day = calendar_day_start (e->occ_start + span - (all_day ? 1 : 0));
+      e->until_day = existing->until ? existing->until : e->day;
+      g_autoptr (GDateTime) s = local_dt (e->occ_start);
+      g_autoptr (GDateTime) en = local_dt (e->occ_start + span);
+      start_h = g_date_time_get_hour (s);
+      start_m = g_date_time_get_minute (s);
+      end_h = g_date_time_get_hour (en);
+      end_m = g_date_time_get_minute (en);
     }
   else if (start)
     {
       e->day = calendar_day_start (start);
+      gint64 stop = end > start ? end : start + 3600;
+      e->end_day = calendar_day_start (stop);
+      e->until_day = e->day;
       g_autoptr (GDateTime) s = local_dt (start);
-      g_autoptr (GDateTime) en = local_dt (end > start ? end : start + 3600);
+      g_autoptr (GDateTime) en = local_dt (stop);
       start_h = g_date_time_get_hour (s);
       start_m = g_date_time_get_minute (s);
       end_h = g_date_time_get_hour (en);
@@ -664,19 +876,21 @@ open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 en
     }
   else
     {
-      e->day = U.anchor;
+      e->day = e->end_day = e->until_day = U.anchor;
       start_h = (g_date_time_get_hour (now) + 1) % 24;
       end_h = (start_h + 1) % 24;
     }
 
   e->dialog = adw_dialog_new ();
   adw_dialog_set_title (e->dialog, existing ? TR ("Editar evento", "Edit event") : TR ("Nuevo evento", "New event"));
-  adw_dialog_set_content_width (e->dialog, 460);
+  adw_dialog_set_content_width (e->dialog, 480);
+  adw_dialog_set_content_height (e->dialog, 720);
   g_signal_connect (e->dialog, "closed", G_CALLBACK (editor_free), e);
 
   GtkWidget *page = adw_preferences_page_new ();
-  AdwPreferencesGroup *main = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
 
+  /* what */
+  AdwPreferencesGroup *what = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
   e->title = adw_entry_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->title), TR ("Título", "Title"));
   if (existing)
@@ -684,96 +898,146 @@ open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 en
   else if (editor_title_hint)
     gtk_editable_set_text (GTK_EDITABLE (e->title), editor_title_hint);
   g_clear_pointer (&editor_title_hint, g_free);
-  adw_preferences_group_add (main, e->title);
-
+  adw_preferences_group_add (what, e->title);
   e->location = adw_entry_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->location), TR ("Lugar", "Location"));
   if (existing)
     gtk_editable_set_text (GTK_EDITABLE (e->location), existing->location);
-  adw_preferences_group_add (main, e->location);
+  adw_preferences_group_add (what, e->location);
+  e->url = adw_entry_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->url), TR ("Enlace", "Link"));
+  if (existing)
+    gtk_editable_set_text (GTK_EDITABLE (e->url), existing->url);
+  adw_preferences_group_add (what, e->url);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), what);
 
+  /* when */
+  AdwPreferencesGroup *when = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
   e->all_day = adw_switch_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->all_day), TR ("Todo el día", "All day"));
   adw_switch_row_set_active (ADW_SWITCH_ROW (e->all_day), all_day);
-  adw_preferences_group_add (main, e->all_day);
+  adw_preferences_group_add (when, e->all_day);
+  e->reminder = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->reminder), TR ("Es un recordatorio", "It is a reminder"));
+  adw_action_row_set_subtitle (ADW_ACTION_ROW (e->reminder), TR ("Una tarea con casilla para marcar", "A task with a box to tick off"));
+  adw_switch_row_set_active (ADW_SWITCH_ROW (e->reminder), existing && existing->reminder);
+  adw_preferences_group_add (when, e->reminder);
 
-  GtkWidget *date_row = adw_action_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (date_row), TR ("Fecha", "Date"));
-  e->date_button = gtk_menu_button_new ();
-  gtk_widget_set_valign (e->date_button, GTK_ALIGN_CENTER);
-  e->calendar = gtk_calendar_new ();
-  GtkWidget *pop = gtk_popover_new ();
-  gtk_popover_set_child (GTK_POPOVER (pop), e->calendar);
-  gtk_menu_button_set_popover (GTK_MENU_BUTTON (e->date_button), pop);
-  adw_action_row_add_suffix (ADW_ACTION_ROW (date_row), e->date_button);
-  adw_preferences_group_add (main, date_row);
-  {
-    g_autoptr (GDateTime) d = local_dt (e->day);
-    /* gtk_calendar_set_date only exists from GTK 4.20; Ubuntu 24.04 ships 4.14 */
-    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
-    gtk_calendar_select_day (GTK_CALENDAR (e->calendar), d);
-    G_GNUC_END_IGNORE_DEPRECATIONS
-  }
-  g_signal_connect (e->calendar, "day-selected", G_CALLBACK (on_editor_day_selected), e);
-  editor_update_date_label (e);
+  adw_preferences_group_add (when, date_row (e, 0, TR ("Empieza", "Starts")));
+  e->start_row = adw_action_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->start_row), TR ("Hora de inicio", "Start time"));
+  adw_action_row_add_suffix (ADW_ACTION_ROW (e->start_row), time_spins (&e->start_h, &e->start_m, start_h, start_m));
+  adw_preferences_group_add (when, e->start_row);
+  e->end_date_row = date_row (e, 1, TR ("Termina", "Ends"));
+  adw_preferences_group_add (when, e->end_date_row);
+  e->end_time_row = adw_action_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->end_time_row), TR ("Hora de fin", "End time"));
+  adw_action_row_add_suffix (ADW_ACTION_ROW (e->end_time_row), time_spins (&e->end_h, &e->end_m, end_h, end_m));
+  adw_preferences_group_add (when, e->end_time_row);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), when);
 
-  e->times_row = adw_action_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->times_row), TR ("Hora", "Time"));
-  GtkWidget *times = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 8);
-  gtk_box_append (GTK_BOX (times), time_spins (&e->start_h, &e->start_m, start_h, start_m));
-  gtk_box_append (GTK_BOX (times), gtk_label_new ("–"));
-  gtk_box_append (GTK_BOX (times), time_spins (&e->end_h, &e->end_m, end_h, end_m));
-  adw_action_row_add_suffix (ADW_ACTION_ROW (e->times_row), times);
-  adw_preferences_group_add (main, e->times_row);
-  gtk_widget_set_visible (e->times_row, !all_day);
-  g_signal_connect (e->all_day, "notify::active", G_CALLBACK (on_editor_all_day), e);
-
+  /* repeat */
+  AdwPreferencesGroup *rep = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
   e->repeat = adw_combo_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->repeat), TR ("Repetir", "Repeat"));
   const char *repeat_items[] = { TR ("Nunca", "Never"), TR ("Cada día", "Every day"), TR ("Cada semana", "Every week"),
                                  TR ("Cada mes", "Every month"), TR ("Cada año", "Every year"), NULL };
-  g_autoptr (GtkStringList) list = gtk_string_list_new (repeat_items);
-  adw_combo_row_set_model (ADW_COMBO_ROW (e->repeat), G_LIST_MODEL (list));
+  g_autoptr (GtkStringList) repeat_list = gtk_string_list_new (repeat_items);
+  adw_combo_row_set_model (ADW_COMBO_ROW (e->repeat), G_LIST_MODEL (repeat_list));
   adw_combo_row_set_selected (ADW_COMBO_ROW (e->repeat), existing ? (guint) existing->repeat : 0);
-  adw_preferences_group_add (main, e->repeat);
+  adw_preferences_group_add (rep, e->repeat);
 
-  e->alert = adw_combo_row_new ();
-  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->alert), TR ("Aviso", "Alert"));
-  const char *alert_items[] = { TR ("Ninguno", "None"), TR ("A la hora del evento", "At time of event"),
-                                TR ("5 minutos antes", "5 minutes before"), TR ("10 minutos antes", "10 minutes before"),
-                                TR ("15 minutos antes", "15 minutes before"), TR ("30 minutos antes", "30 minutes before"),
-                                TR ("1 hora antes", "1 hour before"), TR ("1 día antes", "1 day before"), NULL };
-  g_autoptr (GtkStringList) alerts = gtk_string_list_new (alert_items);
-  adw_combo_row_set_model (ADW_COMBO_ROW (e->alert), G_LIST_MODEL (alerts));
-  guint alert_sel = 0;
-  for (guint i = 0; existing && i < G_N_ELEMENTS (alert_minutes); i++)
-    if (alert_minutes[i] == existing->alert)
-      alert_sel = i;
-  adw_combo_row_set_selected (ADW_COMBO_ROW (e->alert), alert_sel);
-  adw_preferences_group_add (main, e->alert);
+  e->interval_row = adw_spin_row_new_with_range (1, 99, 1);
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->interval_row), TR ("Cada", "Every"));
+  adw_spin_row_set_value (ADW_SPIN_ROW (e->interval_row), existing && existing->interval ? existing->interval : 1);
+  adw_preferences_group_add (rep, e->interval_row);
 
+  e->weekday_row = adw_action_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->weekday_row), TR ("Los días", "On"));
+  GtkWidget *wbox = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 2);
+  gtk_widget_set_valign (wbox, GTK_ALIGN_CENTER);
+  g_autoptr (GDateTime) sd = local_dt (existing ? e->occ_start : (start ? start : e->day));
+  guint own_dow = (guint) (g_date_time_get_day_of_week (sd) - 1);
+  for (int i = 0; i < 7; i++)
+    {
+      int dow = (week_start () + i) % 7;
+      g_autofree char *letter = g_strndup (english () ? days_en[dow] : days_es[dow], 1);
+      letter[0] = (char) g_ascii_toupper (letter[0]);
+      GtkWidget *t = gtk_toggle_button_new_with_label (letter);
+      gtk_widget_add_css_class (t, "circular");
+      guint mask = existing && existing->weekdays ? existing->weekdays : (1u << own_dow);
+      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (t), (mask >> dow) & 1);
+      e->weekday[dow] = t;
+      gtk_box_append (GTK_BOX (wbox), t);
+    }
+  adw_action_row_add_suffix (ADW_ACTION_ROW (e->weekday_row), wbox);
+  adw_preferences_group_add (rep, e->weekday_row);
+
+  e->monthly_row = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->monthly_row), TR ("Cada mes el", "Each month on"));
+  const char *monthly_items[] = { TR ("mismo día del mes", "the same date"), TR ("mismo día de la semana", "the same weekday"),
+                                  TR ("último día del mes", "the last day"), NULL };
+  g_autoptr (GtkStringList) monthly_list = gtk_string_list_new (monthly_items);
+  adw_combo_row_set_model (ADW_COMBO_ROW (e->monthly_row), G_LIST_MODEL (monthly_list));
+  adw_combo_row_set_selected (ADW_COMBO_ROW (e->monthly_row), existing ? (guint) existing->monthly : 0);
+  adw_preferences_group_add (rep, e->monthly_row);
+
+  e->ends_row = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->ends_row), TR ("Termina", "Ends"));
+  const char *ends_items[] = { TR ("Nunca", "Never"), TR ("En una fecha", "On a date"), TR ("Después de varias veces", "After a number of times"), NULL };
+  g_autoptr (GtkStringList) ends_list = gtk_string_list_new (ends_items);
+  adw_combo_row_set_model (ADW_COMBO_ROW (e->ends_row), G_LIST_MODEL (ends_list));
+  adw_combo_row_set_selected (ADW_COMBO_ROW (e->ends_row), existing ? (existing->until ? 1u : existing->count ? 2u : 0u) : 0);
+  adw_preferences_group_add (rep, e->ends_row);
+  e->until_row = date_row (e, 2, TR ("Hasta el", "Until"));
+  adw_preferences_group_add (rep, e->until_row);
+  e->count_row = adw_spin_row_new_with_range (1, 999, 1);
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->count_row), TR ("Veces", "Times"));
+  adw_spin_row_set_value (ADW_SPIN_ROW (e->count_row), existing && existing->count ? existing->count : 10);
+  adw_preferences_group_add (rep, e->count_row);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), rep);
+
+  /* alerts */
+  AdwPreferencesGroup *alerts = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  for (int k = 0; k < 2; k++)
+    {
+      GtkWidget *row = adw_combo_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), k ? TR ("Segundo aviso", "Second alert") : TR ("Aviso", "Alert"));
+      g_autoptr (GtkStringList) choices = alert_choices ();
+      adw_combo_row_set_model (ADW_COMBO_ROW (row), G_LIST_MODEL (choices));
+      int minutes = existing ? calendar_event_alert (existing, (guint) k) : (k ? -1 : calendar_settings ()->default_alert);
+      adw_combo_row_set_selected (ADW_COMBO_ROW (row), alert_index (minutes));
+      adw_preferences_group_add (alerts, row);
+      if (k)
+        e->alert2 = row;
+      else
+        e->alert1 = row;
+    }
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), alerts);
+
+  /* more */
+  AdwPreferencesGroup *more = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
   e->cal_combo = adw_combo_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->cal_combo), TR ("Calendario", "Calendar"));
-  GPtrArray *cals = calendar_calendars (calendar_default ());
   g_autoptr (GtkStringList) names = gtk_string_list_new (NULL);
   guint cal_sel = 0;
-  for (guint i = 0; i < cals->len; i++)
+  const char *want_cal = existing ? existing->calendar : calendar_settings ()->default_calendar;
+  for (guint i = 0; i < e->own->len; i++)
     {
-      const CalCalendar *c = cals->pdata[i];
+      const CalCalendar *c = e->own->pdata[i];
       gtk_string_list_append (names, c->name);
-      if (existing && g_str_equal (c->id, existing->calendar))
+      if (want_cal && g_str_equal (c->id, want_cal))
         cal_sel = i;
     }
   adw_combo_row_set_model (ADW_COMBO_ROW (e->cal_combo), G_LIST_MODEL (names));
   adw_combo_row_set_selected (ADW_COMBO_ROW (e->cal_combo), cal_sel);
-  adw_preferences_group_add (main, e->cal_combo);
-
+  adw_preferences_group_add (more, e->cal_combo);
   e->notes = adw_entry_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (e->notes), TR ("Notas", "Notes"));
   if (existing)
     gtk_editable_set_text (GTK_EDITABLE (e->notes), existing->notes);
-  adw_preferences_group_add (main, e->notes);
-  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), main);
+  adw_preferences_group_add (more, e->notes);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), more);
 
   if (existing)
     {
@@ -802,6 +1066,14 @@ open_editor (const CalEvent *existing, gint64 occ_start, gint64 start, gint64 en
   adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (tv), page);
   adw_dialog_set_child (e->dialog, tv);
   adw_dialog_set_default_widget (e->dialog, save);
+
+  editor_update_date_labels (e);
+  g_signal_connect (e->all_day, "notify::active", G_CALLBACK (on_editor_changed), e);
+  g_signal_connect (e->reminder, "notify::active", G_CALLBACK (on_editor_changed), e);
+  g_signal_connect (e->repeat, "notify::selected", G_CALLBACK (on_editor_changed), e);
+  g_signal_connect (e->ends_row, "notify::selected", G_CALLBACK (on_editor_changed), e);
+  editor_sync (e);
+  last_editor = e;
   adw_dialog_present (e->dialog, U.view);
   gtk_widget_grab_focus (e->title);
 }
@@ -817,6 +1089,9 @@ on_chip_pressed (GtkGestureClick *g, int n_press, double x, double y, gpointer d
   const char *id = data;
   gint64 *occ = g_object_get_data (G_OBJECT (chip), "occ");
   gtk_gesture_set_state (GTK_GESTURE (g), GTK_EVENT_SEQUENCE_CLAIMED); /* the day under it must not react */
+  g_free (sel_id);
+  sel_id = g_strdup (id);
+  sel_occ = *occ;
   if (n_press >= 2)
     {
       const CalEvent *ev = calendar_find (calendar_default (), id);
@@ -831,12 +1106,16 @@ on_chip_pressed (GtkGestureClick *g, int n_press, double x, double y, gpointer d
 static GtkWidget *
 make_chip (const CalOccurrence *o, gboolean show_time)
 {
-  g_autofree char *hm = (o->event->all_day || !show_time) ? NULL : format_hm (o->start);
-  g_autofree char *text = hm ? g_strdup_printf ("%s %s", hm, o->event->title) : g_strdup (o->event->title);
+  g_autofree char *hm = (o->event->all_day || o->event->reminder || !show_time) ? NULL : format_hm (o->start);
+  gboolean done = o->event->reminder && calendar_is_done (o->event, o->start);
+  const char *mark = o->event->reminder ? (done ? "● " : "○ ") : "";
+  g_autofree char *text = hm ? g_strdup_printf ("%s %s", hm, o->event->title) : g_strdup_printf ("%s%s", mark, o->event->title);
   GtkWidget *chip = gtk_label_new (text);
   gtk_label_set_xalign (GTK_LABEL (chip), 0);
   gtk_label_set_ellipsize (GTK_LABEL (chip), PANGO_ELLIPSIZE_END);
   gtk_widget_add_css_class (chip, "cal-chip");
+  if (done)
+    gtk_widget_add_css_class (chip, "done");
   add_color_class (chip, calendar_of (o->event)->color);
   g_object_set_data_full (G_OBJECT (chip), "occ", g_memdup2 (&o->start, sizeof o->start), g_free);
   GtkGesture *click = gtk_gesture_click_new ();
@@ -844,7 +1123,6 @@ make_chip (const CalOccurrence *o, gboolean show_time)
   gtk_widget_add_controller (chip, GTK_EVENT_CONTROLLER (click));
   return chip;
 }
-
 static gboolean
 occurrence_visible (const CalOccurrence *o)
 {
@@ -870,9 +1148,11 @@ on_day_clicked (GtkGestureClick *g, int n_press, double x, double y, gpointer da
 static void
 rebuild_month (void)
 {
+  const CalSettings *cs = calendar_settings ();
   GtkWidget *kid;
   while ((kid = gtk_widget_get_first_child (U.month_grid)))
     gtk_grid_remove (GTK_GRID (U.month_grid), kid);
+  clear_box (U.month_wn);
 
   gint64 m0 = month_start (U.anchor);
   g_autoptr (GDateTime) first = local_dt (m0);
@@ -880,11 +1160,30 @@ rebuild_month (void)
   gint64 grid_start = shift_days (m0, -offset);
   GArray *occ = calendar_occurrences (calendar_default (), grid_start, shift_days (grid_start, 42));
   gint64 today = calendar_day_start (now_unix ());
+  int ncols = cs->days;
 
   for (int i = 0; i < 42; i++)
     {
       gint64 day = shift_days (grid_start, i), next = calendar_day_next (day);
       g_autoptr (GDateTime) d = local_dt (day);
+      int dow = g_date_time_get_day_of_week (d) - 1;        /* 0 Monday */
+      int col = i % 7;
+      if (ncols == 5)
+        {
+          if (dow >= 5)
+            continue;                                       /* no weekend columns */
+          col = dow;
+        }
+      if (col == 0 && cs->week_numbers)
+        {
+          g_autofree char *wn = g_strdup_printf ("%d", g_date_time_get_week_of_year (d));
+          GtkWidget *l = gtk_label_new (wn);
+          gtk_widget_add_css_class (l, "cal-weeknum");
+          gtk_widget_set_vexpand (l, TRUE);
+          gtk_widget_set_valign (l, GTK_ALIGN_START);
+          gtk_widget_set_margin_top (l, 8);
+          gtk_box_append (GTK_BOX (U.month_wn), l);
+        }
 
       GtkWidget *cell = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
       gtk_widget_add_css_class (cell, "cal-day");
@@ -892,10 +1191,6 @@ rebuild_month (void)
         gtk_widget_add_css_class (cell, "other");
       if (day == U.anchor)
         gtk_widget_add_css_class (cell, "selected");
-      if (i % 7 == 6)
-        gtk_widget_add_css_class (cell, "last-col");
-      if (i >= 35)
-        gtk_widget_add_css_class (cell, "last-row");
       gtk_widget_set_hexpand (cell, TRUE);
       gtk_widget_set_vexpand (cell, TRUE);
       gtk_widget_set_overflow (cell, GTK_OVERFLOW_HIDDEN);
@@ -920,7 +1215,15 @@ rebuild_month (void)
           total++;
           if (shown < CHIPS_PER_DAY)
             {
-              gtk_box_append (GTK_BOX (cell), make_chip (o, TRUE));
+              GtkWidget *chip = make_chip (o, TRUE);
+              if (o->start < day)
+                {
+                  /* a multi-day event carries on: a bar, with the title again at the start of each week */
+                  gtk_widget_add_css_class (chip, "cont");
+                  if (col != 0)
+                    gtk_label_set_text (GTK_LABEL (chip), "");
+                }
+              gtk_box_append (GTK_BOX (cell), chip);
               shown++;
             }
         }
@@ -936,12 +1239,24 @@ rebuild_month (void)
       GtkGesture *click = gtk_gesture_click_new ();
       g_signal_connect_data (click, "pressed", G_CALLBACK (on_day_clicked), g_memdup2 (&day, sizeof day), free_data, 0);
       gtk_widget_add_controller (cell, GTK_EVENT_CONTROLLER (click));
-      gtk_grid_attach (GTK_GRID (U.month_grid), cell, i % 7, i / 7, 1, 1);
+      gtk_grid_attach (GTK_GRID (U.month_grid), cell, col, i / 7, 1, 1);
     }
   g_array_free (occ, TRUE);
+  gtk_widget_set_visible (U.month_wn, cs->week_numbers);
+  gtk_widget_set_size_request (U.month_wn, cs->week_numbers ? 28 : 0, -1);
 
   clear_box (U.month_weekdays);
-  for (int i = 0; i < 7; i++)
+  if (cs->week_numbers)
+    {
+      GtkWidget *sp = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+      gtk_widget_set_size_request (sp, 28, -1);
+      gtk_box_append (GTK_BOX (U.month_weekdays), sp);
+    }
+  GtkWidget *names = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_box_set_homogeneous (GTK_BOX (names), TRUE);
+  gtk_widget_set_hexpand (names, TRUE);
+  gtk_box_append (GTK_BOX (U.month_weekdays), names);
+  for (int i = 0; i < ncols; i++)
     {
       int dow = (week_start () + i) % 7;
       GtkWidget *l = gtk_label_new (english () ? days_en[dow] : days_es[dow]);
@@ -949,10 +1264,9 @@ rebuild_month (void)
       gtk_widget_set_hexpand (l, TRUE);
       gtk_widget_set_halign (l, GTK_ALIGN_END);
       gtk_widget_set_margin_end (l, 8);
-      gtk_box_append (GTK_BOX (U.month_weekdays), l);
+      gtk_box_append (GTK_BOX (names), l);
     }
 }
-
 /* ---- week and day views ------------------------------------------------- */
 
 static void
@@ -975,10 +1289,21 @@ scroll_to_hour (gpointer data)
   gtk_adjustment_set_value (adj, cal_grid_hour_y (U.time_grid, GPOINTER_TO_INT (data)));
 }
 
+/* which of the n columns a moment falls in; moments outside the range clamp to its ends */
+static int
+column_of (gint64 first, int n, gint64 t)
+{
+  for (int i = 0; i < n; i++)
+    if (t < shift_days (first, i + 1))
+      return i;
+  return n - 1;
+}
+
 static void
 rebuild_week (void)
 {
-  int n = U.mode == VIEW_DAY ? 1 : 7;
+  const CalSettings *cs = calendar_settings ();
+  int n = U.mode == VIEW_DAY ? 1 : cs->days;
   gint64 first = U.mode == VIEW_DAY ? U.anchor : week_first (U.anchor);
   gint64 today = calendar_day_start (now_unix ());
   gint64 end = shift_days (first, n);
@@ -998,16 +1323,15 @@ rebuild_week (void)
   gtk_widget_set_size_request (spacer2, GUTTER_PX, -1);
   gtk_widget_set_valign (spacer2, GTK_ALIGN_START);
   gtk_box_append (GTK_BOX (U.week_allday), spacer2);
-  GtkWidget *strips = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_box_set_homogeneous (GTK_BOX (strips), TRUE);
+  GtkWidget *strips = gtk_grid_new ();
+  gtk_grid_set_column_homogeneous (GTK_GRID (strips), TRUE);
+  gtk_grid_set_row_spacing (GTK_GRID (strips), 2);
   gtk_widget_set_hexpand (strips, TRUE);
   gtk_box_append (GTK_BOX (U.week_allday), strips);
 
-  GArray *occ = calendar_occurrences (calendar_default (), first, end);
-  gboolean any_allday = FALSE;
   for (int i = 0; i < n; i++)
     {
-      gint64 day = shift_days (first, i), next = calendar_day_next (day);
+      gint64 day = shift_days (first, i);
       g_autoptr (GDateTime) d = local_dt (day);
       int dow = g_date_time_get_day_of_week (d) - 1;
 
@@ -1030,34 +1354,45 @@ rebuild_week (void)
           gtk_widget_add_controller (head, GTK_EVENT_CONTROLLER (click));
         }
       gtk_box_append (GTK_BOX (heads), head);
+    }
 
-      GtkWidget *strip = gtk_box_new (GTK_ORIENTATION_VERTICAL, 2);
-      gtk_widget_set_margin_start (strip, 2);
-      gtk_widget_set_margin_end (strip, 2);
-      for (guint k = 0; k < occ->len; k++)
-        {
-          const CalOccurrence *o = &g_array_index (occ, CalOccurrence, k);
-          if (!o->event->all_day || o->start >= next || o->end <= day || !occurrence_visible (o))
-            continue;
-          gtk_box_append (GTK_BOX (strip), make_chip (o, FALSE));
-          any_allday = TRUE;
-        }
-      gtk_box_append (GTK_BOX (strips), strip);
+  /* all-day events as bars: one that lasts several days is a single bar across them */
+  GArray *occ = calendar_occurrences (calendar_default (), first, end);
+  guint rows[16] = { 0 };
+  int nrows = 0;
+  for (guint k = 0; k < occ->len; k++)
+    {
+      const CalOccurrence *o = &g_array_index (occ, CalOccurrence, k);
+      if (!o->event->all_day || o->start >= end || o->end <= first || !occurrence_visible (o))
+        continue;
+      int c0 = column_of (first, n, o->start), c1 = column_of (first, n, o->end - 1);
+      guint mask = ((1u << (c1 - c0 + 1)) - 1) << c0;
+      int row = 0;
+      while (row < 15 && (rows[row] & mask))
+        row++;
+      rows[row] |= mask;
+      nrows = MAX (nrows, row + 1);
+      GtkWidget *chip = make_chip (o, FALSE);
+      gtk_widget_set_margin_start (chip, 2);
+      gtk_widget_set_margin_end (chip, 2);
+      if (c1 > c0)
+        gtk_widget_add_css_class (chip, "span");
+      gtk_grid_attach (GTK_GRID (strips), chip, c0, row, c1 - c0 + 1, 1);
     }
   g_array_free (occ, TRUE);
-  gtk_widget_set_visible (U.week_allday, any_allday);
+  gtk_widget_set_visible (U.week_allday, nrows > 0);
 
   cal_grid_set_days (U.time_grid, first, n);
+  cal_grid_set_hours (U.time_grid, cs->day_start, cs->day_end);
   if (!U.scrolled)
     {
-      /* start the view near the morning, or an hour before now when looking at today */
+      /* start the view at the working day, or an hour before now when looking at today */
       g_autoptr (GDateTime) nowd = g_date_time_new_now_local ();
-      int hour = (U.anchor == today || (first <= today && today < end)) ? MAX (g_date_time_get_hour (nowd) - 1, 0) : 7;
+      int hour = (first <= today && today < end) ? MAX (g_date_time_get_hour (nowd) - 1, 0) : MAX (cs->day_start - 1, 0);
       U.scrolled = TRUE;
       g_idle_add_once (scroll_to_hour, GINT_TO_POINTER (hour));
     }
 }
-
 static void
 on_grid_picked (const char *id, gint64 occ_start, GtkWidget *grid, double x, double y, gpointer data)
 {
@@ -1084,6 +1419,16 @@ on_grid_create (gint64 start, gint64 end, gpointer data)
   test_create_start = start;
   test_create_end = end;
   open_editor (NULL, 0, start, end);
+}
+
+static void
+on_grid_toggled (const char *id, gint64 occ_start, gpointer data)
+{
+  (void) data;
+  const CalEvent *ev = calendar_find (calendar_default (), id);
+  if (ev)
+    calendar_set_done (calendar_default (), id, occ_start, !calendar_is_done (ev, occ_start));
+  refresh_all ();
 }
 
 static void
@@ -1289,6 +1634,13 @@ on_cal_remove (GtkButton *b, gpointer data)
   adw_dialog_present (ask, U.view);
 }
 
+static void
+on_cal_refresh (GtkButton *b, gpointer data)
+{
+  (void) b;
+  calendar_subscription_fetch (data, refresh_done, NULL);
+}
+
 static GtkWidget *
 calendar_settings_popover (const CalCalendar *c)
 {
@@ -1320,9 +1672,20 @@ calendar_settings_popover (const CalCalendar *c)
     }
   gtk_box_append (GTK_BOX (box), swatches);
 
+  if (c->url)
+    {
+      GtkWidget *info = gtk_label_new (c->url);
+      gtk_label_set_ellipsize (GTK_LABEL (info), PANGO_ELLIPSIZE_MIDDLE);
+      gtk_label_set_max_width_chars (GTK_LABEL (info), 28);
+      gtk_widget_add_css_class (info, "dim-label");
+      gtk_box_append (GTK_BOX (box), info);
+      GtkWidget *now = gtk_button_new_with_label (TR ("Actualizar ahora", "Refresh now"));
+      g_signal_connect_data (now, "clicked", G_CALLBACK (on_cal_refresh), g_strdup (c->id), free_data, 0);
+      gtk_box_append (GTK_BOX (box), now);
+    }
   if (calendar_calendars (calendar_default ())->len > 1)
     {
-      GtkWidget *del = gtk_button_new_with_label (TR ("Borrar calendario", "Delete calendar"));
+      GtkWidget *del = gtk_button_new_with_label (c->url ? TR ("Dejar de seguir", "Unsubscribe") : TR ("Borrar calendario", "Delete calendar"));
       gtk_widget_add_css_class (del, "destructive-action");
       g_signal_connect_data (del, "clicked", G_CALLBACK (on_cal_remove), g_strdup (c->id), free_data, 0);
       gtk_box_append (GTK_BOX (box), del);
@@ -1458,6 +1821,12 @@ title_text (void)
                                       g_date_time_get_year (db));
             }
         }
+      if (U.mode == VIEW_WEEK && calendar_settings ()->week_numbers)
+        {
+          g_autoptr (GDateTime) mid = local_dt (shift_days (week_first (U.anchor), 3));
+          return g_strdup_printf ("<b>%s</b> %d  <span alpha=\"55%%\" size=\"small\">%s %d</span>", m, year, TR ("Semana", "Week"),
+                                  g_date_time_get_week_of_year (mid));
+        }
       return g_strdup_printf ("<b>%s</b> %d", m, year);
     }
   g_autofree char *day = format_day (U.anchor);
@@ -1543,8 +1912,19 @@ quick_summary (const CalQuick *q)
   const char *rep = repeat_label (q->repeat);
   g_autofree char *when = q->all_day ? g_strdup (TR ("todo el día", "all day")) : g_strdup_printf ("%s – %s", a, b);
   const char *title = *q->title ? q->title : TR ("Sin título", "Untitled");
-  return rep ? g_strdup_printf ("%s  ·  %s  ·  %s  ·  %s", title, day, when, rep)
-             : g_strdup_printf ("%s  ·  %s  ·  %s", title, day, when);
+  GString *out = g_string_new (NULL);
+  g_string_append_printf (out, "%s%s  ·  %s  ·  %s", q->reminder ? "○ " : "", title, day, q->reminder && !q->all_day ? a : when);
+  if (rep)
+    {
+      g_string_append_printf (out, "  ·  %s", rep);
+      if (q->interval > 1)
+        g_string_append_printf (out, " ×%u", q->interval);
+      if (q->count)
+        g_string_append_printf (out, "  ·  %d %s", q->count, TR ("veces", "times"));
+    }
+  if (q->alert >= 0)
+    g_string_append_printf (out, "  ·  %s %d min", TR ("aviso", "alert"), q->alert);
+  return g_string_free (out, FALSE);
 }
 
 static void
@@ -1572,8 +1952,8 @@ on_quick_activate (GtkEntry *entry, gpointer data)
   CalQuick q;
   if (!calendar_quick_parse (text, now_unix (), quick_month_first (), &q))
     return;
-  CalEvent *ev = calendar_event_new (*q.title ? q.title : TR ("Sin título", "Untitled"), q.start, q.end, q.all_day);
-  ev->repeat = q.repeat;
+  CalEvent *ev = calendar_quick_to_event (&q, TR ("Sin título", "Untitled"));
+  apply_defaults (ev);
   calendar_add (calendar_default (), ev);
   U.anchor = calendar_day_start (q.start);
   calendar_quick_clear (&q);
@@ -1684,18 +2064,724 @@ build_sidebar (void)
   return side;
 }
 
+/* ---- the settings window ------------------------------------------------ */
+
+static void
+add_combo (AdwPreferencesGroup *group, const char *title, const char **items, guint selected, GCallback cb)
+{
+  GtkWidget *row = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), title);
+  g_autoptr (GtkStringList) list = gtk_string_list_new (items);
+  adw_combo_row_set_model (ADW_COMBO_ROW (row), G_LIST_MODEL (list));
+  adw_combo_row_set_selected (ADW_COMBO_ROW (row), selected);
+  g_signal_connect (row, "notify::selected", cb, NULL);
+  adw_preferences_group_add (group, row);
+}
+
+static void
+settings_changed (void)
+{
+  calendar_settings_save ();
+  U.scrolled = FALSE;
+  refresh_all ();
+}
+
+static void
+on_set_first_day (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  calendar_settings ()->first_day = (int) adw_combo_row_get_selected (ADW_COMBO_ROW (row));
+  settings_changed ();
+}
+
+static void
+on_set_days (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  calendar_settings ()->days = adw_combo_row_get_selected (ADW_COMBO_ROW (row)) == 1 ? 5 : 7;
+  settings_changed ();
+}
+
+static void
+on_set_week_numbers (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  calendar_settings ()->week_numbers = adw_switch_row_get_active (ADW_SWITCH_ROW (row));
+  settings_changed ();
+}
+
+static void
+on_set_day_start (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  CalSettings *cs = calendar_settings ();
+  cs->day_start = (int) adw_spin_row_get_value (ADW_SPIN_ROW (row));
+  if (cs->day_end <= cs->day_start)
+    cs->day_end = cs->day_start + 1;
+  settings_changed ();
+}
+
+static void
+on_set_day_end (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  CalSettings *cs = calendar_settings ();
+  cs->day_end = MAX ((int) adw_spin_row_get_value (ADW_SPIN_ROW (row)), cs->day_start + 1);
+  settings_changed ();
+}
+
+static void
+on_set_alert (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  calendar_settings ()->default_alert = alert_minutes[adw_combo_row_get_selected (ADW_COMBO_ROW (row))];
+  calendar_settings_save ();
+}
+
+static void
+on_set_default_calendar (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  guint i = adw_combo_row_get_selected (ADW_COMBO_ROW (row));
+  CalSettings *cs = calendar_settings ();
+  g_clear_pointer (&cs->default_calendar, g_free);
+  g_autoptr (GPtrArray) own = own_calendars ();
+  if (i > 0 && i - 1 < own->len)
+    cs->default_calendar = g_strdup (((CalCalendar *) own->pdata[i - 1])->id);
+  calendar_settings_save ();
+}
+
+static void
+on_set_theme (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  static const char *ids[] = { "system", "light", "dark" };
+  const char *theme = ids[MIN (adw_combo_row_get_selected (ADW_COMBO_ROW (row)), 2u)];
+  apply_theme (theme);
+  g_strlcpy (calendar_settings ()->theme, theme, sizeof calendar_settings ()->theme);
+  calendar_settings_save ();
+}
+
+static void
+on_set_background (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  CalSettings *cs = calendar_settings ();
+  cs->background = adw_switch_row_get_active (ADW_SWITCH_ROW (row));
+  if (!cs->background)
+    cs->autostart = FALSE;
+  calendar_settings_save ();
+  if (background_handler)
+    background_handler (cs->background, cs->autostart);
+}
+
+static void
+on_set_autostart (GObject *row, GParamSpec *p, gpointer d)
+{
+  (void) p; (void) d;
+  CalSettings *cs = calendar_settings ();
+  cs->autostart = adw_switch_row_get_active (ADW_SWITCH_ROW (row));
+  if (cs->autostart)
+    cs->background = TRUE;
+  calendar_settings_save ();
+  if (background_handler)
+    background_handler (cs->background, cs->autostart);
+}
+
+static void
+open_settings (void)
+{
+  const CalSettings *cs = calendar_settings ();
+  AdwDialog *dialog = adw_preferences_dialog_new ();
+  adw_dialog_set_title (dialog, TR ("Ajustes del calendario", "Calendar settings"));
+  GtkWidget *page = adw_preferences_page_new ();
+
+  AdwPreferencesGroup *week = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_title (week, TR ("Semana", "Week"));
+  const char *firsts[] = { TR ("Según el idioma", "Follow the language"), TR ("Lunes", "Monday"), TR ("Martes", "Tuesday"),
+                           TR ("Miércoles", "Wednesday"), TR ("Jueves", "Thursday"), TR ("Viernes", "Friday"),
+                           TR ("Sábado", "Saturday"), TR ("Domingo", "Sunday"), NULL };
+  add_combo (week, TR ("La semana empieza el", "The week starts on"), firsts, (guint) cs->first_day, G_CALLBACK (on_set_first_day));
+  const char *days[] = { TR ("Siete días", "Seven days"), TR ("De lunes a viernes", "Monday to Friday"), NULL };
+  add_combo (week, TR ("Días que se muestran", "Days shown"), days, cs->days == 5 ? 1 : 0, G_CALLBACK (on_set_days));
+  GtkWidget *wn = adw_switch_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (wn), TR ("Mostrar el número de semana", "Show week numbers"));
+  adw_switch_row_set_active (ADW_SWITCH_ROW (wn), cs->week_numbers);
+  g_signal_connect (wn, "notify::active", G_CALLBACK (on_set_week_numbers), NULL);
+  adw_preferences_group_add (week, wn);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), week);
+
+  AdwPreferencesGroup *day = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_title (day, TR ("Tu día", "Your day"));
+  adw_preferences_group_set_description (day, TR ("Las horas fuera de tu día se ven más oscuras y la vista empieza donde empieza tu día.",
+                                                  "Hours outside your day look darker, and the view starts where your day starts."));
+  GtkWidget *ds = adw_spin_row_new_with_range (0, 22, 1);
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (ds), TR ("Empieza a las", "Starts at"));
+  adw_spin_row_set_value (ADW_SPIN_ROW (ds), cs->day_start);
+  g_signal_connect (ds, "notify::value", G_CALLBACK (on_set_day_start), NULL);
+  adw_preferences_group_add (day, ds);
+  GtkWidget *de = adw_spin_row_new_with_range (1, 24, 1);
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (de), TR ("Termina a las", "Ends at"));
+  adw_spin_row_set_value (ADW_SPIN_ROW (de), cs->day_end);
+  g_signal_connect (de, "notify::value", G_CALLBACK (on_set_day_end), NULL);
+  adw_preferences_group_add (day, de);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), day);
+
+  AdwPreferencesGroup *neu = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+  adw_preferences_group_set_title (neu, TR ("Eventos nuevos", "New events"));
+  g_autoptr (GtkStringList) choices = alert_choices ();
+  GtkWidget *al = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (al), TR ("Aviso por defecto", "Default alert"));
+  adw_combo_row_set_model (ADW_COMBO_ROW (al), G_LIST_MODEL (choices));
+  adw_combo_row_set_selected (ADW_COMBO_ROW (al), alert_index (cs->default_alert));
+  g_signal_connect (al, "notify::selected", G_CALLBACK (on_set_alert), NULL);
+  adw_preferences_group_add (neu, al);
+  g_autoptr (GPtrArray) own = own_calendars ();
+  g_autoptr (GtkStringList) names = gtk_string_list_new (NULL);
+  gtk_string_list_append (names, TR ("El primero", "The first one"));
+  guint sel = 0;
+  for (guint i = 0; i < own->len; i++)
+    {
+      const CalCalendar *c = own->pdata[i];
+      gtk_string_list_append (names, c->name);
+      if (cs->default_calendar && g_str_equal (c->id, cs->default_calendar))
+        sel = i + 1;
+    }
+  GtkWidget *dc = adw_combo_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (dc), TR ("Calendario por defecto", "Default calendar"));
+  adw_combo_row_set_model (ADW_COMBO_ROW (dc), G_LIST_MODEL (names));
+  adw_combo_row_set_selected (ADW_COMBO_ROW (dc), sel);
+  g_signal_connect (dc, "notify::selected", G_CALLBACK (on_set_default_calendar), NULL);
+  adw_preferences_group_add (neu, dc);
+  adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), neu);
+
+  if (standalone)
+    {
+      AdwPreferencesGroup *look = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+      adw_preferences_group_set_title (look, TR ("Apariencia", "Appearance"));
+      const char *themes[] = { TR ("Sistema", "System"), TR ("Claro", "Light"), TR ("Oscuro", "Dark"), NULL };
+      add_combo (look, TR ("Tema", "Theme"), themes, g_str_equal (cs->theme, "light") ? 1 : g_str_equal (cs->theme, "dark") ? 2 : 0,
+                 G_CALLBACK (on_set_theme));
+      adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), look);
+
+      AdwPreferencesGroup *bg = ADW_PREFERENCES_GROUP (adw_preferences_group_new ());
+      adw_preferences_group_set_title (bg, TR ("Avisos", "Alerts"));
+      adw_preferences_group_set_description (bg, TR ("Para que avise aunque cierres la ventana. Solo guarda un temporizador, casi no gasta batería ni memoria.",
+                                                     "So it still alerts after you close the window. It only keeps one timer, using almost no battery or memory."));
+      GtkWidget *keep = adw_switch_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (keep), TR ("Seguir avisando con la ventana cerrada", "Keep alerting with the window closed"));
+      adw_switch_row_set_active (ADW_SWITCH_ROW (keep), cs->background);
+      g_signal_connect (keep, "notify::active", G_CALLBACK (on_set_background), NULL);
+      adw_preferences_group_add (bg, keep);
+      GtkWidget *auto_row = adw_switch_row_new ();
+      adw_preferences_row_set_title (ADW_PREFERENCES_ROW (auto_row), TR ("Empezar al iniciar sesión", "Start when I log in"));
+      adw_action_row_set_subtitle (ADW_ACTION_ROW (auto_row), TR ("Arranca en segundo plano, sin abrir la ventana", "Starts in the background, without opening the window"));
+      adw_switch_row_set_active (ADW_SWITCH_ROW (auto_row), cs->autostart);
+      g_signal_connect (auto_row, "notify::active", G_CALLBACK (on_set_autostart), NULL);
+      adw_preferences_group_add (bg, auto_row);
+      adw_preferences_page_add (ADW_PREFERENCES_PAGE (page), bg);
+    }
+  adw_preferences_dialog_add (ADW_PREFERENCES_DIALOG (dialog), ADW_PREFERENCES_PAGE (page));
+  adw_dialog_present (dialog, U.view);
+}
+
+/* ---- import, export, subscriptions and holidays ------------------------- */
+
+static void
+tell (const char *heading, const char *body)
+{
+  AdwDialog *d = adw_alert_dialog_new (heading, body);
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (d), "ok", TR ("Aceptar", "OK"));
+  adw_dialog_present (d, U.view);
+}
+
+static GtkWidget *
+labelled_entry (GtkWidget *box, const char *label, const char *placeholder)
+{
+  GtkWidget *l = gtk_label_new (label);
+  gtk_label_set_xalign (GTK_LABEL (l), 0);
+  gtk_widget_add_css_class (l, "cal-section");
+  gtk_box_append (GTK_BOX (box), l);
+  GtkWidget *e = gtk_entry_new ();
+  gtk_entry_set_placeholder_text (GTK_ENTRY (e), placeholder);
+  gtk_entry_set_activates_default (GTK_ENTRY (e), TRUE);
+  gtk_box_append (GTK_BOX (box), e);
+  return e;
+}
+
+/* ---- import ---- */
+
+typedef struct {
+  GPtrArray *events;   /* parsed, waiting for the user to pick where they go */
+  char      *name;     /* the file's name, for a new calendar */
+  GtkWidget *combo;
+  GPtrArray *own;
+} ImportAsk;
+
+static void
+import_ask_free (gpointer p)
+{
+  ImportAsk *a = p;
+  g_ptr_array_unref (a->events);
+  g_ptr_array_unref (a->own);
+  g_free (a->name);
+  g_free (a);
+}
+
+static void
+on_import_response (AdwAlertDialog *dialog, const char *response, gpointer data)
+{
+  (void) dialog;
+  ImportAsk *a = data;
+  if (!g_str_equal (response, "import"))
+    return;
+  guint sel = gtk_drop_down_get_selected (GTK_DROP_DOWN (a->combo));
+  g_autofree char *target = NULL;
+  if (sel == 0)
+    target = g_strdup (calendar_calendar_add (calendar_default (), a->name, calendar_calendars (calendar_default ())->len));
+  else if (sel - 1 < a->own->len)
+    target = g_strdup (((CalCalendar *) a->own->pdata[sel - 1])->id);
+  else
+    return;
+  guint n = calendar_import (calendar_default (), a->events, target);
+  refresh_all ();
+  g_autofree char *msg = g_strdup_printf (TR ("Se importaron %u eventos.", "%u events were imported."), n);
+  tell (TR ("Importación lista", "Import done"), msg);
+}
+
+static void
+on_import_file (GObject *source, GAsyncResult *res, gpointer data)
+{
+  (void) data;
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GFile) file = gtk_file_dialog_open_finish (GTK_FILE_DIALOG (source), res, &error);
+  if (!file)
+    return;
+  g_autofree char *contents = NULL;
+  gsize len = 0;
+  if (!g_file_load_contents (file, NULL, &contents, &len, NULL, &error) || len > 32 * 1024 * 1024)
+    {
+      tell (TR ("No se pudo leer el archivo", "Could not read the file"), error ? error->message : "");
+      return;
+    }
+  GPtrArray *events = calendar_ics_parse (contents);
+  if (!events->len)
+    {
+      g_ptr_array_unref (events);
+      tell (TR ("No hay eventos", "No events"), TR ("El archivo no tiene eventos que se puedan importar.", "The file has no events that can be imported."));
+      return;
+    }
+  ImportAsk *a = g_new0 (ImportAsk, 1);
+  a->events = events;
+  a->own = own_calendars ();
+  g_autofree char *base = g_file_get_basename (file);
+  char *dot = strrchr (base, '.');
+  if (dot)
+    *dot = 0;
+  a->name = g_strdup (*base ? base : TR ("Importado", "Imported"));
+
+  g_autofree char *body = g_strdup_printf (TR ("El archivo tiene %u eventos. ¿Dónde los pongo?", "The file has %u events. Where should they go?"), events->len);
+  AdwDialog *d = adw_alert_dialog_new (TR ("Importar calendario", "Import calendar"), body);
+  g_autoptr (GtkStringList) names = gtk_string_list_new (NULL);
+  g_autofree char *fresh = g_strdup_printf (TR ("Un calendario nuevo: %s", "A new calendar: %s"), a->name);
+  gtk_string_list_append (names, fresh);
+  for (guint i = 0; i < a->own->len; i++)
+    gtk_string_list_append (names, ((CalCalendar *) a->own->pdata[i])->name);
+  a->combo = gtk_drop_down_new (G_LIST_MODEL (names), NULL);
+  adw_alert_dialog_set_extra_child (ADW_ALERT_DIALOG (d), a->combo);
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (d), "cancel", TR ("Cancelar", "Cancel"));
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (d), "import", TR ("Importar", "Import"));
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (d), "import", ADW_RESPONSE_SUGGESTED);
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (d), "import");
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (d), "cancel");
+  g_object_set_data_full (G_OBJECT (d), "ask", a, import_ask_free);
+  g_signal_connect (d, "response", G_CALLBACK (on_import_response), a);
+  adw_dialog_present (d, U.view);
+}
+
+static void
+open_import (void)
+{
+  GtkFileDialog *fd = gtk_file_dialog_new ();
+  gtk_file_dialog_set_title (fd, TR ("Importar un archivo .ics", "Import an .ics file"));
+  GtkFileFilter *filter = gtk_file_filter_new ();
+  gtk_file_filter_set_name (filter, TR ("Calendarios (.ics)", "Calendars (.ics)"));
+  gtk_file_filter_add_pattern (filter, "*.ics");
+  gtk_file_filter_add_pattern (filter, "*.ICS");
+  gtk_file_filter_add_mime_type (filter, "text/calendar");
+  g_autoptr (GListStore) filters = g_list_store_new (GTK_TYPE_FILE_FILTER);
+  g_list_store_append (filters, filter);
+  g_object_unref (filter);
+  gtk_file_dialog_set_filters (fd, G_LIST_MODEL (filters));
+  gtk_file_dialog_open (fd, GTK_WINDOW (gtk_widget_get_root (U.view)), NULL, on_import_file, NULL);
+  g_object_unref (fd);
+}
+
+/* ---- export ---- */
+
+typedef struct {
+  GtkWidget *combo;
+  GPtrArray *cals;
+} ExportAsk;
+
+static void
+export_ask_free (gpointer p)
+{
+  ExportAsk *a = p;
+  g_ptr_array_unref (a->cals);
+  g_free (a);
+}
+
+static void
+on_export_saved (GObject *source, GAsyncResult *res, gpointer data)
+{
+  char *ics = data;
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GFile) file = gtk_file_dialog_save_finish (GTK_FILE_DIALOG (source), res, &error);
+  if (file)
+    {
+      if (g_file_replace_contents (file, ics, strlen (ics), NULL, FALSE, G_FILE_CREATE_NONE, NULL, NULL, &error))
+        tell (TR ("Exportado", "Exported"), TR ("El archivo está guardado.", "The file is saved."));
+      else
+        tell (TR ("No se pudo guardar", "Could not save"), error->message);
+    }
+  g_free (ics);
+}
+
+static void
+on_export_response (AdwAlertDialog *dialog, const char *response, gpointer data)
+{
+  (void) dialog;
+  ExportAsk *a = data;
+  if (!g_str_equal (response, "export"))
+    return;
+  guint sel = gtk_drop_down_get_selected (GTK_DROP_DOWN (a->combo));
+  const CalCalendar *c = sel > 0 && sel - 1 < a->cals->len ? a->cals->pdata[sel - 1] : NULL;
+  char *ics = calendar_ics_export (calendar_default (), c ? c->id : NULL);
+  g_autofree char *name = g_strdup_printf ("%s.ics", c ? c->name : "calendar");
+  GtkFileDialog *fd = gtk_file_dialog_new ();
+  gtk_file_dialog_set_title (fd, TR ("Guardar el calendario", "Save the calendar"));
+  gtk_file_dialog_set_initial_name (fd, name);
+  gtk_file_dialog_save (fd, GTK_WINDOW (gtk_widget_get_root (U.view)), NULL, on_export_saved, ics);
+  g_object_unref (fd);
+}
+
+static void
+open_export (void)
+{
+  ExportAsk *a = g_new0 (ExportAsk, 1);
+  a->cals = g_ptr_array_ref (calendar_calendars (calendar_default ()));
+  AdwDialog *d = adw_alert_dialog_new (TR ("Exportar", "Export"), TR ("Se guarda un archivo .ics que abre cualquier calendario, incluido el del iPhone.",
+                                                                      "An .ics file is saved, which any calendar app can open, including the iPhone's."));
+  g_autoptr (GtkStringList) names = gtk_string_list_new (NULL);
+  gtk_string_list_append (names, TR ("Todos los calendarios", "All calendars"));
+  for (guint i = 0; i < a->cals->len; i++)
+    gtk_string_list_append (names, ((CalCalendar *) a->cals->pdata[i])->name);
+  a->combo = gtk_drop_down_new (G_LIST_MODEL (names), NULL);
+  adw_alert_dialog_set_extra_child (ADW_ALERT_DIALOG (d), a->combo);
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (d), "cancel", TR ("Cancelar", "Cancel"));
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (d), "export", TR ("Exportar…", "Export…"));
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (d), "export", ADW_RESPONSE_SUGGESTED);
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (d), "cancel");
+  g_object_set_data_full (G_OBJECT (d), "ask", a, export_ask_free);
+  g_signal_connect (d, "response", G_CALLBACK (on_export_response), a);
+  adw_dialog_present (d, U.view);
+}
+
+/* ---- subscribe ---- */
+
+static void
+subscribed (const char *calendar_id, guint events, const char *error, gpointer data)
+{
+  (void) calendar_id; (void) data;
+  refresh_all ();
+  if (error)
+    tell (TR ("No se pudo cargar el calendario", "Could not load the calendar"), error);
+  else
+    {
+      g_autofree char *msg = g_strdup_printf (TR ("Se cargaron %u eventos. Se actualizará solo.", "%u events loaded. It will update itself."), events);
+      tell (TR ("Suscrito", "Subscribed"), msg);
+    }
+}
+
+static void
+start_subscription (const char *name, const char *url, int hours)
+{
+  const char *id = calendar_subscription_add (calendar_default (), name, 5, url, hours);
+  g_autofree char *keep = g_strdup (id);
+  refresh_all ();
+  calendar_subscription_fetch (keep, subscribed, NULL);
+}
+
+typedef struct {
+  GtkWidget *url, *name, *hours;
+} SubscribeAsk;
+
+static void
+on_subscribe_response (AdwAlertDialog *dialog, const char *response, gpointer data)
+{
+  (void) dialog;
+  SubscribeAsk *a = data;
+  if (!g_str_equal (response, "subscribe"))
+    return;
+  g_autofree char *url = calendar_subscription_normalize_url (gtk_editable_get_text (GTK_EDITABLE (a->url)));
+  if (!url)
+    {
+      tell (TR ("La dirección no es válida", "That address is not valid"),
+            TR ("Debe empezar con https://, http:// o webcal://.", "It must start with https://, http:// or webcal://."));
+      return;
+    }
+  static const int hours[] = { 1, 6, 24, 168 };
+  const char *name = gtk_editable_get_text (GTK_EDITABLE (a->name));
+  start_subscription (*name ? name : TR ("Calendario suscrito", "Subscribed calendar"), url,
+                      hours[MIN (gtk_drop_down_get_selected (GTK_DROP_DOWN (a->hours)), 3u)]);
+}
+
+static void
+open_subscribe (void)
+{
+  SubscribeAsk *a = g_new0 (SubscribeAsk, 1);
+  AdwDialog *d = adw_alert_dialog_new (TR ("Suscribirse a un calendario", "Subscribe to a calendar"),
+                                       TR ("Pega la dirección de un calendario público o compartido (.ics o webcal://). Se lee y se actualiza solo; no se puede editar desde aquí. Es la única conexión a internet del calendario.",
+                                           "Paste the address of a public or shared calendar (.ics or webcal://). It is read and kept up to date, and cannot be edited here. It is the calendar's only internet connection."));
+  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+  a->url = labelled_entry (box, TR ("Dirección", "Address"), "https://…/calendar.ics");
+  a->name = labelled_entry (box, TR ("Nombre", "Name"), TR ("Mi calendario", "My calendar"));
+  GtkWidget *l = gtk_label_new (TR ("Actualizar", "Refresh"));
+  gtk_label_set_xalign (GTK_LABEL (l), 0);
+  gtk_widget_add_css_class (l, "cal-section");
+  gtk_box_append (GTK_BOX (box), l);
+  g_autoptr (GtkStringList) every = gtk_string_list_new (NULL);
+  gtk_string_list_append (every, TR ("Cada hora", "Every hour"));
+  gtk_string_list_append (every, TR ("Cada 6 horas", "Every 6 hours"));
+  gtk_string_list_append (every, TR ("Cada día", "Every day"));
+  gtk_string_list_append (every, TR ("Cada semana", "Every week"));
+  a->hours = gtk_drop_down_new (G_LIST_MODEL (every), NULL);
+  gtk_drop_down_set_selected (GTK_DROP_DOWN (a->hours), 2);
+  gtk_box_append (GTK_BOX (box), a->hours);
+  adw_alert_dialog_set_extra_child (ADW_ALERT_DIALOG (d), box);
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (d), "cancel", TR ("Cancelar", "Cancel"));
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (d), "subscribe", TR ("Suscribirse", "Subscribe"));
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (d), "subscribe", ADW_RESPONSE_SUGGESTED);
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (d), "subscribe");
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (d), "cancel");
+  g_object_set_data_full (G_OBJECT (d), "ask", a, g_free);
+  g_signal_connect (d, "response", G_CALLBACK (on_subscribe_response), a);
+  adw_dialog_present (d, U.view);
+}
+
+/* ---- holidays ---- */
+
+static void
+on_holidays_response (AdwAlertDialog *dialog, const char *response, gpointer data)
+{
+  (void) dialog;
+  GtkWidget *combo = data;
+  if (!g_str_equal (response, "add"))
+    return;
+  guint n;
+  const HolidayRegion *regions = calendar_holiday_regions (&n);
+  guint sel = gtk_drop_down_get_selected (GTK_DROP_DOWN (combo));
+  if (sel >= n)
+    return;
+  g_autofree char *url = calendar_holiday_url (&regions[sel]);
+  g_autofree char *name = g_strdup_printf ("%s: %s", TR ("Festivos", "Holidays"), TR (regions[sel].name_es, regions[sel].name_en));
+  start_subscription (name, url, 168);
+}
+
+static void
+open_holidays (void)
+{
+  AdwDialog *d = adw_alert_dialog_new (TR ("Calendario de festivos", "Holiday calendar"),
+                                       TR ("Añade los festivos de un país como un calendario aparte, que se puede ocultar o quitar cuando quieras.",
+                                           "Adds a country's holidays as a calendar of their own, which you can hide or remove at any time."));
+  guint n;
+  const HolidayRegion *regions = calendar_holiday_regions (&n);
+  g_autoptr (GtkStringList) names = gtk_string_list_new (NULL);
+  for (guint i = 0; i < n; i++)
+    gtk_string_list_append (names, TR (regions[i].name_es, regions[i].name_en));
+  GtkWidget *combo = gtk_drop_down_new (G_LIST_MODEL (names), NULL);
+  adw_alert_dialog_set_extra_child (ADW_ALERT_DIALOG (d), combo);
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (d), "cancel", TR ("Cancelar", "Cancel"));
+  adw_alert_dialog_add_response (ADW_ALERT_DIALOG (d), "add", TR ("Añadir", "Add"));
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (d), "add", ADW_RESPONSE_SUGGESTED);
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (d), "cancel");
+  g_signal_connect (d, "response", G_CALLBACK (on_holidays_response), combo);
+  adw_dialog_present (d, U.view);
+}
+
+static void
+refresh_done (const char *calendar_id, guint events, const char *error, gpointer data)
+{
+  (void) calendar_id; (void) events; (void) data;
+  refresh_all ();
+  if (error)
+    tell (TR ("No se pudo actualizar", "Could not refresh"), error);
+}
+
+
+/* ---- go to a date ------------------------------------------------------- */
+
+static void
+on_goto_picked (GtkCalendar *calendar, gpointer data)
+{
+  AdwDialog *dialog = data;
+  g_autoptr (GDateTime) d = gtk_calendar_get_date (calendar);
+  g_autoptr (GDateTime) m = g_date_time_new_local (g_date_time_get_year (d), g_date_time_get_month (d),
+                                                    g_date_time_get_day_of_month (d), 0, 0, 0);
+  U.anchor = g_date_time_to_unix (m);
+  U.scrolled = FALSE;
+  adw_dialog_close (dialog);
+  refresh_all ();
+}
+
+static void
+open_goto (void)
+{
+  AdwDialog *dialog = adw_dialog_new ();
+  adw_dialog_set_title (dialog, TR ("Ir a la fecha", "Go to date"));
+  GtkWidget *cal = gtk_calendar_new ();
+  g_autoptr (GDateTime) d = local_dt (U.anchor);
+  G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+  gtk_calendar_select_day (GTK_CALENDAR (cal), d);
+  G_GNUC_END_IGNORE_DEPRECATIONS
+  gtk_widget_set_margin_start (cal, 12);
+  gtk_widget_set_margin_end (cal, 12);
+  gtk_widget_set_margin_bottom (cal, 12);
+  g_signal_connect (cal, "day-selected", G_CALLBACK (on_goto_picked), dialog);
+  GtkWidget *tv = adw_toolbar_view_new ();
+  adw_toolbar_view_add_top_bar (ADW_TOOLBAR_VIEW (tv), adw_header_bar_new ());
+  adw_toolbar_view_set_content (ADW_TOOLBAR_VIEW (tv), cal);
+  adw_dialog_set_child (dialog, tv);
+  adw_dialog_present (dialog, U.view);
+}
+
+/* ---- keyboard: edit, copy, paste, delete and nudge the selected event ---- */
+
+/* the event the user picked last: in the day and week grids, or by clicking a chip or popover */
+static const char *
+selected_event (gint64 *occ)
+{
+  gint64 o = 0;
+  const char *id = (U.mode == VIEW_DAY || U.mode == VIEW_WEEK) ? cal_grid_selected (U.time_grid, &o) : NULL;
+  if (!id && sel_id && calendar_find (calendar_default (), sel_id))
+    {
+      id = sel_id;
+      o = sel_occ;
+    }
+  if (id && occ)
+    *occ = o;
+  return id;
+}
+
+static void
+move_selected (int minutes, int days)
+{
+  gint64 occ;
+  const char *id = selected_event (&occ);
+  const CalEvent *ev = id ? calendar_find (calendar_default (), id) : NULL;
+  if (!ev || calendar_of (ev)->url)
+    return;
+  CalEvent *edited = calendar_event_copy (ev);
+  gint64 start = days ? shift_days (occ, days) : occ + (gint64) minutes * 60;
+  edited->start = start;
+  edited->end = start + (ev->end - ev->start);
+  edit_showing (id, occ, edited, NULL);
+}
+
+static void
+copy_selected (void)
+{
+  gint64 occ;
+  const char *id = selected_event (&occ);
+  if (!id)
+    return;
+  calendar_event_free (clipboard_event);
+  clipboard_event = calendar_event_copy (calendar_find (calendar_default (), id));
+  /* remember the showing's own time, not the first one's */
+  clipboard_event->start = occ;
+  clipboard_event->end = occ + (clipboard_event->end - calendar_find (calendar_default (), id)->start);
+}
+
+static void
+paste_event (void)
+{
+  if (!clipboard_event)
+    return;
+  CalEvent *ev = calendar_event_copy (clipboard_event);
+  gint64 length = ev->end - ev->start;
+  gint64 clock = ev->start - calendar_day_start (ev->start);
+  g_autoptr (GDateTime) d = local_dt (U.anchor);
+  g_autoptr (GDateTime) base = g_date_time_new_local (g_date_time_get_year (d), g_date_time_get_month (d), g_date_time_get_day_of_month (d), 0, 0, 0);
+  g_autoptr (GDateTime) at = g_date_time_add_seconds (base, ev->all_day ? 0 : (gdouble) clock);
+  ev->start = g_date_time_to_unix (at);
+  ev->end = ev->start + length;
+  ev->done = FALSE;
+  g_clear_pointer (&ev->exceptions, g_array_unref);
+  g_clear_pointer (&ev->completed, g_array_unref);
+  if (calendar_of (ev)->url)
+    {
+      g_free (ev->calendar);
+      ev->calendar = NULL;
+    }
+  calendar_add (calendar_default (), ev);
+  refresh_all ();
+}
+
 static gboolean
 on_key (GtkEventControllerKey *c, guint keyval, guint keycode, GdkModifierType state, gpointer data)
 {
   (void) c; (void) keycode; (void) data;
+  GtkWidget *focus = gtk_root_get_focus (gtk_widget_get_root (U.view));
+  gboolean typing = focus && GTK_IS_EDITABLE (focus);
+
   if (!(state & GDK_CONTROL_MASK))
-    return FALSE;
+    {
+      if ((keyval == GDK_KEY_Delete || keyval == GDK_KEY_BackSpace) && !typing)
+        {
+          gint64 occ;
+          const char *id = selected_event (&occ);
+          const CalEvent *ev = id ? calendar_find (calendar_default (), id) : NULL;
+          if (ev && !calendar_of (ev)->url)
+            {
+              delete_showing (id, occ, NULL);
+              return TRUE;
+            }
+        }
+      return FALSE;
+    }
+  if (state & GDK_ALT_MASK)
+    {
+      switch (keyval)
+        {
+        case GDK_KEY_Up:    move_selected (-15, 0); return TRUE;
+        case GDK_KEY_Down:  move_selected (15, 0); return TRUE;
+        case GDK_KEY_Left:  move_selected (0, -1); return TRUE;
+        case GDK_KEY_Right: move_selected (0, 1); return TRUE;
+        default:            return FALSE;
+        }
+    }
   switch (keyval)
     {
     case GDK_KEY_n:     gtk_menu_button_popup (GTK_MENU_BUTTON (U.new_button)); return TRUE;
     case GDK_KEY_f:     gtk_widget_grab_focus (U.search); return TRUE;
     case GDK_KEY_t:     on_today (NULL, NULL); return TRUE;
+    case GDK_KEY_T:     open_goto (); return TRUE;
     case GDK_KEY_l:     gtk_widget_grab_focus (U.quick); return TRUE;
+    case GDK_KEY_comma: open_settings (); return TRUE;
+    case GDK_KEY_r:     calendar_subscriptions_refresh_all (); return TRUE;
+    case GDK_KEY_p:     print_view (); return TRUE;
+    case GDK_KEY_e:
+      {
+        gint64 occ;
+        const char *id = selected_event (&occ);
+        const CalEvent *ev = id ? calendar_find (calendar_default (), id) : NULL;
+        if (ev)
+          open_editor (ev, occ, 0, 0);
+        return ev != NULL;
+      }
+    case GDK_KEY_c:     if (typing) return FALSE; copy_selected (); return TRUE;
+    case GDK_KEY_v:     if (typing) return FALSE; paste_event (); return TRUE;
     case GDK_KEY_1:     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_DAY]), TRUE); return TRUE;
     case GDK_KEY_2:     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_WEEK]), TRUE); return TRUE;
     case GDK_KEY_3:     gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (U.toggle[VIEW_MONTH]), TRUE); return TRUE;
@@ -1713,41 +2799,66 @@ on_sidebar_toggled (GtkToggleButton *b, gpointer data)
   gtk_revealer_set_reveal_child (GTK_REVEALER (U.sidebar), gtk_toggle_button_get_active (b));
 }
 
+static void
+act_settings (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void) a; (void) p; (void) d;
+  open_settings ();
+}
+
+static void
+act_goto (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void) a; (void) p; (void) d;
+  open_goto ();
+}
+
+static void act_import (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; open_import (); }
+static void act_export (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; open_export (); }
+static void act_subscribe (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; open_subscribe (); }
+static void act_holidays (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; open_holidays (); }
+
+static void
+print_view (void)
+{
+  PrintView v = U.mode == VIEW_DAY ? PRINT_DAY : U.mode == VIEW_WEEK ? PRINT_WEEK : U.mode == VIEW_MONTH ? PRINT_MONTH : PRINT_YEAR;
+  calendar_print (GTK_WINDOW (gtk_widget_get_root (U.view)), v, U.anchor, NULL);
+}
+
+static void act_print (GSimpleAction *a, GVariant *p, gpointer d) { (void) a; (void) p; (void) d; print_view (); }
+
+static void
+act_refresh (GSimpleAction *a, GVariant *p, gpointer d)
+{
+  (void) a; (void) p; (void) d;
+  calendar_subscriptions_refresh_all ();
+}
+
 static GtkWidget *
-theme_menu (void)
+main_menu (void)
 {
   GtkWidget *btn = gtk_menu_button_new ();
   gtk_menu_button_set_icon_name (GTK_MENU_BUTTON (btn), "open-menu-symbolic");
-  GtkWidget *pop = gtk_popover_new ();
-  GtkWidget *box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 8);
-  gtk_widget_set_margin_start (box, 8);
-  gtk_widget_set_margin_end (box, 8);
-  gtk_widget_set_margin_top (box, 8);
-  gtk_widget_set_margin_bottom (box, 8);
-  GtkWidget *label = gtk_label_new (TR ("Apariencia", "Appearance"));
-  gtk_widget_add_css_class (label, "cal-section");
-  gtk_label_set_xalign (GTK_LABEL (label), 0);
-  gtk_box_append (GTK_BOX (box), label);
-  GtkWidget *row = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
-  gtk_widget_add_css_class (row, "linked");
-  const char *saved = saved_theme ();
-  static const char *ids[] = { "system", "light", "dark" };
-  GtkWidget *first = NULL;
-  for (int i = 0; i < 3; i++)
-    {
-      const char *names[] = { TR ("Sistema", "System"), TR ("Claro", "Light"), TR ("Oscuro", "Dark") };
-      GtkWidget *t = gtk_toggle_button_new_with_label (names[i]);
-      if (first)
-        gtk_toggle_button_set_group (GTK_TOGGLE_BUTTON (t), GTK_TOGGLE_BUTTON (first));
-      else
-        first = t;
-      gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (t), g_str_equal (saved, ids[i]));
-      g_signal_connect (t, "toggled", G_CALLBACK (on_theme_toggled), (gpointer) ids[i]);
-      gtk_box_append (GTK_BOX (row), t);
-    }
-  gtk_box_append (GTK_BOX (box), row);
-  gtk_popover_set_child (GTK_POPOVER (pop), box);
-  gtk_menu_button_set_popover (GTK_MENU_BUTTON (btn), pop);
+  GMenu *menu = g_menu_new ();
+  GMenu *nav = g_menu_new ();
+  g_menu_append (nav, TR ("Ir a la fecha…", "Go to date…"), "cal.goto");
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (nav));
+  GMenu *data = g_menu_new ();
+  g_menu_append (data, TR ("Importar un archivo .ics…", "Import an .ics file…"), "cal.import");
+  g_menu_append (data, TR ("Exportar…", "Export…"), "cal.export");
+  g_menu_append (data, TR ("Suscribirse a un calendario…", "Subscribe to a calendar…"), "cal.subscribe");
+  g_menu_append (data, TR ("Añadir festivos de un país…", "Add a country's holidays…"), "cal.holidays");
+  g_menu_append (data, TR ("Actualizar suscripciones", "Refresh subscriptions"), "cal.refresh");
+  g_menu_append (data, TR ("Imprimir…", "Print…"), "cal.print");
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (data));
+  g_object_unref (data);
+  GMenu *app = g_menu_new ();
+  g_menu_append (app, TR ("Ajustes", "Settings"), "cal.settings");
+  g_menu_append_section (menu, NULL, G_MENU_MODEL (app));
+  gtk_menu_button_set_menu_model (GTK_MENU_BUTTON (btn), G_MENU_MODEL (menu));
+  g_object_unref (nav);
+  g_object_unref (app);
+  g_object_unref (menu);
   return btn;
 }
 
@@ -1824,8 +2935,7 @@ calendar_ui_view_new (void)
     gtk_box_append (GTK_BOX (modes), U.toggle[i]);
   adw_header_bar_set_title_widget (ADW_HEADER_BAR (header), modes);
 
-  if (standalone)
-    adw_header_bar_pack_end (ADW_HEADER_BAR (header), theme_menu ());
+  adw_header_bar_pack_end (ADW_HEADER_BAR (header), main_menu ());
   U.search = gtk_search_entry_new ();
   gtk_widget_set_size_request (U.search, 170, -1);
   gtk_search_entry_set_placeholder_text (GTK_SEARCH_ENTRY (U.search), TR ("Buscar", "Search"));
@@ -1871,7 +2981,14 @@ calendar_ui_view_new (void)
   gtk_grid_set_column_homogeneous (GTK_GRID (U.month_grid), TRUE);
   gtk_widget_add_css_class (U.month_grid, "cal-month");
   gtk_widget_set_vexpand (U.month_grid, TRUE);
-  gtk_box_append (GTK_BOX (month), U.month_grid);
+  gtk_widget_set_hexpand (U.month_grid, TRUE);
+  U.month_wn = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+  gtk_box_set_homogeneous (GTK_BOX (U.month_wn), TRUE);
+  GtkWidget *month_body = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+  gtk_box_append (GTK_BOX (month_body), U.month_wn);
+  gtk_box_append (GTK_BOX (month_body), U.month_grid);
+  gtk_widget_set_vexpand (month_body, TRUE);
+  gtk_box_append (GTK_BOX (month), month_body);
 
   /* ---- year page ---- */
   U.year_grid = gtk_grid_new ();
@@ -1886,7 +3003,7 @@ calendar_ui_view_new (void)
   gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (year_scroll), U.year_grid);
 
   /* ---- week and day page ---- */
-  CalGridCallbacks cb = { on_grid_picked, on_grid_open, on_grid_create, on_grid_moved };
+  CalGridCallbacks cb = { on_grid_picked, on_grid_open, on_grid_create, on_grid_toggled, on_grid_moved };
   U.time_grid = cal_grid_new (&cb, NULL);
   U.scroller = gtk_scrolled_window_new ();
   gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (U.scroller), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
@@ -1948,6 +3065,20 @@ calendar_ui_view_new (void)
   gtk_event_controller_set_propagation_phase (keys, GTK_PHASE_CAPTURE);
   g_signal_connect (keys, "key-pressed", G_CALLBACK (on_key), NULL);
   gtk_widget_add_controller (tv, keys);
+  GSimpleActionGroup *actions = g_simple_action_group_new ();
+  GActionEntry entries[] = {
+    { "settings", act_settings, NULL, NULL, NULL, { 0 } },
+    { "goto", act_goto, NULL, NULL, NULL, { 0 } },
+    { "import", act_import, NULL, NULL, NULL, { 0 } },
+    { "export", act_export, NULL, NULL, NULL, { 0 } },
+    { "subscribe", act_subscribe, NULL, NULL, NULL, { 0 } },
+    { "holidays", act_holidays, NULL, NULL, NULL, { 0 } },
+    { "refresh", act_refresh, NULL, NULL, NULL, { 0 } },
+    { "print", act_print, NULL, NULL, NULL, { 0 } },
+  };
+  g_action_map_add_action_entries (G_ACTION_MAP (actions), entries, G_N_ELEMENTS (entries), NULL);
+  gtk_widget_insert_action_group (tv, "cal", G_ACTION_GROUP (actions));
+  g_object_unref (actions);
   U.view = tv;
   refresh_all ();
   return tv;
@@ -2031,12 +3162,80 @@ selftest_step (gpointer data)
   ev = calendar_find (cal, event_id);
   CHECK (ev && ev->start == s, "a click without dragging leaves the event alone");
 
+  /* keyboard: nudge by 15 minutes, copy and paste to another day, delete and bring back */
+  {
+    settle ();
+    const CalEvent *cur = calendar_find (cal, event_id);
+    gint64 before = cur ? cur->start : 0;
+    move_selected (15, 0);
+    cur = calendar_find (cal, event_id);
+    CHECK (cur && cur->start == before + 900, "Ctrl+Alt+Down moves the selected event 15 minutes");
+    move_selected (0, 1);
+    cur = calendar_find (cal, event_id);
+    CHECK (cur && calendar_day_start (cur->start) == calendar_day_next (calendar_day_start (before)), "Ctrl+Alt+Right moves it a day");
+    move_selected (0, -1);
+    move_selected (-15, 0);
+    cur = calendar_find (cal, event_id);
+    CHECK (cur && cur->start == before, "and back again");
+    guint count = calendar_count (cal);
+    copy_selected ();
+    U.anchor = shift_days (today, 2);
+    paste_event ();
+    CHECK (calendar_count (cal) == count + 1, "paste adds a copy");
+    U.anchor = today;
+    on_key (NULL, GDK_KEY_Delete, 0, 0, NULL);
+    CHECK (calendar_find (cal, event_id) == NULL, "Delete removes the selected event");
+    g_autofree char *gone = NULL;
+    CHECK (calendar_undo_delete (cal, &gone) && calendar_find (cal, event_id) != NULL, "and it can be brought back");
+    refresh_all ();
+    settle ();
+    /* the drag steps below need the event selected again */
+    cal_grid_point (U.time_grid, before + 1800, &x, &y);
+    cal_grid_test_drag (U.time_grid, x, y, x + 1, y + 1);
+  }
+
   /* create: drag across free time from 18:00 to 19:30 */
   cal_grid_point (U.time_grid, today + 18 * 3600, &x, &y);
   cal_grid_point (U.time_grid, today + 19 * 3600 + 1800, &x1, &y1);
   test_create_start = test_create_end = 0;
   cal_grid_test_drag (U.time_grid, x, y, x1, y1);
   CHECK (test_create_start == today + 18 * 3600 && test_create_end == today + 19 * 3600 + 1800, "dragging over free time proposes that range");
+  /* the editor: fill the form and save, then look at what was stored */
+  {
+    gint64 when = today + 20 * 3600;
+    open_editor (NULL, 0, when, when + 3600);
+    CHECK (last_editor != NULL, "the editor opens");
+    if (last_editor)
+      {
+        Editor *ed = last_editor;
+        gtk_editable_set_text (GTK_EDITABLE (ed->title), "Editor test");
+        gtk_editable_set_text (GTK_EDITABLE (ed->location), "Room 7");
+        adw_combo_row_set_selected (ADW_COMBO_ROW (ed->repeat), CAL_REPEAT_WEEKLY);
+        adw_spin_row_set_value (ADW_SPIN_ROW (ed->interval_row), 2);
+        adw_combo_row_set_selected (ADW_COMBO_ROW (ed->ends_row), 2);
+        adw_spin_row_set_value (ADW_SPIN_ROW (ed->count_row), 3);
+        adw_combo_row_set_selected (ADW_COMBO_ROW (ed->alert1), alert_index (10));
+        adw_combo_row_set_selected (ADW_COMBO_ROW (ed->alert2), alert_index (1440));
+        adw_switch_row_set_active (ADW_SWITCH_ROW (ed->reminder), TRUE);
+        on_editor_save (NULL, ed);
+      }
+    const CalEvent *saved = NULL;
+    GArray *later = calendar_occurrences (cal, when - 60, when + 86400 * 20);
+    for (guint i = 0; i < later->len; i++)
+      if (g_str_equal (g_array_index (later, CalOccurrence, i).event->title, "Editor test"))
+        saved = g_array_index (later, CalOccurrence, i).event;
+    CHECK (saved != NULL, "the saved event exists");
+    if (saved)
+      {
+        CHECK (saved->repeat == CAL_REPEAT_WEEKLY && saved->interval == 2 && saved->count == 3, "repeat every 2 weeks, 3 times");
+        CHECK (saved->reminder, "it is a reminder");
+        CHECK (calendar_event_alert_count (saved) == 2 && calendar_event_alert (saved, 0) == 10 && calendar_event_alert (saved, 1) == 1440,
+               "two alerts");
+        CHECK (g_str_equal (saved->location, "Room 7"), "location");
+      }
+    g_array_free (later, TRUE);
+  }
+
   g_print (ok ? "SELFTEST PASS\n" : "SELFTEST FAILED\n");
   *result = ok;
   return G_SOURCE_REMOVE;
@@ -2048,4 +3247,39 @@ calendar_ui_selftest (void)
   static gboolean result = FALSE;
   selftest_step (&result);
   return result;
+}
+
+/* for screenshots: open one of the dialogs on start */
+void
+calendar_ui_debug_open (const char *what)
+{
+  if (!U.view || !what)
+    return;
+  if (g_str_equal (what, "editor"))
+    open_editor (NULL, 0, 0, 0);
+  else if (g_str_equal (what, "editor-repeat"))
+    {
+      open_editor (NULL, 0, 0, 0);
+      if (last_editor)
+        {
+          adw_combo_row_set_selected (ADW_COMBO_ROW (last_editor->repeat), CAL_REPEAT_WEEKLY);
+          adw_combo_row_set_selected (ADW_COMBO_ROW (last_editor->ends_row), 2);
+        }
+    }
+  else if (g_str_equal (what, "settings"))
+    open_settings ();
+  else if (g_str_equal (what, "goto"))
+    open_goto ();
+}
+
+/* for tests: one PDF per view, without a dialog */
+void
+calendar_ui_debug_print (const char *directory)
+{
+  static const char *names[] = { "day", "week", "month", "year" };
+  for (int v = 0; v < 4; v++)
+    {
+      g_autofree char *path = g_strdup_printf ("%s/%s.pdf", directory, names[v]);
+      calendar_print (NULL, (PrintView) v, U.anchor, path);
+    }
 }

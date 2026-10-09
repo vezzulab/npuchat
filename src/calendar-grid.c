@@ -17,6 +17,7 @@ typedef struct {
   char  *id;
   gint64 occ_start;        /* start of this showing of the event */
   guint  color;
+  gboolean reminder, done;
 } Block;
 
 typedef enum { DRAG_NONE, DRAG_CREATE, DRAG_MOVE, DRAG_RESIZE } DragKind;
@@ -39,6 +40,8 @@ typedef struct {
   /* proposed result while dragging */
   gint64              ghost_start, ghost_end;
   char               *selected;
+  gint64              selected_occ;
+  int                 hour_from, hour_to;   /* the working day, shaded around */
   guint               draws;       /* how many times the grid was drawn, for tests */
 } Grid;
 
@@ -278,6 +281,8 @@ layout_day (Grid *g, GArray *occ, int index)
       b.id = g_strdup (s->occ->event->id);
       b.occ_start = s->occ->start;
       b.color = calendar_calendar_find (cal, s->occ->event->calendar)->color;
+      b.reminder = s->occ->event->reminder;
+      b.done = b.reminder && calendar_is_done (s->occ->event, s->occ->start);
       g_array_append_val (g->blocks, b);
     }
   g_array_free (slots, TRUE);
@@ -318,16 +323,41 @@ draw_block (Grid *g, cairo_t *cr, const Block *b, const CalEvent *ev, gint64 s, 
     }
 
   GdkRGBA text = selected ? (GdkRGBA) { 1, 1, 1, 1 } : text_tint (hex, dark);
+  if (b->done)
+    text.alpha = 0.55;
   cairo_save (cr);
   cairo_rectangle (cr, b->x, b->y, b->w, b->h);
   cairo_clip (cr);
-  draw_text (cr, g->area, ev->title, b->x + 8, b->y + 3, b->w - 12, 16, TRUE, 9.5, &text);
+  double indent = 8;
+  if (b->reminder)
+    {
+      /* an open circle to tick off; a filled one with a check when it is done */
+      double cx = b->x + 15, cy = b->y + 11;
+      cairo_set_line_width (cr, 1.6);
+      cairo_arc (cr, cx, cy, 6, 0, 2 * G_PI);
+      cairo_set_source_rgba (cr, text.red, text.green, text.blue, selected ? 1 : 0.9);
+      if (b->done)
+        {
+          cairo_fill_preserve (cr);
+          cairo_stroke (cr);
+          cairo_set_source_rgba (cr, selected ? accent.red : surface.red, selected ? accent.green : surface.green,
+                                 selected ? accent.blue : surface.blue, 1);
+          cairo_move_to (cr, cx - 3, cy);
+          cairo_line_to (cr, cx - 0.8, cy + 2.4);
+          cairo_line_to (cr, cx + 3.2, cy - 2.4);
+          cairo_stroke (cr);
+        }
+      else
+        cairo_stroke (cr);
+      indent = 26;
+    }
+  draw_text (cr, g->area, ev->title, b->x + indent, b->y + 3, b->w - indent - 4, 16, TRUE, 9.5, &text);
   if (b->h > 34)
     {
       g_autofree char *span = span_label (s, e);
       GdkRGBA dim = text;
       dim.alpha = 0.8;
-      draw_text (cr, g->area, span, b->x + 8, b->y + 19, b->w - 12, 14, FALSE, 8.5, &dim);
+      draw_text (cr, g->area, span, b->x + indent, b->y + 19, b->w - indent - 4, 14, FALSE, 8.5, &dim);
     }
   cairo_restore (cr);
 }
@@ -351,6 +381,22 @@ draw_cb (GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data
         {
           cairo_set_source_rgba (cr, 1, 0.23, 0.19, is_dark (&fg) ? 0.07 : 0.05);
           cairo_rectangle (cr, GUTTER + i * cw, 0, cw, height);
+          cairo_fill (cr);
+        }
+    }
+
+  /* the hours outside the working day are a little darker */
+  if (g->hour_to > g->hour_from && (g->hour_from > 0 || g->hour_to < 24))
+    {
+      cairo_set_source_rgba (cr, fg.red, fg.green, fg.blue, is_dark (&fg) ? 0.035 : 0.03);
+      if (g->hour_from > 0)
+        {
+          cairo_rectangle (cr, GUTTER, 0, width - GUTTER, g->hour_from * HOUR_H);
+          cairo_fill (cr);
+        }
+      if (g->hour_to < 24)
+        {
+          cairo_rectangle (cr, GUTTER, g->hour_to * HOUR_H, width - GUTTER, (24 - g->hour_to) * HOUR_H);
           cairo_fill (cr);
         }
     }
@@ -417,7 +463,7 @@ draw_cb (GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer data
             continue;
           gint64 s = MAX (g->ghost_start, day), e = MIN (g->ghost_end, next);
           Block b = { GUTTER + i * cw + 2, minutes_to_y (minutes_in_day (s)), cw - 6,
-                      MAX ((double) (e - s) / 3600.0 * HOUR_H - 2, 18), NULL, 0, 0 };
+                      MAX ((double) (e - s) / 3600.0 * HOUR_H - 2, 18), NULL, 0, 0, FALSE, FALSE };
           if (g->drag == DRAG_CREATE)
             {
               CalEvent fake = { 0 };
@@ -519,6 +565,8 @@ on_drag_begin (GtkGestureDrag *gesture, double x, double y, gpointer data)
   if (x < GUTTER)
     return;
   const Block *b = block_at (g, x, y);
+  if (b && b->reminder && x < b->x + 24 && y < b->y + 22)
+    return;                      /* the check circle: handled as a click */
   if (b)
     {
       const CalEvent *ev = calendar_find (calendar_default (), b->id);
@@ -532,6 +580,7 @@ on_drag_begin (GtkGestureDrag *gesture, double x, double y, gpointer data)
       g->drag_grab_min = y_to_minutes (y - b->y, FALSE);
       g_free (g->selected);
       g->selected = g_strdup (b->id);
+      g->selected_occ = b->occ_start;
       gtk_widget_queue_draw (g->area);
     }
   else
@@ -639,8 +688,15 @@ on_click (GtkGestureClick *gesture, int n_press, double x, double y, gpointer da
         }
       return;
     }
+  if (b->reminder && x < b->x + 24 && y < b->y + 22)
+    {
+      if (g->cb.toggled)
+        g->cb.toggled (b->id, b->occ_start, g->data);
+      return;
+    }
   g_free (g->selected);
   g->selected = g_strdup (b->id);
+  g->selected_occ = b->occ_start;
   gtk_widget_queue_draw (g->area);
   if (n_press >= 2)
     {
@@ -701,6 +757,8 @@ cal_grid_new (const CalGridCallbacks *callbacks, gpointer data)
   g->cb = *callbacks;
   g->data = data;
   g->ndays = 7;
+  g->hour_from = 0;
+  g->hour_to = 24;
   g->blocks = g_array_new (FALSE, TRUE, sizeof (Block));
   g_array_set_clear_func (g->blocks, block_clear);
 
@@ -780,4 +838,26 @@ cal_grid_draw_count (GtkWidget *grid)
 {
   Grid *g = g_object_get_data (G_OBJECT (grid), "grid");
   return g->draws;
+}
+
+void
+cal_grid_set_hours (GtkWidget *grid, int from, int to)
+{
+  Grid *g = g_object_get_data (G_OBJECT (grid), "grid");
+  g->hour_from = from;
+  g->hour_to = to;
+  gtk_widget_queue_draw (grid);
+}
+
+const char *
+cal_grid_selected (GtkWidget *grid, gint64 *occurrence_start)
+{
+  Grid *g = g_object_get_data (G_OBJECT (grid), "grid");
+  if (g->selected && calendar_find (calendar_default (), g->selected))
+    {
+      if (occurrence_start)
+        *occurrence_start = g->selected_occ;
+      return g->selected;
+    }
+  return NULL;
 }

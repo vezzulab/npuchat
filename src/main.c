@@ -17,6 +17,7 @@
 #include "copilotkey.h"
 #include "calendar.h"
 #include "calendar-alerts.h"
+#include "calendar-subscribe.h"
 #include "calendar-ui.h"
 #include "store.h"
 #include "templates.h"
@@ -1911,7 +1912,9 @@ on_skill_done (char *result, gboolean ok, gpointer data)
     }
 
   ToolStep *st = A.reply->steps->pdata[index];
-  if (ok && g_str_equal (st->name, "calendar_add"))
+  if (ok && (g_str_equal (st->name, "calendar_add") || g_str_equal (st->name, "calendar_change") ||
+             g_str_equal (st->name, "calendar_delete") || g_str_equal (st->name, "calendar_undo") ||
+             g_str_equal (st->name, "calendar_done")))
     {
       calendar_ui_refresh ();
       calendar_alerts_reschedule ();
@@ -5946,6 +5949,7 @@ on_shutdown (GApplication *app, gpointer user_data)
   (void) app;
   (void) user_data;
   flm_shutdown ();
+  calendar_subscriptions_stop ();
   calendar_alerts_stop ();
   calendar_default_free ();
   rag_shutdown ();
@@ -6000,6 +6004,7 @@ on_activate (GApplication *app, gpointer user_data)
 
   settings_load ();
   calendar_alerts_start (G_APPLICATION (app));
+  calendar_subscriptions_start (calendar_ui_refresh);
   i18n_set (A.lang);
   apply_theme ();
 

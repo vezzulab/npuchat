@@ -73,6 +73,57 @@ test_english (void)
 }
 
 static void
+check_extras (const char *text, gboolean reminder, int alert, guint interval, int count, CalRepeat repeat, gboolean month_first)
+{
+  CalQuick q;
+  g_assert_true (calendar_quick_parse (text, at (2026, 10, 8, 10, 0), month_first, &q));
+  if (q.reminder != reminder || q.alert != alert || q.interval != interval || q.count != count || q.repeat != repeat)
+    g_error ("\"%s\"\n   got reminder=%d alert=%d interval=%u count=%d repeat=%d title=\"%s\"\n   want reminder=%d alert=%d interval=%u count=%d repeat=%d",
+             text, q.reminder, q.alert, q.interval, q.count, q.repeat, q.title, reminder, alert, interval, count, repeat);
+  calendar_quick_clear (&q);
+}
+
+static void
+test_extras (void)
+{
+  CalQuick q;
+  check_extras ("dentista mañana 3pm", FALSE, -1, 0, 0, CAL_REPEAT_NONE, FALSE);
+  check_extras ("dentista mañana 3pm avísame 15 min antes", FALSE, 15, 0, 0, CAL_REPEAT_NONE, FALSE);
+  check_extras ("flight friday 8am alert 2 hours before", FALSE, 120, 0, 0, CAL_REPEAT_NONE, TRUE);
+  check_extras ("cumpleaños de mamá 3 de noviembre 1 día antes", FALSE, 1440, 0, 0, CAL_REPEAT_NONE, FALSE);
+  check_extras ("recuérdame pagar la renta mañana", TRUE, -1, 0, 0, CAL_REPEAT_NONE, FALSE);
+  check_extras ("remind me to call mom friday 5pm", TRUE, -1, 0, 0, CAL_REPEAT_NONE, TRUE);
+  check_extras ("gym cada 2 semanas lunes 6am", FALSE, -1, 2, 0, CAL_REPEAT_WEEKLY, FALSE);
+  check_extras ("gym every other week monday 6am", FALSE, -1, 2, 0, CAL_REPEAT_WEEKLY, TRUE);
+  check_extras ("curso cada semana 8 veces jueves 6pm", FALSE, -1, 0, 8, CAL_REPEAT_WEEKLY, FALSE);
+  check_extras ("rent every 3 months on the 1st", FALSE, -1, 3, 0, CAL_REPEAT_MONTHLY, TRUE);
+  check_extras ("pills every day 5 times 8am", FALSE, -1, 0, 5, CAL_REPEAT_DAILY, TRUE);
+
+  /* an ISO date, as models and files write it */
+  g_assert_true (calendar_quick_parse ("dentist 2026-11-20 16:30", at (2026, 10, 8, 10, 0), TRUE, &q));
+  g_assert_cmpint (q.start, ==, at (2026, 11, 20, 16, 30));
+  g_assert_cmpstr (q.title, ==, "Dentist");
+  calendar_quick_clear (&q);
+
+  /* titles come out clean */
+  g_assert_true (calendar_quick_parse ("recuérdame pagar la renta mañana", at (2026, 10, 8, 10, 0), FALSE, &q));
+  g_assert_cmpstr (q.title, ==, "Pagar la renta");
+  calendar_quick_clear (&q);
+  g_assert_true (calendar_quick_parse ("dentista mañana 3pm avísame 15 min antes", at (2026, 10, 8, 10, 0), FALSE, &q));
+  g_assert_cmpstr (q.title, ==, "Dentista");
+  calendar_quick_clear (&q);
+  g_assert_true (calendar_quick_parse ("curso cada semana hasta el 15 de diciembre jueves 6pm", at (2026, 10, 8, 10, 0), FALSE, &q));
+  g_assert_cmpstr (q.title, ==, "Curso");
+  g_assert_cmpint (q.until, ==, at (2026, 12, 15, 0, 0));
+  g_assert_cmpint (q.start, ==, at (2026, 10, 8, 18, 0));
+  calendar_quick_clear (&q);
+  g_assert_true (calendar_quick_parse ("class every week until december 15 thursday 6pm", at (2026, 10, 8, 10, 0), TRUE, &q));
+  g_assert_cmpint (q.until, ==, at (2026, 12, 15, 0, 0));
+  g_assert_cmpstr (q.title, ==, "Class");
+  calendar_quick_clear (&q);
+}
+
+static void
 test_edges (void)
 {
   CalQuick q;
@@ -104,6 +155,7 @@ main (int argc, char **argv)
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/quick/spanish", test_spanish);
   g_test_add_func ("/quick/english", test_english);
+  g_test_add_func ("/quick/extras", test_extras);
   g_test_add_func ("/quick/edges", test_edges);
   return g_test_run ();
 }

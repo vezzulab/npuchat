@@ -12,6 +12,8 @@ typedef struct {
   void (*picked) (const char *event_id, gint64 occurrence_start, GtkWidget *grid, double x, double y, gpointer data);
   void (*open) (const char *event_id, gint64 occurrence_start, gpointer data);      /* double click */
   void (*create) (gint64 start, gint64 end, gpointer data);                         /* dragged over free time */
+  /* the check circle of a reminder was clicked */
+  void (*toggled) (const char *event_id, gint64 occurrence_start, gpointer data);
   /* moved or resized: the showing that started at occ_start now runs from new_start to new_end */
   void (*moved) (const char *event_id, gint64 occ_start, gint64 new_start, gint64 new_end, gpointer data);
 } CalGridCallbacks;
@@ -26,3 +28,8 @@ double     cal_grid_hour_y (GtkWidget *grid, int hour);
 gboolean   cal_grid_point (GtkWidget *grid, gint64 t, double *x, double *y);
 void       cal_grid_test_drag (GtkWidget *grid, double x0, double y0, double x1, double y1);
 guint      cal_grid_draw_count (GtkWidget *grid);
+
+/* Hours outside [from, to) are shaded: the working day. */
+void       cal_grid_set_hours (GtkWidget *grid, int from, int to);
+/* The selected event, or NULL; occurrence_start tells which showing. */
+const char *cal_grid_selected (GtkWidget *grid, gint64 *occurrence_start);

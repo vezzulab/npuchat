@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "../src/i18n.h"
+#include "../src/calendar-tools.h"
 #include "../src/calendar.h"
 #include "../src/skills.h"
 
@@ -207,7 +208,7 @@ test_tool_definitions (void)
       json_builder_end_object (b);
       g_autoptr (JsonNode) root = json_builder_get_root (b);
       JsonArray *tools = json_object_get_array_member (json_node_get_object (root), "tools");
-      CHECK (json_array_get_length (tools) == (pass ? 1u : 5u), "tool count (pass %d): %u", pass, json_array_get_length (tools));
+      CHECK (json_array_get_length (tools) == (pass ? 1u : 11u), "tool count (pass %d): %u", pass, json_array_get_length (tools));
       for (guint i = 0; i < json_array_get_length (tools); i++)
         {
           JsonObject *fn = json_object_get_object_member (json_array_get_object_element (tools, i), "function");
@@ -223,29 +224,29 @@ test_calendar (void)
   i18n_set ("en");
   CHECK (skill_find ("calendar_add") == skill_find ("calendar_agenda") && skill_find ("calendar_add") != NULL,
          "both calendar tools belong to the calendar skill");
-  g_autofree char *empty = skill_calendar_agenda ("today");
+  g_autofree char *empty = calendar_tool_agenda ("today");
   CHECK (strstr (empty, "No events"), "an empty calendar says so: %s", empty);
 
   gboolean ok;
-  g_autofree char *added = skill_calendar_add ("dentist tomorrow 3pm", &ok);
+  g_autofree char *added = calendar_tool_add ("dentist tomorrow 3pm", &ok);
   CHECK (ok && strstr (added, "Added:") && strstr (added, "dentist") == NULL && strstr (added, "Dentist") && strstr (added, "15:00"),
          "adding in the user's words works: %s", added);
-  g_autofree char *tomorrow = skill_calendar_agenda ("tomorrow");
+  g_autofree char *tomorrow = calendar_tool_agenda ("tomorrow");
   CHECK (strstr (tomorrow, "Dentist") && strstr (tomorrow, "15:00–16:00"), "it shows up tomorrow: %s", tomorrow);
-  g_autofree char *today = skill_calendar_agenda ("today");
+  g_autofree char *today = calendar_tool_agenda ("today");
   CHECK (strstr (today, "No events"), "and not today: %s", today);
-  g_autofree char *week = skill_calendar_agenda ("this week");
+  g_autofree char *week = calendar_tool_agenda ("this week");
   CHECK (strstr (week, "Dentist"), "and in the week: %s", week);
-  g_autofree char *odd = skill_calendar_agenda ("whenever");
+  g_autofree char *odd = calendar_tool_agenda ("whenever");
   CHECK (g_str_has_prefix (odd, "Error"), "an unknown period is an error the model can read: %s", odd);
 
-  g_autofree char *noname = skill_calendar_add ("tomorrow 3pm", &ok);
+  g_autofree char *noname = calendar_tool_add ("tomorrow 3pm", &ok);
   CHECK (!ok && g_str_has_prefix (noname, "Error"), "an event without a name is refused: %s", noname);
-  g_autofree char *junk = skill_calendar_add ("", &ok);
+  g_autofree char *junk = calendar_tool_add ("", &ok);
   CHECK (!ok && g_str_has_prefix (junk, "Error"), "empty input is refused: %s", junk);
 
   i18n_set ("es");
-  g_autofree char *es = skill_calendar_add ("cena con Ana viernes 8pm", &ok);
+  g_autofree char *es = calendar_tool_add ("cena con Ana viernes 8pm", &ok);
   CHECK (ok && strstr (es, "Apuntado:") && strstr (es, "Cena con Ana") && strstr (es, "20:00"), "Spanish works: %s", es);
   i18n_set ("en");
 }

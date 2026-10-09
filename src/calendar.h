@@ -13,30 +13,49 @@ typedef enum {
   CAL_REPEAT_YEARLY,
 } CalRepeat;
 
-#define CAL_NO_ALERT (-1)
+/* How a monthly event picks its day. */
+typedef enum {
+  CAL_MONTHLY_DATE,     /* the same day number: the 15th */
+  CAL_MONTHLY_WEEKDAY,  /* the same weekday: the second Tuesday, or the last one */
+  CAL_MONTHLY_LAST_DAY, /* the last day of the month */
+} CalMonthly;
+
 #define CAL_N_COLORS 8
 
 /* A calendar groups events and gives them a color ("Personal", "Work"…). */
 typedef struct {
   char     *id;
   char     *name;
-  guint     color;    /* 0 .. CAL_N_COLORS-1, see calendar_color_hex */
+  guint     color;         /* 0 .. CAL_N_COLORS-1, see calendar_color_hex */
   gboolean  visible;
+  /* subscriptions: read-only calendars fed from a web address */
+  char     *url;           /* NULL for the user's own calendars */
+  int       refresh_hours; /* how often to fetch it again */
+  gint64    fetched;       /* unix time of the last successful fetch */
 } CalCalendar;
 
 typedef struct {
   char     *id;
-  char     *calendar;  /* id of its CalCalendar */
+  char     *uid;           /* the iCalendar UID when it came from outside, else NULL */
+  char     *calendar;      /* id of its CalCalendar */
   char     *title;
   char     *notes;
   char     *location;
-  int       alert;     /* minutes before the start, CAL_NO_ALERT for none */
-  gint64    start;    /* unix seconds; an all-day event starts at local midnight */
-  gint64    end;      /* exclusive; always after start */
+  char     *url;           /* a link kept with the event */
+  GArray   *alerts;        /* int: minutes before the start; empty for none */
+  gint64    start;         /* unix seconds; an all-day event starts at local midnight */
+  gint64    end;           /* exclusive; always after start; may be days later */
   gboolean  all_day;
+  gboolean  reminder;      /* a task with a check box instead of a block of time */
+  gboolean  done;          /* a completed reminder that does not repeat */
+  GArray   *completed;     /* gint64: finished showings of a repeating reminder */
   CalRepeat repeat;
-  gint64    until;    /* last day a repeating event may start on, 0 = forever */
-  GArray   *exceptions; /* gint64: showings removed from a repeating event ('only this one' edits) */
+  guint     interval;      /* every N days/weeks/months/years; 0 means 1 */
+  guint     weekdays;      /* weekly: bit 0 Monday … bit 6 Sunday; 0 means the start's weekday */
+  CalMonthly monthly;
+  int       count;         /* the series ends after this many showings; 0 means never */
+  gint64    until;         /* last day a repeating event may start on, 0 = forever */
+  GArray   *exceptions;    /* gint64: showings removed from a repeating event ('only this one' edits) */
 } CalEvent;
 
 /* One concrete showing of an event inside a time range. */
@@ -54,15 +73,30 @@ void      calendar_free (Calendar *cal);
 CalEvent *calendar_event_new (const char *title, gint64 start, gint64 end, gboolean all_day);
 void      calendar_event_free (CalEvent *ev);
 CalEvent *calendar_event_copy (const CalEvent *ev);
+/* alerts */
+void      calendar_event_set_alerts (CalEvent *ev, const int *minutes, guint n);
+void      calendar_event_add_alert (CalEvent *ev, int minutes);
+int       calendar_event_alert (const CalEvent *ev, guint index);   /* -1 past the end */
+guint     calendar_event_alert_count (const CalEvent *ev);
 
 /* ---- calendars ---- */
 const char *calendar_color_hex (guint color);
 GPtrArray  *calendar_calendars (Calendar *cal);              /* CalCalendar*, never empty */
 CalCalendar *calendar_calendar_find (Calendar *cal, const char *id);  /* falls back to the first */
 const char *calendar_calendar_add (Calendar *cal, const char *name, guint color);
+/* A calendar fed from a web address; its events are replaced by calendar_replace_events. */
+const char *calendar_subscription_add (Calendar *cal, const char *name, guint color, const char *url, int refresh_hours);
 void        calendar_calendar_changed (Calendar *cal);       /* after editing a CalCalendar in place */
 /* Deletes the calendar and its events; the last calendar cannot be removed. */
 gboolean    calendar_calendar_remove (Calendar *cal, const char *id);
+/* Swaps all the events of a calendar for these (takes ownership of the array's events). */
+void        calendar_replace_events (Calendar *cal, const char *calendar_id, GPtrArray *events);
+/* The first calendar that accepts new events (not a subscription). */
+const CalCalendar *calendar_default_target (Calendar *cal);
+
+/* Adds all these events to a calendar and saves once. Takes ownership of the events and empties
+ * the array. Returns how many were added. */
+guint calendar_import (Calendar *cal, GPtrArray *events, const char *calendar_id);
 
 /* Takes ownership of ev, gives it an id and saves. Returns the id (owned by the calendar). */
 const char     *calendar_add (Calendar *cal, CalEvent *ev);
@@ -81,12 +115,25 @@ gboolean        calendar_update (Calendar *cal, CalEvent *ev);
 gboolean        calendar_remove (Calendar *cal, const char *id);
 const CalEvent *calendar_find (Calendar *cal, const char *id);
 guint           calendar_count (Calendar *cal);
+/* Every stored event, in the order they were added (CalEvent*). Do not modify the array. */
+const GPtrArray *calendar_all_events (Calendar *cal);
+
+/* Deleted events wait here, so a deletion (the user's or the model's) can be undone. */
+gboolean        calendar_undo_delete (Calendar *cal, char **title);  /* brings back the last one */
+
+/* Marks one showing of a reminder done or not done. */
+void            calendar_set_done (Calendar *cal, const char *id, gint64 occ_start, gboolean done);
+gboolean        calendar_is_done (const CalEvent *ev, gint64 occ_start);
 
 /* Occurrences that overlap [from, to), sorted by start. Free with g_array_free (arr, TRUE). */
 GArray *calendar_occurrences (Calendar *cal, gint64 from, gint64 to);
 
+/* Gaps of at least `minutes` inside [from, to) between the visible events, restricted
+ * to the hours [hour_from, hour_to) of each day. Each pair is start, end (gint64). */
+GArray *calendar_free_slots (Calendar *cal, gint64 from, gint64 to, int minutes, int hour_from, int hour_to);
+
 /* The next alert that fires after the given time: when, and for which showing of
- * which event. Looks about nine days ahead. FALSE when nothing is scheduled. */
+ * which event. Looks about ten days ahead. FALSE when nothing is scheduled. */
 typedef struct {
   const CalEvent *event;
   gint64          fire;

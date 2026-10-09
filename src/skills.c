@@ -7,7 +7,7 @@
 #include <string.h>
 #include <sys/statvfs.h>
 
-#include "calendar-quick.h"
+#include "calendar-tools.h"
 #include "calendar.h"
 #include "i18n.h"
 #include "net.h"
@@ -94,6 +94,51 @@ add_function (JsonBuilder *b, const char *name, const char *description, const c
   json_builder_end_object (b);
 }
 
+typedef struct {
+  const char *name, *description;
+  gboolean    required;
+} ParamSpec;
+
+static void
+add_function_params (JsonBuilder *b, const char *name, const char *description, const ParamSpec *params, guint n)
+{
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "type");
+  json_builder_add_string_value (b, "function");
+  json_builder_set_member_name (b, "function");
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "name");
+  json_builder_add_string_value (b, name);
+  json_builder_set_member_name (b, "description");
+  json_builder_add_string_value (b, description);
+  json_builder_set_member_name (b, "parameters");
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "type");
+  json_builder_add_string_value (b, "object");
+  json_builder_set_member_name (b, "properties");
+  json_builder_begin_object (b);
+  for (guint i = 0; i < n; i++)
+    {
+      json_builder_set_member_name (b, params[i].name);
+      json_builder_begin_object (b);
+      json_builder_set_member_name (b, "type");
+      json_builder_add_string_value (b, "string");
+      json_builder_set_member_name (b, "description");
+      json_builder_add_string_value (b, params[i].description);
+      json_builder_end_object (b);
+    }
+  json_builder_end_object (b);
+  json_builder_set_member_name (b, "required");
+  json_builder_begin_array (b);
+  for (guint i = 0; i < n; i++)
+    if (params[i].required)
+      json_builder_add_string_value (b, params[i].name);
+  json_builder_end_array (b);
+  json_builder_end_object (b);
+  json_builder_end_object (b);
+  json_builder_end_object (b);
+}
+
 void
 skills_build_tools (JsonBuilder *b, gboolean (*enabled) (const char *id, gpointer data), gpointer data)
 {
@@ -119,11 +164,31 @@ skills_build_tools (JsonBuilder *b, gboolean (*enabled) (const char *id, gpointe
           add_function (b, "calendar_agenda",
                         "List the events in the user's calendar. Use it for any question about their schedule, "
                         "agenda, appointments or free time.",
-                        "when", "today, tomorrow, week, next week, or a date like 2026-10-09");
+                        "when", "today, tomorrow, week, next week, month, or a date like 2026-10-09");
           add_function (b, "calendar_add",
-                        "Add an event to the user's calendar. Pass the event exactly as the user said it, with its "
-                        "day and time, for example: dentist tomorrow 3pm. Do not work out dates yourself.",
-                        "event", "The event in the user's own words, for example: dinner with Ana thursday 7pm");
+                        "Add an event or a reminder to the user's calendar. Pass it exactly as the user said it, with "
+                        "its day, time, repeat and alert, for example: dentist tomorrow 3pm, or: remind me to pay rent "
+                        "friday, or: gym every monday 6am. Do not work out dates yourself.",
+                        "event", "The event in the user's own words");
+          add_function (b, "calendar_find", "Search the calendar for events by name.", "query", "Part of the event's name");
+          static const ParamSpec change[] = {
+            { "event", "Part of the name of the event to change", TRUE },
+            { "new_time", "The new day and time as the user said it, for example: friday 4pm", FALSE },
+            { "new_title", "A new name for the event", FALSE },
+            { "new_location", "A new place for the event", FALSE },
+          };
+          add_function_params (b, "calendar_change", "Change an event: move it to another time, rename it or change its place.", change,
+                               G_N_ELEMENTS (change));
+          add_function (b, "calendar_delete", "Delete an event from the calendar. The user can undo it.", "event",
+                        "Part of the name of the event to delete");
+          add_function (b, "calendar_undo", "Bring back the event that was deleted last.", NULL, NULL);
+          static const ParamSpec free_params[] = {
+            { "minutes", "How long a gap is needed, in minutes", TRUE },
+            { "when", "today, tomorrow, week, next week or a date", FALSE },
+          };
+          add_function_params (b, "calendar_free", "Find free time in the user's calendar, for example to schedule something.",
+                               free_params, G_N_ELEMENTS (free_params));
+          add_function (b, "calendar_done", "Mark a reminder as done.", "event", "Part of the reminder's name");
         }
       else if (g_str_equal (id, "wikipedia"))
         add_function (b, id,
@@ -467,9 +532,10 @@ skills_instructions (gboolean (*enabled) (const char *id, gpointer data), gpoint
     g_string_append (s, " Call system_status for questions about this computer; battery and memory change, "
                         "so never reuse an earlier value.");
   if (enabled ("calendar", data))
-    g_string_append (s, " You MUST call calendar_agenda for any question about the user's schedule, and calendar_add "
-                        "when they ask you to schedule, add or remember an appointment or event. Pass their words as "
-                        "they said them.");
+    g_string_append (s, " For the calendar you MUST call a tool, never answer from memory: calendar_agenda for any question "
+                        "about their schedule, calendar_add to add or remember an event or reminder, calendar_change to "
+                        "move or rename one, calendar_delete to delete one, calendar_free to find free time. Pass the "
+                        "user's own words, never dates you worked out.");
   if (enabled ("wikipedia", data))
     g_string_append (s, " You MUST call wikipedia whenever the user asks about a specific person, place, organization "
                         "or event, or says 'search' or 'look up'. Never answer those from memory.");
@@ -493,111 +559,6 @@ skill_datetime (void)
                        g_date_time_get_day_of_month (now), g_date_time_get_year (now), clock, tz, iso)
     : g_strdup_printf ("%s %d de %s de %d, %s (UTC%s). Fecha ISO: %s", days_es[dow],
                        g_date_time_get_day_of_month (now), months_es[month], g_date_time_get_year (now), clock, tz, iso);
-}
-
-/* ---- calendar ----------------------------------------------------------- */
-
-static char *
-calendar_line (const CalOccurrence *o)
-{
-  g_autoptr (GDateTime) d = g_date_time_new_from_unix_local (o->start);
-  int dow = g_date_time_get_day_of_week (d) - 1, month = g_date_time_get_month (d) - 1;
-  g_autofree char *when = NULL;
-  if (o->event->all_day)
-    when = g_strdup (TR ("todo el día", "all day"));
-  else
-    {
-      g_autoptr (GDateTime) e = g_date_time_new_from_unix_local (o->end);
-      g_autofree char *a = g_date_time_format (d, "%H:%M");
-      g_autofree char *b = g_date_time_format (e, "%H:%M");
-      when = g_strdup_printf ("%s–%s", a, b);
-    }
-  const CalCalendar *c = calendar_calendar_find (calendar_default (), o->event->calendar);
-  return g_strdup_printf ("- %s %d %s, %s: %s (%s)%s%s", i18n_lang () == LANG_EN ? days_en[dow] : days_es[dow],
-                          g_date_time_get_day_of_month (d), i18n_lang () == LANG_EN ? months_en[month] : months_es[month],
-                          when, o->event->title, c->name, *o->event->location ? " @ " : "", o->event->location);
-}
-
-char *
-skill_calendar_agenda (const char *when)
-{
-  g_autofree char *trimmed = g_strstrip (g_strdup (when ? when : ""));
-  g_autofree char *w = g_ascii_strdown (trimmed, -1);
-  g_autofree char *ascii = g_str_to_ascii (w, NULL);
-  gint64 today = calendar_day_start (g_get_real_time () / G_USEC_PER_SEC);
-  gint64 from = today, to;
-  gint64 t;
-  gboolean date_only;
-  if (!*ascii || g_strstr_len (ascii, -1, "today") || g_strstr_len (ascii, -1, "hoy"))
-    to = calendar_day_next (today);
-  else if (g_strstr_len (ascii, -1, "tomorrow") || g_strstr_len (ascii, -1, "manana"))
-    {
-      from = calendar_day_next (today);
-      to = calendar_day_next (from);
-    }
-  else if (g_strstr_len (ascii, -1, "next week") || g_strstr_len (ascii, -1, "proxima semana"))
-    {
-      g_autoptr (GDateTime) d = g_date_time_new_from_unix_local (today);
-      g_autoptr (GDateTime) a = g_date_time_add_days (d, 7);
-      g_autoptr (GDateTime) b = g_date_time_add_days (d, 14);
-      from = g_date_time_to_unix (a);
-      to = g_date_time_to_unix (b);
-    }
-  else if (g_strstr_len (ascii, -1, "week") || g_strstr_len (ascii, -1, "semana"))
-    {
-      g_autoptr (GDateTime) d = g_date_time_new_from_unix_local (today);
-      g_autoptr (GDateTime) b = g_date_time_add_days (d, 7);
-      to = g_date_time_to_unix (b);
-    }
-  else if (calendar_parse_time (ascii, &t, &date_only))
-    {
-      from = calendar_day_start (t);
-      to = calendar_day_next (from);
-    }
-  else
-    return g_strdup ("Error: say today, tomorrow, week, next week, or a date like 2026-10-09.");
-
-  GArray *occ = calendar_occurrences (calendar_default (), from, to);
-  GString *out = g_string_new (NULL);
-  guint n = 0;
-  for (guint i = 0; i < occ->len && out->len < 1300; i++)
-    {
-      const CalOccurrence *o = &g_array_index (occ, CalOccurrence, i);
-      if (!calendar_calendar_find (calendar_default (), o->event->calendar)->visible)
-        continue;
-      g_autofree char *line = calendar_line (o);
-      g_string_append_printf (out, "%s\n", line);
-      n++;
-    }
-  g_array_free (occ, TRUE);
-  if (!n)
-    {
-      g_string_free (out, TRUE);
-      return g_strdup (TR ("No hay eventos en ese período.", "No events in that period."));
-    }
-  return g_string_free (out, FALSE);
-}
-
-char *
-skill_calendar_add (const char *text, gboolean *ok)
-{
-  CalQuick q;
-  *ok = FALSE;
-  if (!text || !calendar_quick_parse (text, g_get_real_time () / G_USEC_PER_SEC, i18n_lang () == LANG_EN, &q))
-    return g_strdup ("Error: describe the event, for example: dentist tomorrow 3pm.");
-  if (!*q.title)
-    {
-      calendar_quick_clear (&q);
-      return g_strdup ("Error: the event needs a name, for example: dentist tomorrow 3pm.");
-    }
-  CalEvent *ev = calendar_event_new (q.title, q.start, q.end, q.all_day);
-  ev->repeat = q.repeat;
-  CalOccurrence o = { ev, q.start, q.end };
-  g_autofree char *line = calendar_line (&o);
-  calendar_add (calendar_default (), ev);
-  calendar_quick_clear (&q);
-  *ok = TRUE;
-  return g_strdup_printf ("%s %s", TR ("Apuntado:", "Added:"), line + 2);
 }
 
 /* ---- laptop status ------------------------------------------------------ */
@@ -881,16 +842,31 @@ skill_run (const char *id, const char *arguments_json, GCancellable *cancel, Ski
     done (skill_datetime (), TRUE, data);
   else if (g_str_equal (id, "system_status"))
     done (skill_system_status (), TRUE, data);
-  else if (g_str_equal (id, "calendar_agenda"))
+  else if (g_str_has_prefix (id, "calendar_"))
     {
-      char *r = skill_calendar_agenda (args ? json_object_get_string_member_with_default (args, "when", "today") : "today");
-      done (r, !g_str_has_prefix (r, "Error"), data);
-    }
-  else if (g_str_equal (id, "calendar_add"))
-    {
-      gboolean added;
-      char *r = skill_calendar_add (args ? json_object_get_string_member_with_default (args, "event", NULL) : NULL, &added);
-      done (r, added, data);
+      gboolean ok = TRUE;
+      char *r;
+#define ARG(key, fallback) (args ? json_object_get_string_member_with_default (args, key, fallback) : fallback)
+      if (g_str_equal (id, "calendar_agenda"))
+        r = calendar_tool_agenda (ARG ("when", "today"));
+      else if (g_str_equal (id, "calendar_add"))
+        r = calendar_tool_add (ARG ("event", NULL), &ok);
+      else if (g_str_equal (id, "calendar_find"))
+        r = calendar_tool_find (ARG ("query", NULL));
+      else if (g_str_equal (id, "calendar_change"))
+        r = calendar_tool_change (ARG ("event", NULL), ARG ("new_time", NULL), ARG ("new_title", NULL), ARG ("new_location", NULL), &ok);
+      else if (g_str_equal (id, "calendar_delete"))
+        r = calendar_tool_delete (ARG ("event", NULL), &ok);
+      else if (g_str_equal (id, "calendar_undo"))
+        r = calendar_tool_undo (&ok);
+      else if (g_str_equal (id, "calendar_free"))
+        r = calendar_tool_free (ARG ("minutes", "60"), ARG ("when", "week"));
+      else if (g_str_equal (id, "calendar_done"))
+        r = calendar_tool_done (ARG ("event", NULL), &ok);
+      else
+        r = g_strdup_printf ("Error: there is no tool called \"%s\".", id);
+#undef ARG
+      done (r, ok && !g_str_has_prefix (r, "Error"), data);
     }
   else if (g_str_equal (id, "wikipedia"))
     run_wikipedia (args ? json_object_get_string_member_with_default (args, "topic", NULL) : NULL, cancel, done, data);

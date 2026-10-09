@@ -108,6 +108,20 @@ month_of (const char *t)
   return 0;
 }
 
+/* "3", "tres", "three" */
+static int
+number_word (const char *t)
+{
+  static const char *words[][2] = { { "un", "one" }, { "una", "a" }, { "dos", "two" }, { "tres", "three" }, { "cuatro", "four" },
+                                    { "cinco", "five" }, { "seis", "six" }, { "siete", "seven" }, { "ocho", "eight" },
+                                    { "nueve", "nine" }, { "diez", "ten" } };
+  static const int values[] = { 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+  for (guint i = 0; i < G_N_ELEMENTS (words); i++)
+    if (g_str_equal (t, words[i][0]) || g_str_equal (t, words[i][1]))
+      return values[i];
+  return 0;
+}
+
 static gboolean
 all_digits (const char *t, int max_len)
 {
@@ -280,6 +294,7 @@ gboolean
 calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQuick *out)
 {
   memset (out, 0, sizeof *out);
+  out->alert = -1;
   if (!text || !*text)
     return FALSE;
 
@@ -292,6 +307,102 @@ calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQui
   int hint_start = 0, hint_end = 0;
   int duration_min = 0;
   CalRepeat repeat = CAL_REPEAT_NONE;
+
+  /* "remind me to…", "recuérdame…", "recordatorio": a task to tick off */
+  for (guint i = 0; i < w.n; i++)
+    {
+      if (is (&w, i, "recuerdame", "recordatorio", "reminder", NULL) || (is (&w, i, "remind", NULL, NULL, NULL) && is (&w, i + 1, "me", NULL, NULL, NULL)))
+        {
+          out->reminder = TRUE;
+          use (&w, i, is (&w, i, "remind", NULL, NULL, NULL) ? 2 : 1);
+          if (is (&w, i + (is (&w, i, "remind", NULL, NULL, NULL) ? 2u : 1u), "to", "de", "que", NULL))
+            use (&w, i + (w.used[i] && i + 1 < w.n && w.used[i + 1] ? 2u : 1u), 1);
+        }
+    }
+
+  /* "15 min antes", "1 hour before", "avísame 2 horas antes": the alert */
+  for (guint i = 0; i + 2 < w.n; i++)
+    {
+      if (w.used[i] || w.used[i + 1] || w.used[i + 2])
+        continue;
+      int n = all_digits (w.norm[i], 3) ? atoi (w.norm[i]) : number_word (w.norm[i]);
+      if (!n || !is (&w, i + 2, "antes", "before", NULL, NULL))
+        continue;
+      int mult = 0;
+      if (is (&w, i + 1, "min", "mins", "minuto", "minutos") || is (&w, i + 1, "minute", "minutes", NULL, NULL))
+        mult = 1;
+      else if (is (&w, i + 1, "h", "hr", "hora", "horas") || is (&w, i + 1, "hour", "hours", NULL, NULL))
+        mult = 60;
+      else if (is (&w, i + 1, "dia", "dias", "day", "days"))
+        mult = 1440;
+      else if (is (&w, i + 1, "semana", "semanas", "week", "weeks"))
+        mult = 10080;
+      if (!mult)
+        continue;
+      out->alert = n * mult;
+      use (&w, i, 3);
+      /* the words that led into it: "avísame", "con aviso de", "alert me" */
+      for (guint back = 0; back < 3 && i > 0; back++)
+        {
+          guint k = i - 1;
+          if (!w.used[k] && (is (&w, k, "avisame", "aviso", "alerta", "alert") || is (&w, k, "con", "de", "me", "notify")))
+            {
+              use (&w, k, 1);
+              i = k;
+            }
+          else
+            break;
+        }
+      break;
+    }
+
+  /* "hasta el 15 de diciembre", "until december 15", "5 veces", "5 times": where a repeat stops */
+  for (guint i = 0; i < w.n; i++)
+    {
+      if (w.used[i])
+        continue;
+      if (is (&w, i, "hasta", "until", "through", NULL))
+        {
+          guint k = i + 1;
+          if (is (&w, k, "el", "the", NULL, NULL))
+            k++;
+          gint64 stop = 0;
+          guint len = 0;
+          if (k + 2 < w.n && !w.used[k] && all_digits (w.norm[k], 2) && is (&w, k + 1, "de", NULL, NULL, NULL) && month_of (w.norm[k + 2]))
+            {
+              stop = month_day (today, month_of (w.norm[k + 2]), atoi (w.norm[k]), 0);
+              len = k + 3 - i;
+            }
+          else if (k + 1 < w.n && !w.used[k] && month_of (w.norm[k]) && strlen (w.norm[k]) >= 3 && all_digits (w.norm[k + 1], 2))
+            {
+              stop = month_day (today, month_of (w.norm[k]), atoi (w.norm[k + 1]), 0);
+              len = k + 2 - i;
+            }
+          else if (k < w.n && !w.used[k] && strchr (w.norm[k], '/'))
+            {
+              int a, b;
+              if (sscanf (w.norm[k], "%d/%d", &a, &b) == 2)
+                {
+                  int dd = month_first ? b : a, mm = month_first ? a : b;
+                  if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31)
+                    {
+                      stop = month_day (today, mm, dd, 0);
+                      len = k + 1 - i;
+                    }
+                }
+            }
+          if (stop)
+            {
+              out->until = stop;
+              use (&w, i, len);
+            }
+        }
+      else if ((all_digits (w.norm[i], 3) && is (&w, i + 1, "veces", "times", "vez", NULL)) )
+        {
+          out->count = atoi (w.norm[i]);
+          use (&w, i, 2);
+        }
+    }
 
   /* "7 de la manana" must be read before "manana" means tomorrow, so times come first */
   for (guint i = 0; i < w.n; i++)
@@ -457,14 +568,28 @@ calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQui
       else if (is (&w, i, "cada", "every", NULL, NULL) || (is (&w, i, "todos", "todas", NULL, NULL) && is (&w, i + 1, "los", "las", NULL, NULL)))
         {
           guint k = i + (is (&w, i, "todos", "todas", NULL, NULL) ? 2 : 1);
-          if (is (&w, k, "dia", "dias", "day", NULL))
-            { repeat = CAL_REPEAT_DAILY; use (&w, i, k + 1 - i); }
-          else if (is (&w, k, "semana", "semanas", "week", NULL))
-            { repeat = CAL_REPEAT_WEEKLY; use (&w, i, k + 1 - i); }
-          else if (is (&w, k, "mes", "meses", "month", NULL))
-            { repeat = CAL_REPEAT_MONTHLY; use (&w, i, k + 1 - i); }
-          else if (is (&w, k, "ano", "anos", "year", NULL))
-            { repeat = CAL_REPEAT_YEARLY; use (&w, i, k + 1 - i); }
+          /* "cada 2 semanas", "every other week", "cada tres meses": a number before the unit */
+          int step = 0;
+          if (k < w.n && !w.used[k])
+            {
+              if (is (&w, k, "other", "otra", "otro", NULL))
+                step = 2;
+              else if (all_digits (w.norm[k], 2))
+                step = atoi (w.norm[k]);
+              else
+                step = number_word (w.norm[k]);
+              if (step)
+                k++;        /* the unit comes next */
+            }
+          guint every = step > 1 ? (guint) step : 0;
+          if (is (&w, k, "dia", "dias", "day", "days"))
+            { repeat = CAL_REPEAT_DAILY; out->interval = every; use (&w, i, k + 1 - i); }
+          else if (is (&w, k, "semana", "semanas", "week", "weeks"))
+            { repeat = CAL_REPEAT_WEEKLY; out->interval = every; use (&w, i, k + 1 - i); }
+          else if (is (&w, k, "mes", "meses", "month", "months"))
+            { repeat = CAL_REPEAT_MONTHLY; out->interval = every; use (&w, i, k + 1 - i); }
+          else if (is (&w, k, "ano", "anos", "year", "years"))
+            { repeat = CAL_REPEAT_YEARLY; out->interval = every; use (&w, i, k + 1 - i); }
           else if (k < w.n && !w.used[k] && weekday_of (w.norm[k]) >= 0)
             {
               repeat = CAL_REPEAT_WEEKLY;
@@ -549,6 +674,17 @@ calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQui
       else
         {
           int a, b, y = 0;
+          /* 2026-10-20, the form the model and files use */
+          int iy, im, id;
+          if (strlen (t) == 10 && t[4] == '-' && t[7] == '-' && sscanf (t, "%4d-%2d-%2d", &iy, &im, &id) == 3 && im >= 1 && im <= 12 && id >= 1 && id <= 31)
+            {
+              day = at_midnight (iy, im, id);
+              if (day)
+                {
+                  use (&w, i, 1);
+                  continue;
+                }
+            }
           int cnt = sscanf (t, "%d/%d/%d", &a, &b, &y);
           if (cnt < 2)
             cnt = sscanf (t, "%d-%d-%d", &a, &b, &y);
@@ -678,4 +814,20 @@ calendar_quick_parse (const char *text, gint64 now, gboolean month_first, CalQui
   out->repeat = repeat;
   words_free (&w);
   return TRUE;
+}
+
+CalEvent *
+calendar_quick_to_event (const CalQuick *q, const char *untitled)
+{
+  CalEvent *ev = calendar_event_new (q->title && *q->title ? q->title : untitled, q->start, q->end, q->all_day);
+  ev->repeat = q->repeat;
+  ev->interval = q->repeat != CAL_REPEAT_NONE ? q->interval : 0;
+  ev->until = q->repeat != CAL_REPEAT_NONE ? q->until : 0;
+  ev->count = q->repeat != CAL_REPEAT_NONE ? q->count : 0;
+  ev->reminder = q->reminder;
+  if (q->reminder)
+    ev->end = q->all_day ? calendar_day_next (q->start) : q->start + 900;
+  if (q->alert >= 0)
+    calendar_event_add_alert (ev, q->alert);
+  return ev;
 }
