@@ -32,6 +32,11 @@ void             caldav_account_remove (const char *id, gboolean delete_events);
 void             caldav_accounts_save (void);
 void             caldav_accounts_free (void);
 
+/* Apple's app-specific passwords look like abcd-efgh-ijkl-mnop (spaces and case do not matter). */
+gboolean caldav_looks_like_app_password (const char *password);
+/* The server is iCloud. */
+gboolean caldav_is_icloud (const char *server_url);
+
 /* "https://…" always; "http://" only for this computer (testing). NULL when it is not acceptable. */
 char *caldav_check_server_url (const char *text);
 

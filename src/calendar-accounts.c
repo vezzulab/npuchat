@@ -13,6 +13,16 @@ static GtkWidget *parent_widget;
 
 static void rebuild_list (void);
 
+/* what the server's complaint means for the person who typed the password */
+static const char *
+friendly (const char *error)
+{
+  if (error && (strstr (error, "user name or password")))
+    return TR ("El servidor no aceptó el usuario o la contraseña. En iCloud hace falta una contraseña para apps (la normal no sirve): créala en appleid.apple.com → Inicio de sesión y seguridad → Contraseñas para apps, y revisa que tu Apple ID tenga la verificación en dos pasos. El usuario es tu correo de Apple ID completo.",
+               "The server did not accept the user name or password. iCloud needs an app-specific password (your normal one does not work): make one at appleid.apple.com → Sign-In and Security → App-Specific Passwords, and check that your Apple ID has two-factor authentication. The user is your full Apple ID email.");
+  return error ? error : "";
+}
+
 static void
 tell (const char *heading, const char *body)
 {
@@ -163,7 +173,7 @@ on_discovered (const char *error, GPtrArray *calendars, gpointer data)
       if (a && f->new_account)
         caldav_account_remove (f->account_id, TRUE);
       rebuild_list ();
-      tell (TR ("No se pudo conectar", "Could not connect"), error ? error : "");
+      tell (TR ("No se pudo conectar", "Could not connect"), friendly (error));
     }
   else if (!calendars->len)
     {
@@ -220,8 +230,9 @@ on_connect (GtkButton *b, gpointer data)
   (void) b;
   AddForm *f = data;
   g_autofree char *server = caldav_check_server_url (gtk_editable_get_text (GTK_EDITABLE (f->server)));
-  const char *user = gtk_editable_get_text (GTK_EDITABLE (f->user));
-  const char *pass = gtk_editable_get_text (GTK_EDITABLE (f->password));
+  /* pasted text often carries a space or a line break at the ends */
+  g_autofree char *user = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (f->user))));
+  g_autofree char *typed = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (f->password))));
   const char *name = gtk_editable_get_text (GTK_EDITABLE (f->name));
   if (!server)
     {
@@ -229,12 +240,28 @@ on_connect (GtkButton *b, gpointer data)
             TR ("Usa una dirección https://. Para iCloud: https://caldav.icloud.com", "Use an https:// address. For iCloud: https://caldav.icloud.com"));
       return;
     }
-  if (!*user || !*pass)
+  if (!*user || !*typed)
     {
       tell (TR ("Faltan datos", "Something is missing"), TR ("Escribe el usuario y la contraseña.", "Enter the user name and the password."));
       return;
     }
-  CalAccount *a = caldav_account_add (*name ? name : "CalDAV", server, user, pass);
+  /* Apple's password for apps has a known shape; a normal password never works, so say so before trying */
+  if (caldav_is_icloud (server) && !caldav_looks_like_app_password (typed))
+    {
+      tell (TR ("Eso no parece una contraseña para apps", "That does not look like an app-specific password"),
+            TR ("iCloud no acepta tu contraseña normal. Una contraseña para apps se ve así: abcd-efgh-ijkl-mnop. Créala en appleid.apple.com → Inicio de sesión y seguridad → Contraseñas para apps (necesitas la verificación en dos pasos) y pégala aquí.",
+                "iCloud does not accept your normal password. An app-specific password looks like this: abcd-efgh-ijkl-mnop. Make one at appleid.apple.com → Sign-In and Security → App-Specific Passwords (you need two-factor authentication) and paste it here."));
+      return;
+    }
+  /* the password is shown to you in groups; the server wants it without spaces */
+  GString *clean = g_string_new (NULL);
+  for (const char *c = typed; *c; c++)
+    if (!(*c == ' ' && caldav_is_icloud (server)))
+      g_string_append_c (clean, *c);
+  CalAccount *a = caldav_account_add (*name ? name : "CalDAV", server, user, clean->str);
+  memset (clean->str, 0, clean->len);
+  g_string_free (clean, TRUE);
+  memset (typed, 0, strlen (typed));
   adw_dialog_close (f->dialog);
   find_calendars (a, TRUE);
 }

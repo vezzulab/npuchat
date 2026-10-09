@@ -159,6 +159,36 @@ caldav_resolve (const char *base, const char *href)
   return r;
 }
 
+gboolean
+caldav_looks_like_app_password (const char *password)
+{
+  if (!password)
+    return FALSE;
+  /* four groups of four letters, with or without the dashes */
+  int letters = 0, dashes = 0;
+  for (const char *c = password; *c; c++)
+    {
+      if (g_ascii_isalpha (*c))
+        letters++;
+      else if (*c == '-')
+        dashes++;
+      else if (*c != ' ')
+        return FALSE;
+    }
+  return letters == 16 && (dashes == 0 || dashes == 3);
+}
+
+gboolean
+caldav_is_icloud (const char *server_url)
+{
+  if (!server_url)
+    return FALSE;
+  g_autofree char *full = strstr (server_url, "://") ? g_strdup (server_url) : g_strconcat ("https://", server_url, NULL);
+  g_autoptr (GUri) uri = g_uri_parse (full, G_URI_FLAGS_PARSE_RELAXED, NULL);
+  const char *host = uri ? g_uri_get_host (uri) : NULL;
+  return host && (g_str_equal (host, "icloud.com") || g_str_has_suffix (host, ".icloud.com"));
+}
+
 char *
 caldav_check_server_url (const char *text)
 {
@@ -513,7 +543,7 @@ describe_status (guint status)
   switch (status)
     {
     case 401: return "The user name or password was not accepted.";
-    case 403: return "The server refused the request.";
+    case 403: return "The server refused the user name or password.";
     case 404: return "The server does not have that address.";
     case 429: return "The server asks to try again later.";
     default:  return "The server did not answer as a calendar server should.";

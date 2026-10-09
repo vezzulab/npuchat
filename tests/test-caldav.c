@@ -158,6 +158,27 @@ become (const char *dir)
 int
 main (void)
 {
+  /* Apple's app passwords, as Apple shows them (also pasted without dashes or with spaces) */
+  CHECK (caldav_looks_like_app_password ("abcd-efgh-ijkl-mnop"), "app password with dashes");
+  CHECK (caldav_looks_like_app_password ("abcdefghijklmnop"), "app password without dashes");
+  CHECK (caldav_looks_like_app_password ("abcd efgh ijkl mnop"), "app password with spaces");
+  CHECK (caldav_looks_like_app_password ("ABCD-EFGH-IJKL-MNOP"), "in capitals");
+  CHECK (!caldav_looks_like_app_password ("MyRealPassword123"), "a normal password is not one");
+  CHECK (!caldav_looks_like_app_password ("Abcd-efgh-ijkl"), "too short");
+  CHECK (!caldav_looks_like_app_password ("abcd-efgh-ijkl-mnop-qrst"), "too long");
+  CHECK (!caldav_looks_like_app_password (""), "empty");
+  CHECK (!caldav_looks_like_app_password (NULL), "null");
+  CHECK (caldav_is_icloud ("https://caldav.icloud.com"), "iCloud is recognised");
+  CHECK (caldav_is_icloud ("caldav.icloud.com"), "even without the scheme");
+  CHECK (caldav_is_icloud ("https://p33-caldav.icloud.com:443/"), "and its numbered hosts");
+  CHECK (!caldav_is_icloud ("https://nextcloud.example.org"), "other servers are not");
+  CHECK (!caldav_is_icloud ("https://evil-icloud.com"), "lookalikes are not");
+  CHECK (!caldav_is_icloud (NULL), "null");
+  if (failures)
+    {
+      g_print ("test-caldav: %d failure(s)\n", failures);
+      return 1;
+    }
   const char *url = g_getenv ("CALDAV_URL");
   if (!url)
     {
